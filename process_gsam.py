@@ -1,6 +1,7 @@
 import os
 import yaml
 import torch
+import argparse
 from pathlib import Path
 from tqdm import tqdm
 import time
@@ -16,12 +17,22 @@ def load_config(config_path="config.yaml"):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Process videos with GSAM for object detection and segmentation")
+    parser.add_argument('--mode', type=str, default='world', choices=['world', 'human'],
+                        help='Select configuration mode: "world" (default) or "human"')
+    args = parser.parse_args()
+    
     # Load configuration from config file
     config = load_config("config.yaml")
-    gsam_config = config['gsam']
+    
+    # Select the appropriate config based on mode
+    config_key = 'gsam' if args.mode == 'world' else 'gsam_human'
+    gsam_config = config[config_key]
     
     # Extract configuration
     text_prompt = gsam_config['text_prompt']
+    key_frame_idx = gsam_config.get('key_frame_idx', 0)  # Default to 0 if not specified
     input_images_dir = Path(gsam_config['input_images_dir'])
     device = gsam_config['device']
     output_masks_dir = Path(gsam_config['output_masks_dir'])
@@ -57,7 +68,9 @@ def main():
     print(f"\n{'='*60}")
     print(f"GSAM VIDEO PROCESSING CONFIGURATION")
     print(f"{'='*60}")
+    print(f"Mode: {args.mode}")
     print(f"Text prompt: {text_prompt}")
+    print(f"Key frame index: {key_frame_idx} ({'middle frame' if key_frame_idx == -1 else f'frame {key_frame_idx}'})")
     print(f"Input directory: {input_images_dir}")
     print(f"Output masks directory: {output_masks_dir}")
     print(f"Device: {device}")
@@ -107,6 +120,7 @@ def main():
         masks_4d, obj_dict = gsam_video(
             frames_dir=str(video_folder),
             text_prompt=text_prompt,
+            key_frame_idx=key_frame_idx,  # Pass the key frame index
             save_path=save_path,
             video_name=video_name,  # Pass video name for unique filenames
             device=device,

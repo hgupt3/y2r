@@ -11,6 +11,7 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 def gsam_video(
     frames_dir,
     text_prompt,
+    key_frame_idx=0,  # Add key_frame_idx parameter, default to 0
     save_path=None,
     video_name=None,
     device="cuda",
@@ -30,6 +31,7 @@ def gsam_video(
     Args:
         frames_dir (str): Path to directory containing PNG frames (e.g., 00000/, 00001/, etc.)
         text_prompt (str): Text prompt for object detection (e.g., "apple pear mango.").
+        key_frame_idx (int, optional): Frame index to use for detection. 0=first frame, -1=middle frame. Defaults to 0.
         save_path (str, optional): Path to save the annotated video (e.g. ./save/).
         device (str, optional): Device to run the models on ("cuda" or "cpu"). 
         sam2_checkpoint (str, optional): Path to the SAM2 model checkpoint. 
@@ -70,8 +72,26 @@ def gsam_video(
     T = len(png_files)  # Number of frames
     H, W = first_frame.shape[:2]  # Frame height, width
     
-    # Convert first frame to RGB for detection
-    first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+    # Determine which frame to use for detection
+    # -1 means middle frame, otherwise use the specified index
+    if key_frame_idx == -1:
+        actual_key_frame_idx = T // 2
+    else:
+        actual_key_frame_idx = key_frame_idx
+    
+    # Ensure the key frame index is valid
+    if actual_key_frame_idx >= T or actual_key_frame_idx < 0:
+        print(f"Error: Key frame index {actual_key_frame_idx} is out of range (0-{T-1})")
+        return None, None
+    
+    # Load the key frame for detection
+    key_frame = cv2.imread(str(png_files[actual_key_frame_idx]))
+    if key_frame is None:
+        print(f"Failed to load key frame at index {actual_key_frame_idx}.")
+        return None, None
+    
+    # Convert key frame to RGB for detection
+    key_frame_rgb = cv2.cvtColor(key_frame, cv2.COLOR_BGR2RGB)
 
     # ------------------------------
     # Step 2: Run Grounding DINO on a key frame
@@ -82,9 +102,8 @@ def gsam_video(
         processor = AutoProcessor.from_pretrained(grounding_model_id)
         grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(grounding_model_id).to(device)
     
-    print(f"Running object detection on key frame with prompt: '{text_prompt}'...")
-    key_frame_idx = 0
-    key_frame_pil = Image.fromarray(first_frame_rgb)
+    print(f"Running object detection on key frame {actual_key_frame_idx} (of {T} total frames) with prompt: '{text_prompt}'...")
+    key_frame_pil = Image.fromarray(key_frame_rgb)
 
     # Prepare input for Grounding DINO
     inputs = processor(
@@ -157,7 +176,7 @@ def gsam_video(
         box_prompt = box.astype(np.float32)
         predictor.add_new_points_or_box(
             inference_state=inference_state,
-            frame_idx=key_frame_idx,
+            frame_idx=actual_key_frame_idx,  # Use the actual key frame index
             obj_id=obj_id,
             box=box_prompt,
         )
@@ -165,11 +184,31 @@ def gsam_video(
     # Now propagate to all frames, building a 4D array: (T, O, H, W)
     masks_4d = np.zeros((T, num_objects, H, W), dtype=bool)
 
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+    # Bidirectional propagation: forward from key frame to end, backward from key frame to start
+    print(f"Propagating masks bidirectionally from frame {actual_key_frame_idx}...")
+    
+    # Forward propagation: from key frame to end
+    print(f"  Forward: frames {actual_key_frame_idx} → {T-1}")
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+        inference_state, start_frame_idx=actual_key_frame_idx
+    ):
         for j, out_obj_id in enumerate(out_obj_ids):
             if 1 <= out_obj_id <= num_objects:
                 mask = (out_mask_logits[j] > 0.0).cpu().numpy()  # shape (H, W)
                 masks_4d[out_frame_idx, out_obj_id - 1] = mask
+    
+    # Backward propagation: from key frame to beginning (only if key frame is not the first frame)
+    if actual_key_frame_idx > 0:
+        print(f"  Backward: frames {actual_key_frame_idx} → 0")
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            inference_state, start_frame_idx=actual_key_frame_idx, reverse=True
+        ):
+            for j, out_obj_id in enumerate(out_obj_ids):
+                if 1 <= out_obj_id <= num_objects:
+                    mask = (out_mask_logits[j] > 0.0).cpu().numpy()  # shape (H, W)
+                    masks_4d[out_frame_idx, out_obj_id - 1] = mask
+    
+    print("✓ Bidirectional propagation complete")
 
     # ------------------------------
     # Step 5 (Optional): Save annotated video

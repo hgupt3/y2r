@@ -8,8 +8,19 @@ __pycache__/
 
 # Data directories
 data/
+*/data/
 */checkpoints/
 checkpoints/
+weights/
+*/weights/
+results/
+*/results/
+examples/
+*/examples/
+eval/
+*/eval/
+outputs/
+*/outputs/
 *.pth
 *.pt
 
