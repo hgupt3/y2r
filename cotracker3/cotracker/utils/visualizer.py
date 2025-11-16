@@ -361,3 +361,133 @@ class Visualizer:
                     )
         rgb = np.array(rgb)
         return rgb
+
+    def visualize_trajectory_on_frame(
+        self,
+        frame: torch.Tensor,  # (C, H, W) - single frame
+        tracks: torch.Tensor,  # (1, T, N, 2) - full trajectory for the window
+        visibility: torch.Tensor = None,  # (1, T, N) - visibility for all frames
+        segm_mask: torch.Tensor = None,  # (H, W) - segmentation mask
+        query_frame: int = 0,
+        opacity: float = 1.0,
+    ):
+        """
+        Visualize the full trajectory on a single frame.
+        
+        Args:
+            frame: Single frame tensor (C, H, W)
+            tracks: Trajectory tracks (1, T, N, 2) where T is window length
+            visibility: Visibility tensor (1, T, N)
+            segm_mask: Segmentation mask (H, W)
+            query_frame: Query frame index (should be 0 for first frame)
+            opacity: Opacity for drawing (0-1)
+            
+        Returns:
+            Rendered frame as numpy array (H, W, C)
+        """
+        # Add batch dimension to frame if needed: (C, H, W) -> (1, 1, C, H, W)
+        if frame.dim() == 3:
+            frame = frame.unsqueeze(0).unsqueeze(0)  # (1, 1, C, H, W)
+        
+        # Pad frame
+        frame = F.pad(
+            frame,
+            (self.pad_value, self.pad_value, self.pad_value, self.pad_value),
+            "constant",
+            255,
+        )
+        
+        # Adjust tracks for padding
+        tracks = tracks + self.pad_value
+        
+        # Process segmentation mask if provided
+        if segm_mask is not None:
+            coords = tracks[0, query_frame].round().long()
+            segm_mask_processed = segm_mask[coords[:, 1], coords[:, 0]].long()
+        else:
+            segm_mask_processed = None
+        
+        # Extract dimensions
+        B, T_frames, C, H, W = frame.shape
+        _, T, N, D = tracks.shape
+        
+        assert D == 2
+        assert C == 3
+        
+        # Convert to numpy
+        frame_np = frame[0, 0].permute(1, 2, 0).byte().detach().cpu().numpy()  # H, W, C
+        tracks_np = tracks[0].long().detach().cpu().numpy()  # T, N, 2
+        
+        # Initialize result
+        res_frame = frame_np.copy()
+        
+        # Compute colors for tracks
+        vector_colors = np.zeros((T, N, 3))
+        
+        if segm_mask_processed is None:
+            if self.mode == "rainbow":
+                y_min, y_max = (
+                    tracks_np[query_frame, :, 1].min(),
+                    tracks_np[query_frame, :, 1].max(),
+                )
+                norm = plt.Normalize(y_min, y_max)
+                for n in range(N):
+                    color = self.color_map(norm(tracks_np[query_frame, n, 1]))
+                    color = np.array(color[:3])[None] * 255
+                    vector_colors[:, n] = np.repeat(color, T, axis=0)
+            else:
+                # color changes with time
+                for t in range(T):
+                    color = np.array(self.color_map(t / T)[:3])[None] * 255
+                    vector_colors[t] = np.repeat(color, N, axis=0)
+        else:
+            if self.mode == "rainbow":
+                vector_colors[:, segm_mask_processed <= 0, :] = 255
+                
+                y_min, y_max = (
+                    tracks_np[0, segm_mask_processed > 0, 1].min(),
+                    tracks_np[0, segm_mask_processed > 0, 1].max(),
+                )
+                norm = plt.Normalize(y_min, y_max)
+                for n in range(N):
+                    if segm_mask_processed[n] > 0:
+                        color = self.color_map(norm(tracks_np[0, n, 1]))
+                        color = np.array(color[:3])[None] * 255
+                        vector_colors[:, n] = np.repeat(color, T, axis=0)
+            else:
+                # color changes with segm class
+                segm_mask_processed = segm_mask_processed.cpu()
+                color = np.zeros((segm_mask_processed.shape[0], 3), dtype=np.float32)
+                color[segm_mask_processed > 0] = np.array(self.color_map(1.0)[:3]) * 255.0
+                color[segm_mask_processed <= 0] = np.array(self.color_map(0.0)[:3]) * 255.0
+                vector_colors = np.repeat(color[None], T, axis=0)
+        
+        # Draw full trajectory (all tracks from frame 0 to T-1)
+        res_frame = self._draw_pred_tracks(
+            res_frame,
+            tracks_np,  # Full trajectory T x N x 2
+            vector_colors,
+        )
+        
+        # Draw points at their final positions (frame T-1)
+        color_alpha = int(opacity * 255)
+        img = Image.fromarray(np.uint8(res_frame))
+        for i in range(N):
+            # Draw point at the last frame position
+            coord = (tracks_np[-1, i, 0], tracks_np[-1, i, 1])
+            visible = True
+            if visibility is not None:
+                visible = visibility[0, -1, i]
+            if coord[0] != 0 and coord[1] != 0:
+                img = draw_circle(
+                    img,
+                    coord=coord,
+                    radius=int(self.linewidth * 2),
+                    color=vector_colors[-1, i].astype(int),
+                    visible=visible,
+                    color_alpha=color_alpha,
+                )
+        
+        res_frame = np.array(img)
+        
+        return res_frame

@@ -79,23 +79,8 @@ def cotracker(
     pred_tracks = torch.stack(filtered_tracks, dim=0)  # (B, T, num_kept, 2)
     pred_visibility = torch.stack(filtered_visibility, dim=0)  # (B, T, num_kept)
 
-    # Optional visualization (only if tracks exist - visualizer cannot handle empty tracks)
-    if save_dir is not None:
-        if pred_tracks.shape[2] > 0:  # If there are tracks to visualize
-            vis = Visualizer(save_dir=save_dir, pad_value=120, linewidth=1)
-            
-            # Darken background for better track visibility
-            frames_darkened = frames * 0.5  # Darken to 50% brightness
-            
-            vis.visualize(
-                frames_darkened,
-                pred_tracks,
-                pred_visibility,
-                query_frame=query_frame_idx,
-            )
-        else:
-            # No tracks to visualize - skip (visualizer cannot handle empty tracks)
-            print(f"⚠ No tracks to visualize (all filtered due to occlusion) - skipping visualization")
+    # Per-window visualization is now disabled for efficiency
+    # Trajectory summary visualization is handled in process_cotracker.py instead
     
     return pred_tracks, pred_visibility
 

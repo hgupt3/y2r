@@ -1,66 +1,96 @@
 # Configuration file for video processing pipeline
 
+# ===== COMMON VARIABLES =====
+# These variables are shared across multiple stages of the pipeline
+common:
+  # Base paths
+  base_data_dir: &base_data_dir "/home/harsh/sam/data"
+  raw_videos_dir: &raw_videos_dir "/home/harsh/sam/data/raw_videos"
+  
+  # Intermediate outputs (shared between stages)
+  frames_dir: &frames_dir "/home/harsh/sam/data/frames"  # Output: preprocess -> Input: gsam_human, diffueraser
+  human_masks_dir: &human_masks_dir "/home/harsh/sam/data/human_masks"  # Output: gsam_human -> Input: diffueraser
+  clean_frames_dir: &clean_frames_dir "/home/harsh/sam/data/clean_frames"  # Output: diffueraser -> Input: gsam, cotracker
+  masks_dir: &masks_dir "/home/harsh/sam/data/masks"  # Output: gsam -> Input: cotracker
+  tracks_dir: &tracks_dir "/home/harsh/sam/data/tracks"  # Output: cotracker
+  
+  # Visualization paths
+  human_vis_dir: &human_vis_dir "/home/harsh/sam/data/human_vis"
+  gsam_vis_dir: &gsam_vis_dir "/home/harsh/sam/data/gsam_vis"
+  cotracker_vis_dir: &cotracker_vis_dir "/home/harsh/sam/data/cotracker_vis"
+  
+  # Common parameters
+  device: &device "cuda:0"  # CUDA device to use across all stages
+  target_fps: &target_fps 12  # FPS for both extraction and visualization
+  num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
+  continue: &continue true  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  vis_flag: &vis_flag true  # Enable/disable visualization videos
+  
+# ===== PIPELINE STAGES =====
+
 preprocess:
   target_width: 512  # Target width for resized frames (in pixels)
   target_height: 384  # Target height for resized frames (in pixels)
-  target_fps: 12  # Target FPS for frame extraction (set to null to extract all frames)
-  num_videos_to_process: null  # Number of videos to process (set to null to process all)
-  raw_videos_dir: "/home/harsh/sam/data/raw_videos"  # Input directory containing raw videos
-  output_dir: "/home/harsh/sam/data/frames"  # Output directory for processed frames
+  target_fps: *target_fps  # Target FPS for frame extraction (set to null to extract all frames)
+  num_videos_to_process: *num_videos_to_process  # Number of videos to process (set to null to process all)
+  raw_videos_dir: *raw_videos_dir  # Input directory containing raw videos
+  output_dir: *frames_dir  # Output directory for processed frames -> feeds into gsam_human & diffueraser
   video_extensions: ["*.MOV", "*.mov", "*.mp4", "*.MP4"]  # Video file extensions to process
-  delete_previous_output: true  # Whether to delete previous output folder before processing
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam_human:
   text_prompt: "person."  # Text prompt for object detection (better detection than "human.")
   key_frame_idx: -1  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
-  input_images_dir: "/home/harsh/sam/data/frames"  # Path to processed video frames (00000/, 00001/, etc.)
-  device: "cuda:0"  # CUDA device to use
-  output_masks_dir: "/home/harsh/sam/data/human_masks"  # Where to save .pt mask files
-  num_videos_to_process: null  # Number of video folders to process (set to null to process all)
-  vis_flag: false  # Enable visualization videos
-  vis_path: "/home/harsh/sam/data/human_vis"  # Where to save visualization videos
-  vis_fps: 12  # FPS for visualization videos
-  delete_previous_output: true  # Whether to delete previous output folder before processing
+  input_images_dir: *frames_dir  # <- Input from preprocess output
+  device: *device  # CUDA device to use
+  output_masks_dir: *human_masks_dir  # Where to save .pt mask files -> feeds into diffueraser
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  vis_flag: *vis_flag  # Enable visualization videos
+  vis_path: *human_vis_dir  # Where to save visualization videos
+  vis_fps: *target_fps  # FPS for visualization videos
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 diffueraser:
-  input_images_dir: "/home/harsh/sam/data/frames"  # Path to processed video frames (00000/, 00001/, etc.)
-  input_masks_dir: "/home/harsh/sam/data/human_masks"  # Path to human mask .pt files
-  output_frames_dir: "/home/harsh/sam/data/clean_frames"  # Where to save cleaned frames
-  device: "cuda:0"  # CUDA device to use
-  num_videos_to_process: null  # Number of video folders to process (set to null to process all)
+  input_images_dir: *frames_dir  # <- Input from preprocess output
+  input_masks_dir: *human_masks_dir  # <- Input from gsam_human output
+  output_frames_dir: *clean_frames_dir  # Where to save cleaned frames -> feeds into gsam & cotracker
+  device: *device  # CUDA device to use
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
   max_img_size: 512  # Maximum image dimension (width or height)
-  mask_dilation_iter: 4  # Mask dilation iterations
+  mask_dilation_iter: 8  # Mask dilation iterations
   # Propainter parameters
   ref_stride: 10  # Reference frame stride for Propainter
   neighbor_length: 10  # Neighbor length for Propainter
   subvideo_length: 50  # Subvideo length for Propainter
-  delete_previous_output: true  # Whether to delete previous output folder before processing
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam:
-  text_prompt: "red T-shaped block."  # Text prompt for object detection
+  text_prompt: "small red T-shaped block."  # Text prompt for object detection
   key_frame_idx: 0  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
-  input_images_dir: "/home/harsh/sam/data/clean_frames"  # Path to processed video frames (00000/, 00001/, etc.)
-  device: "cuda:0"  # CUDA device to use
-  output_masks_dir: "/home/harsh/sam/data/masks"  # Where to save .pt mask files
-  num_videos_to_process: null  # Number of video folders to process (set to null to process all)
-  vis_flag: false  # Enable visualization videos
-  vis_path: "/home/harsh/sam/data/gsam_vis"  # Where to save visualization videos
-  vis_fps: 12  # FPS for visualization videos
-  delete_previous_output: true  # Whether to delete previous output folder before processing
+  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
+  device: *device  # CUDA device to use
+  output_masks_dir: *masks_dir  # Where to save .pt mask files -> feeds into cotracker
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  vis_flag: *vis_flag  # Enable visualization videos
+  vis_path: *gsam_vis_dir  # Where to save visualization videos
+  vis_fps: *target_fps  # FPS for visualization videos
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 cotracker:
   window_length: 16  # Number of frames per sliding window
   stride: 1  # Step size between window starts
-  grid_size: 120  # Grid density for point tracking
+  grid_size: 80  # Grid density for point tracking
   visibility_threshold: 0.95  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
-  mask_erosion_pixels: 2  # Number of pixels to erode mask (shrink) to avoid unreliable edge points
-  input_images_dir: "/home/harsh/sam/data/clean_frames"  # Path to processed video frames (00000/, 00001/, etc.)
-  input_masks_dir: "/home/harsh/sam/data/masks"  # Path to mask .pt files
-  output_tracks_dir: "/home/harsh/sam/data/tracks"  # Where to save track .pt files
-  device: "cuda:0"  # CUDA device to use
-  num_videos_to_process: null  # Number of video folders to process (set to null to process all)
-  vis_flag: false  # Enable visualization videos
-  vis_path: "/home/harsh/sam/data/cotracker_vis"  # Where to save visualization videos
-  vis_fps: 12  # FPS for visualization videos
-  delete_previous_output: true  # Whether to delete previous output folder before processing
+  mask_erosion_pixels: 2  # Number of pixels to erode object mask (shrink) to avoid unreliable edge points
+  human_mask_dilation_pixels: 2  # Number of pixels to dilate human mask (expand) before subtraction to create buffer zone
+  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
+  input_masks_dir: *masks_dir  # <- Input from gsam output (object masks)
+  input_human_masks_dir: *human_masks_dir  # <- Input from gsam_human output (human masks to subtract)
+  output_tracks_dir: *tracks_dir  # Where to save track .pt files
+  device: *device  # CUDA device to use
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  vis_flag: *vis_flag  # Enable visualization videos
+  vis_path: *cotracker_vis_dir  # Where to save visualization videos
+  vis_fps: *target_fps  # FPS for visualization videos
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 

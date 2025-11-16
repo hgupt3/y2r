@@ -101,7 +101,7 @@ def main():
     neighbor_length = diffueraser_config['neighbor_length']
     subvideo_length = diffueraser_config['subvideo_length']
     
-    delete_previous_output = diffueraser_config.get('delete_previous_output', False)
+    continue_mode = diffueraser_config.get('continue', False)
     
     # Model paths - set internally using relative paths
     script_dir = Path(__file__).parent
@@ -111,8 +111,8 @@ def main():
     diffueraser_path = str(diffueraser_dir / "weights" / "diffuEraser")
     propainter_model_dir = str(diffueraser_dir / "weights" / "propainter")
     
-    # Delete previous output directory if requested
-    if delete_previous_output and output_frames_dir.exists():
+    # Delete previous output directory if not continuing
+    if not continue_mode and output_frames_dir.exists():
         print(f"\n🗑️  Deleting previous output directory: {output_frames_dir}")
         shutil.rmtree(output_frames_dir)
         print(f"✓ Previous output deleted\n")
@@ -155,10 +155,55 @@ def main():
     print(f"{'='*60}\n")
     
     total_videos_processed = 0
+    skipped_videos = 0
     start_time = time.time()
+    start_idx = 0
     
-    # Process each video folder
-    for idx, video_folder in enumerate(video_folders):
+    # Efficient resume: Check only the last output folder
+    if continue_mode and output_frames_dir.exists():
+        existing_outputs = sorted([d for d in output_frames_dir.iterdir() if d.is_dir()])
+        
+        if existing_outputs:
+            last_output = existing_outputs[-1]
+            video_name = last_output.name
+            
+            # Find corresponding input folder
+            input_folder = input_images_dir / video_name
+            
+            if input_folder.exists():
+                # Get last frame from input
+                input_frames = sorted(input_folder.glob("*.png"))
+                
+                if input_frames:
+                    last_frame_name = input_frames[-1].name
+                    last_output_frame = last_output / last_frame_name
+                    
+                    if last_output_frame.exists():
+                        print(f"\n✓ Last output {video_name} is complete (last frame: {last_frame_name})")
+                        # Find index in video_folders list and start from next
+                        for i, vf in enumerate(video_folders):
+                            if vf.name == video_name:
+                                start_idx = i + 1
+                                skipped_videos = i + 1
+                                break
+                    else:
+                        print(f"\n⚠️  Last output {video_name} is incomplete (missing last frame: {last_frame_name})")
+                        print(f"🗑️  Deleting incomplete output: {last_output}")
+                        shutil.rmtree(last_output)
+                        # Find index and reprocess this video
+                        for i, vf in enumerate(video_folders):
+                            if vf.name == video_name:
+                                start_idx = i
+                                skipped_videos = i
+                                break
+            
+            if start_idx > 0:
+                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
+                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+    
+    # Process each video folder, starting from start_idx
+    for idx in range(start_idx, len(video_folders)):
+        video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
         print(f"{'='*60}")
@@ -246,7 +291,12 @@ def main():
     print(f"\n{'='*60}")
     print(f"✅ ALL VIDEOS PROCESSED!")
     print(f"{'='*60}")
-    print(f"Total videos: {total_videos_processed}")
+    print(f"Total videos: {len(video_folders)}")
+    if continue_mode and skipped_videos > 0:
+        print(f"Videos processed: {total_videos_processed}")
+        print(f"Videos skipped: {skipped_videos}")
+    else:
+        print(f"Videos processed: {total_videos_processed}")
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
         print(f"Average: {elapsed_time/total_videos_processed:.2f}s per video")

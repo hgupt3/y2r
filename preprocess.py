@@ -148,7 +148,7 @@ def main():
     TARGET_HEIGHT = preprocess_config['target_height']
     TARGET_FPS = preprocess_config['target_fps']
     NUM_VIDEOS_TO_PROCESS = preprocess_config['num_videos_to_process']
-    DELETE_PREVIOUS_OUTPUT = preprocess_config.get('delete_previous_output', False)
+    CONTINUE = preprocess_config.get('continue', False)
     
     start_time = time.time()
     
@@ -156,8 +156,8 @@ def main():
     raw_videos_dir = Path(preprocess_config['raw_videos_dir'])
     output_dir = Path(preprocess_config['output_dir'])
     
-    # Delete previous output directory if requested
-    if DELETE_PREVIOUS_OUTPUT and output_dir.exists():
+    # Delete previous output directory if not continuing
+    if not CONTINUE and output_dir.exists():
         print(f"\n🗑️  Deleting previous output directory: {output_dir}")
         shutil.rmtree(output_dir)
         print(f"✓ Previous output deleted\n")
@@ -193,10 +193,61 @@ def main():
         print(f"{'='*60}\n")
     
     total_frames_processed = 0
+    skipped_videos = 0
+    start_idx = 0
     
-    # Process each video with overall progress
-    for idx, video_path in enumerate(video_files):
+    # Efficient resume: Check only the last output folder
+    if CONTINUE and output_dir.exists():
+        existing_outputs = sorted([d for d in output_dir.iterdir() if d.is_dir() and d.name.isdigit()])
+        
+        if existing_outputs:
+            last_output = existing_outputs[-1]
+            video_idx = int(last_output.name)  # e.g., "00039" -> 39
+            
+            if video_idx < len(video_files):
+                video_path = video_files[video_idx]
+                
+                # Get video metadata to calculate expected frames
+                cap = cv2.VideoCapture(str(video_path))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                original_fps = cap.get(cv2.CAP_PROP_FPS)
+                duration = total_frames / original_fps if original_fps > 0 else 0
+                cap.release()
+                
+                # Calculate expected output frames
+                if TARGET_FPS is not None and TARGET_FPS > 0:
+                    expected_output_frames = int(duration * TARGET_FPS)
+                else:
+                    expected_output_frames = total_frames
+                
+                # Check if last frame exists
+                if expected_output_frames > 0:
+                    last_frame_path = last_output / f"{expected_output_frames - 1:05d}.png"
+                    
+                    if last_frame_path.exists():
+                        print(f"\n✓ Last output {last_output.name} is complete ({expected_output_frames} frames)")
+                        start_idx = video_idx + 1  # Resume from next video
+                        skipped_videos = video_idx + 1  # Count all previous as skipped
+                    else:
+                        print(f"\n⚠️  Last output {last_output.name} is incomplete (expected {expected_output_frames} frames)")
+                        print(f"🗑️  Deleting incomplete output: {last_output}")
+                        shutil.rmtree(last_output)
+                        start_idx = video_idx  # Reprocess this video
+                        skipped_videos = video_idx  # Count all previous as skipped
+                else:
+                    # Can't determine expected frames, start from this video
+                    start_idx = video_idx
+                    skipped_videos = video_idx
+            
+            if start_idx > 0:
+                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_files)}")
+                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+    
+    # Process each video with overall progress, starting from start_idx
+    for idx in range(start_idx, len(video_files)):
+        video_path = video_files[idx]
         print(f"📹 Video {idx + 1}/{len(video_files)}")
+        
         frames = process_video(video_path, output_dir, idx, target_width=TARGET_WIDTH, target_height=TARGET_HEIGHT, target_fps=TARGET_FPS)
         if frames:
             total_frames_processed += frames
@@ -207,6 +258,9 @@ def main():
     print(f"✅ ALL VIDEOS PROCESSED!")
     print(f"{'='*60}")
     print(f"Total videos: {len(video_files)}")
+    if CONTINUE and skipped_videos > 0:
+        print(f"Videos processed: {len(video_files) - skipped_videos}")
+        print(f"Videos skipped: {skipped_videos}")
     print(f"Total frames: {total_frames_processed}")
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_frames_processed > 0:

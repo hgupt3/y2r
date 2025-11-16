@@ -40,10 +40,10 @@ def main():
     vis_flag = gsam_config['vis_flag']
     vis_path = Path(gsam_config['vis_path']) if vis_flag else None
     vis_fps = gsam_config['vis_fps']
-    delete_previous_output = gsam_config.get('delete_previous_output', False)
+    continue_mode = gsam_config.get('continue', False)
     
-    # Delete previous output directories if requested
-    if delete_previous_output:
+    # Delete previous output directories if not continuing
+    if not continue_mode:
         if output_masks_dir.exists():
             print(f"\n🗑️  Deleting previous masks directory: {output_masks_dir}")
             shutil.rmtree(output_masks_dir)
@@ -101,10 +101,34 @@ def main():
     print(f"{'='*60}\n")
     
     total_videos_processed = 0
+    skipped_videos = 0
     start_time = time.time()
+    start_idx = 0
     
-    # Process each video folder
-    for idx, video_folder in enumerate(video_folders):
+    # Efficient resume: Check only the last output .pt file
+    if continue_mode and output_masks_dir.exists():
+        existing_masks = sorted([f for f in output_masks_dir.iterdir() if f.suffix == '.pt'])
+        
+        if existing_masks:
+            last_mask = existing_masks[-1]
+            video_name = last_mask.stem  # e.g., "00039.pt" -> "00039"
+            
+            print(f"\n✓ Last mask file {video_name}.pt exists (torch.save is atomic, so it's complete)")
+            
+            # Find index in video_folders list and start from next
+            for i, vf in enumerate(video_folders):
+                if vf.name == video_name:
+                    start_idx = i + 1
+                    skipped_videos = i + 1
+                    break
+            
+            if start_idx > 0:
+                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
+                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+    
+    # Process each video folder, starting from start_idx
+    for idx in range(start_idx, len(video_folders)):
+        video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
         print(f"{'='*60}")
@@ -163,7 +187,12 @@ def main():
     print(f"\n{'='*60}")
     print(f"✅ ALL VIDEOS PROCESSED!")
     print(f"{'='*60}")
-    print(f"Total videos: {total_videos_processed}")
+    print(f"Total videos: {len(video_folders)}")
+    if continue_mode and skipped_videos > 0:
+        print(f"Videos processed: {total_videos_processed}")
+        print(f"Videos skipped: {skipped_videos}")
+    else:
+        print(f"Videos processed: {total_videos_processed}")
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
         print(f"Average: {elapsed_time/total_videos_processed:.2f}s per video")

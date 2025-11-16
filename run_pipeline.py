@@ -7,6 +7,17 @@ import subprocess
 import sys
 import time
 
+# ===== PIPELINE STAGE CONFIGURATION =====
+# Set to True to run the stage, False to skip it
+PIPELINE_CONFIG = {
+    "preprocess": False,          # Extract and resize frames from videos
+    "gsam_human": True,          # Detect humans in frames
+    "diffueraser": True,         # Erase detected humans from frames
+    "gsam_world": True,          # Detect objects (e.g., blocks) in clean frames
+    "cotracker": True,           # Track points on clean frames
+}
+# =========================================
+
 
 def run_script(script_name, args=None):
     """
@@ -62,20 +73,29 @@ def main():
     print("🎬 STARTING FULL PIPELINE")
     print("="*70)
     print("Pipeline order:")
-    print("  1. preprocess.py - Extract and resize frames")
-    print("  2. process_gsam.py (human mode) - Detect humans")
-    print("  3. process_diffueraser.py - Erase humans from frames")
-    print("  4. process_gsam.py (world mode) - Detect objects on clean frames")
-    print("  5. process_cotracker.py - Track points on clean frames")
+    print(f"  1. preprocess.py - Extract and resize frames {'[ENABLED]' if PIPELINE_CONFIG['preprocess'] else '[SKIPPED]'}")
+    print(f"  2. process_gsam.py (human mode) - Detect humans {'[ENABLED]' if PIPELINE_CONFIG['gsam_human'] else '[SKIPPED]'}")
+    print(f"  3. process_diffueraser.py - Erase humans from frames {'[ENABLED]' if PIPELINE_CONFIG['diffueraser'] else '[SKIPPED]'}")
+    print(f"  4. process_gsam.py (world mode) - Detect objects on clean frames {'[ENABLED]' if PIPELINE_CONFIG['gsam_world'] else '[SKIPPED]'}")
+    print(f"  5. process_cotracker.py - Track points on clean frames {'[ENABLED]' if PIPELINE_CONFIG['cotracker'] else '[SKIPPED]'}")
     print("="*70 + "\n")
     
-    scripts = [
-        ("preprocess.py", []),
-        ("process_gsam.py", ["--mode", "human"]),
-        ("process_diffueraser.py", []),
-        ("process_gsam.py", ["--mode", "world"]),
-        ("process_cotracker.py", [])
+    # Define all pipeline stages with their config keys
+    all_scripts = [
+        ("preprocess", "preprocess.py", []),
+        ("gsam_human", "process_gsam.py", ["--mode", "human"]),
+        ("diffueraser", "process_diffueraser.py", []),
+        ("gsam_world", "process_gsam.py", ["--mode", "world"]),
+        ("cotracker", "process_cotracker.py", [])
     ]
+    
+    # Filter to only enabled scripts
+    scripts = [(script, args) for config_key, script, args in all_scripts if PIPELINE_CONFIG[config_key]]
+    
+    if not scripts:
+        print("⚠️  WARNING: All pipeline stages are disabled!")
+        print("Enable at least one stage in PIPELINE_CONFIG at the top of this file.")
+        return
     
     for idx, (script, args) in enumerate(scripts, 1):
         print(f"\n📍 Step {idx}/{len(scripts)}")

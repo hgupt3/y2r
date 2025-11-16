@@ -206,8 +206,8 @@ def create_collage_gif(processed_videos_dir, output_file, grid_size=7, speed_mul
 
 def main():
     # CONFIGURATION
-    PROCESSED_VIDEOS_DIR = "/Users/harshgupta/Desktop/process/processed_videos"
-    OUTPUT_FILE = "/Users/harshgupta/Desktop/process/collage.gif"
+    PROCESSED_VIDEOS_DIR = "/home/harsh/sam/data/clean_frames"
+    OUTPUT_FILE = "/home/harsh/sam/collage.gif"
     GRID_SIZE = 7  # 7x7 grid
     SPEED_MULTIPLIER = 3  # 3x speed
     TARGET_DURATION = 18  # Duration in seconds
@@ -229,4 +229,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

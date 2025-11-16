@@ -7,6 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 import shutil
+import imageio
 from cotracker3.tap import cotracker
 
 
@@ -104,10 +105,8 @@ def process_windows_sequentially(model, frames, combined_mask, windows, grid_siz
             # Extract mask at start frame
             window_mask = combined_mask[start_idx]  # (H, W)
             
-            # Run CoTracker on single window
+            # Run CoTracker on single window (visualization disabled in cotracker() now)
             with torch.no_grad():
-                vis_save_dir = str(vis_path / f"{video_name}_window_{window_idx:03d}") if vis_flag else None
-                
                 pred_tracks, pred_visibility = cotracker(
                     model=model,
                     frames=window_frames,
@@ -115,7 +114,7 @@ def process_windows_sequentially(model, frames, combined_mask, windows, grid_siz
                     grid_size=grid_size,
                     visibility_threshold=visibility_threshold,
                     query_frame_idx=0,
-                    save_dir=vis_save_dir,
+                    save_dir=None,  # Visualization now handled separately
                     device=device
                 )
                 
@@ -131,6 +130,73 @@ def process_windows_sequentially(model, frames, combined_mask, windows, grid_siz
     return all_tracks
 
 
+def create_trajectory_summary_video(frames, all_tracks, windows, vis_path, video_name, vis_fps, pad_value=120, linewidth=1):
+    """
+    Create a trajectory summary video where each frame shows a window's first frame
+    with the full trajectory drawn on it.
+    
+    Args:
+        frames: Full video frames tensor (T, C, H, W)
+        all_tracks: List of track tensors, one per window [(1, T_window, N_i, 2), ...]
+        windows: List of (start, end) tuples indicating window boundaries
+        vis_path: Path to save visualization video
+        video_name: Name of the video
+        vis_fps: FPS for the output video
+        pad_value: Padding value for visualization
+        linewidth: Line width for drawing tracks
+    """
+    from cotracker3.cotracker.utils.visualizer import Visualizer
+    import imageio
+    
+    print(f"\nCreating trajectory summary video...")
+    
+    # Create visualizer
+    vis = Visualizer(save_dir=str(vis_path), pad_value=pad_value, linewidth=linewidth)
+    
+    # Collect rendered frames
+    rendered_frames = []
+    
+    for window_idx, ((start_idx, end_idx), window_tracks) in enumerate(zip(windows, all_tracks)):
+        # Skip windows with no tracks
+        if window_tracks.shape[2] == 0:
+            print(f"  Window {window_idx}: No tracks (skipping)")
+            continue
+        
+        # Extract first frame of this window
+        first_frame = frames[start_idx]  # (C, H, W)
+        
+        # Darken for better visibility (like in original visualization)
+        first_frame_darkened = first_frame * 0.5
+        
+        # Render trajectory on this frame
+        rendered_frame = vis.visualize_trajectory_on_frame(
+            frame=first_frame_darkened,
+            tracks=window_tracks,  # (1, T_window, N, 2)
+            visibility=None,  # Already filtered by visibility in cotracker()
+            segm_mask=None,
+            query_frame=0,
+            opacity=1.0,
+        )
+        
+        rendered_frames.append(rendered_frame)
+    
+    if len(rendered_frames) == 0:
+        print(f"⚠ No frames to visualize (all windows had no tracks)")
+        return
+    
+    # Save as video
+    os.makedirs(vis_path, exist_ok=True)
+    output_path = vis_path / f"{video_name}_trajectory_summary.mp4"
+    
+    video_writer = imageio.get_writer(output_path, fps=vis_fps)
+    for frame in rendered_frames:
+        video_writer.append_data(frame)
+    video_writer.close()
+    
+    print(f"✓ Trajectory summary video saved: {output_path}")
+    print(f"  Total frames in summary: {len(rendered_frames)}")
+
+
 def main():
     # Load configuration
     config = load_config("config.yaml")
@@ -142,18 +208,20 @@ def main():
     grid_size = cotracker_config['grid_size']
     visibility_threshold = cotracker_config['visibility_threshold']
     mask_erosion_pixels = cotracker_config['mask_erosion_pixels']
+    human_mask_dilation_pixels = cotracker_config['human_mask_dilation_pixels']
     input_images_dir = Path(cotracker_config['input_images_dir'])
     input_masks_dir = Path(cotracker_config['input_masks_dir'])
+    input_human_masks_dir = Path(cotracker_config['input_human_masks_dir'])
     output_tracks_dir = Path(cotracker_config['output_tracks_dir'])
     device = cotracker_config['device']
     num_videos_to_process = cotracker_config['num_videos_to_process']
     vis_flag = cotracker_config['vis_flag']
     vis_path = Path(cotracker_config['vis_path']) if vis_flag else None
     vis_fps = cotracker_config['vis_fps']
-    delete_previous_output = cotracker_config.get('delete_previous_output', False)
+    continue_mode = cotracker_config.get('continue', False)
     
-    # Delete previous output directories if requested
-    if delete_previous_output:
+    # Delete previous output directories if not continuing
+    if not continue_mode:
         if output_tracks_dir.exists():
             print(f"\n🗑️  Deleting previous tracks directory: {output_tracks_dir}")
             shutil.rmtree(output_tracks_dir)
@@ -204,10 +272,34 @@ def main():
     
     total_videos_processed = 0
     total_windows_processed = 0
+    skipped_videos = 0
     start_time = time.time()
+    start_idx = 0
     
-    # Process each video folder with progress bar
-    for idx, video_folder in enumerate(tqdm(video_folders, desc="Processing videos", unit="video")):
+    # Efficient resume: Check only the last output .pt file
+    if continue_mode and output_tracks_dir.exists():
+        existing_tracks = sorted([f for f in output_tracks_dir.iterdir() if f.suffix == '.pt'])
+        
+        if existing_tracks:
+            last_track = existing_tracks[-1]
+            video_name = last_track.stem  # e.g., "00039.pt" -> "00039"
+            
+            print(f"\n✓ Last tracks file {video_name}.pt exists (torch.save is atomic, so it's complete)")
+            
+            # Find index in video_folders list and start from next
+            for i, vf in enumerate(video_folders):
+                if vf.name == video_name:
+                    start_idx = i + 1
+                    skipped_videos = i + 1
+                    break
+            
+            if start_idx > 0:
+                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
+                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+    
+    # Process each video folder with progress bar, starting from start_idx
+    for idx in range(start_idx, len(video_folders)):
+        video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
         print(f"{'='*60}")
@@ -250,6 +342,48 @@ def main():
         
         print(f"✓ Combined mask shape: {combined_mask.shape}")
         
+        # Load human masks and subtract from object masks
+        human_mask_file = input_human_masks_dir / f"{video_folder.name}.pt"
+        if not human_mask_file.exists():
+            print(f"⚠ Human mask file not found: {human_mask_file}")
+            print(f"⚠ Skipping human mask subtraction for this video")
+            combined_human_mask = torch.zeros_like(combined_mask)
+        else:
+            print(f"Loading human masks from {human_mask_file}...")
+            human_mask_data = torch.load(human_mask_file, map_location='cpu')
+            human_masks = human_mask_data['masks']  # Shape: (T, O, H, W) from gsam_video
+            
+            print(f"✓ Loaded human masks with shape: {human_masks.shape}")
+            
+            # Combine human masks across all objects to get (T, H, W)
+            if human_masks.dim() == 4:  # (T, O, H, W) - expected format
+                # Combine all humans: any pixel that's True in any human mask
+                combined_human_mask = torch.any(human_masks > 0.5, dim=1).float()  # (T, H, W)
+            elif human_masks.dim() == 3:  # (T, H, W) - single object already combined
+                combined_human_mask = human_masks.float()
+            else:
+                print(f"⚠ Unexpected human mask shape: {human_masks.shape}. Skipping subtraction")
+                combined_human_mask = torch.zeros_like(combined_mask)
+            
+            print(f"✓ Combined human mask shape: {combined_human_mask.shape}")
+        
+        # Dilate human mask to create buffer zone around humans
+        if human_mask_dilation_pixels > 0 and combined_human_mask.sum() > 0:
+            print(f"Dilating human mask by {human_mask_dilation_pixels} pixels...")
+            kernel = np.ones((human_mask_dilation_pixels * 2 + 1, human_mask_dilation_pixels * 2 + 1), np.uint8)
+            dilated_human_mask_list = []
+            for t in range(combined_human_mask.shape[0]):
+                mask_np = combined_human_mask[t].numpy().astype(np.uint8)
+                dilated = cv2.dilate(mask_np, kernel, iterations=1)
+                dilated_human_mask_list.append(torch.from_numpy(dilated).float())
+            combined_human_mask = torch.stack(dilated_human_mask_list, dim=0)
+            print(f"✓ Human mask dilated")
+        
+        # Subtract human mask from object mask (clamp to [0, 1])
+        print(f"Subtracting human masks from object masks...")
+        combined_mask = torch.clamp(combined_mask - combined_human_mask, 0, 1)
+        print(f"✓ Human masks subtracted")
+        
         # Erode mask to avoid tracking unreliable edge points
         if mask_erosion_pixels > 0:
             print(f"Eroding mask by {mask_erosion_pixels} pixels...")
@@ -287,6 +421,19 @@ def main():
             video_name=video_folder.name
         )
         
+        # Create trajectory summary visualization if enabled
+        if vis_flag:
+            create_trajectory_summary_video(
+                frames=frames,
+                all_tracks=all_tracks,
+                windows=windows,
+                vis_path=vis_path,
+                video_name=video_folder.name,
+                vis_fps=vis_fps,
+                pad_value=0,
+                linewidth=1
+            )
+        
         # Save tracks
         # NOTE: tracks is a Python list, not a stacked tensor
         # tracks[i] contains the i-th window's tracks with shape (1, T, N_i, 2)
@@ -321,7 +468,12 @@ def main():
     print(f"\n{'='*60}")
     print(f"✅ ALL VIDEOS PROCESSED!")
     print(f"{'='*60}")
-    print(f"Total videos: {total_videos_processed}")
+    print(f"Total videos: {len(video_folders)}")
+    if continue_mode and skipped_videos > 0:
+        print(f"Videos processed: {total_videos_processed}")
+        print(f"Videos skipped: {skipped_videos}")
+    else:
+        print(f"Videos processed: {total_videos_processed}")
     print(f"Total windows: {total_windows_processed}")
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
