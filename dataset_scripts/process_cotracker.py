@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import torch
 import cv2
@@ -8,6 +9,12 @@ from tqdm import tqdm
 import time
 import shutil
 import imageio
+
+# Add thirdparty to path
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
+
 from cotracker3.tap import cotracker
 
 
@@ -130,7 +137,7 @@ def process_windows_sequentially(model, frames, combined_mask, windows, grid_siz
     return all_tracks
 
 
-def create_trajectory_summary_video(frames, all_tracks, windows, vis_path, video_name, vis_fps, pad_value=120, linewidth=1):
+def create_trajectory_summary_video(frames, all_tracks, windows, vis_path, video_name, vis_fps, pad_value=0, linewidth=1):
     """
     Create a trajectory summary video where each frame shows a window's first frame
     with the full trajectory drawn on it.
@@ -208,6 +215,7 @@ def main():
     grid_size = cotracker_config['grid_size']
     visibility_threshold = cotracker_config['visibility_threshold']
     mask_erosion_pixels = cotracker_config['mask_erosion_pixels']
+    subtract_human_masks = cotracker_config.get('subtract_human_masks', True)
     human_mask_dilation_pixels = cotracker_config['human_mask_dilation_pixels']
     input_images_dir = Path(cotracker_config['input_images_dir'])
     input_masks_dir = Path(cotracker_config['input_masks_dir'])
@@ -249,8 +257,14 @@ def main():
     print(f"Window length: {window_length} frames")
     print(f"Stride: {stride} frames")
     print(f"Grid size: {grid_size}")
+    print(f"Mask erosion: {mask_erosion_pixels} pixels")
+    print(f"Subtract human masks: {'Enabled' if subtract_human_masks else 'Disabled'}")
+    if subtract_human_masks:
+        print(f"Human mask dilation: {human_mask_dilation_pixels} pixels")
     print(f"Input images directory: {input_images_dir}")
     print(f"Input masks directory: {input_masks_dir}")
+    if subtract_human_masks:
+        print(f"Input human masks directory: {input_human_masks_dir}")
     print(f"Output tracks directory: {output_tracks_dir}")
     print(f"Device: {device}")
     print(f"Videos to process: {len(video_folders)}")
@@ -342,47 +356,50 @@ def main():
         
         print(f"✓ Combined mask shape: {combined_mask.shape}")
         
-        # Load human masks and subtract from object masks
-        human_mask_file = input_human_masks_dir / f"{video_folder.name}.pt"
-        if not human_mask_file.exists():
-            print(f"⚠ Human mask file not found: {human_mask_file}")
-            print(f"⚠ Skipping human mask subtraction for this video")
-            combined_human_mask = torch.zeros_like(combined_mask)
-        else:
-            print(f"Loading human masks from {human_mask_file}...")
-            human_mask_data = torch.load(human_mask_file, map_location='cpu')
-            human_masks = human_mask_data['masks']  # Shape: (T, O, H, W) from gsam_video
-            
-            print(f"✓ Loaded human masks with shape: {human_masks.shape}")
-            
-            # Combine human masks across all objects to get (T, H, W)
-            if human_masks.dim() == 4:  # (T, O, H, W) - expected format
-                # Combine all humans: any pixel that's True in any human mask
-                combined_human_mask = torch.any(human_masks > 0.5, dim=1).float()  # (T, H, W)
-            elif human_masks.dim() == 3:  # (T, H, W) - single object already combined
-                combined_human_mask = human_masks.float()
-            else:
-                print(f"⚠ Unexpected human mask shape: {human_masks.shape}. Skipping subtraction")
+        # Load human masks and subtract from object masks (if enabled)
+        if subtract_human_masks:
+            human_mask_file = input_human_masks_dir / f"{video_folder.name}.pt"
+            if not human_mask_file.exists():
+                print(f"⚠ Human mask file not found: {human_mask_file}")
+                print(f"⚠ Skipping human mask subtraction for this video")
                 combined_human_mask = torch.zeros_like(combined_mask)
+            else:
+                print(f"Loading human masks from {human_mask_file}...")
+                human_mask_data = torch.load(human_mask_file, map_location='cpu')
+                human_masks = human_mask_data['masks']  # Shape: (T, O, H, W) from gsam_video
+                
+                print(f"✓ Loaded human masks with shape: {human_masks.shape}")
+                
+                # Combine human masks across all objects to get (T, H, W)
+                if human_masks.dim() == 4:  # (T, O, H, W) - expected format
+                    # Combine all humans: any pixel that's True in any human mask
+                    combined_human_mask = torch.any(human_masks > 0.5, dim=1).float()  # (T, H, W)
+                elif human_masks.dim() == 3:  # (T, H, W) - single object already combined
+                    combined_human_mask = human_masks.float()
+                else:
+                    print(f"⚠ Unexpected human mask shape: {human_masks.shape}. Skipping subtraction")
+                    combined_human_mask = torch.zeros_like(combined_mask)
+                
+                print(f"✓ Combined human mask shape: {combined_human_mask.shape}")
             
-            print(f"✓ Combined human mask shape: {combined_human_mask.shape}")
-        
-        # Dilate human mask to create buffer zone around humans
-        if human_mask_dilation_pixels > 0 and combined_human_mask.sum() > 0:
-            print(f"Dilating human mask by {human_mask_dilation_pixels} pixels...")
-            kernel = np.ones((human_mask_dilation_pixels * 2 + 1, human_mask_dilation_pixels * 2 + 1), np.uint8)
-            dilated_human_mask_list = []
-            for t in range(combined_human_mask.shape[0]):
-                mask_np = combined_human_mask[t].numpy().astype(np.uint8)
-                dilated = cv2.dilate(mask_np, kernel, iterations=1)
-                dilated_human_mask_list.append(torch.from_numpy(dilated).float())
-            combined_human_mask = torch.stack(dilated_human_mask_list, dim=0)
-            print(f"✓ Human mask dilated")
-        
-        # Subtract human mask from object mask (clamp to [0, 1])
-        print(f"Subtracting human masks from object masks...")
-        combined_mask = torch.clamp(combined_mask - combined_human_mask, 0, 1)
-        print(f"✓ Human masks subtracted")
+            # Dilate human mask to create buffer zone around humans
+            if human_mask_dilation_pixels > 0 and combined_human_mask.sum() > 0:
+                print(f"Dilating human mask by {human_mask_dilation_pixels} pixels...")
+                kernel = np.ones((human_mask_dilation_pixels * 2 + 1, human_mask_dilation_pixels * 2 + 1), np.uint8)
+                dilated_human_mask_list = []
+                for t in range(combined_human_mask.shape[0]):
+                    mask_np = combined_human_mask[t].numpy().astype(np.uint8)
+                    dilated = cv2.dilate(mask_np, kernel, iterations=1)
+                    dilated_human_mask_list.append(torch.from_numpy(dilated).float())
+                combined_human_mask = torch.stack(dilated_human_mask_list, dim=0)
+                print(f"✓ Human mask dilated")
+            
+            # Subtract human mask from object mask (clamp to [0, 1])
+            print(f"Subtracting human masks from object masks...")
+            combined_mask = torch.clamp(combined_mask - combined_human_mask, 0, 1)
+            print(f"✓ Human masks subtracted")
+        else:
+            print(f"Human mask subtraction disabled (subtract_human_masks=False)")
         
         # Erode mask to avoid tracking unreliable edge points
         if mask_erosion_pixels > 0:

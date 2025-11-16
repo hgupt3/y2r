@@ -1,12 +1,17 @@
 from tkinter import NONE
 import cv2
 import os
+import sys
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import time
 import yaml
 import shutil
+
+# Setup paths
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
 
 def resize_and_minimal_crop(frame, target_width, target_height):
     """

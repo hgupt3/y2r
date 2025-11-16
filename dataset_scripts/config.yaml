@@ -22,8 +22,9 @@ common:
   # Common parameters
   device: &device "cuda:0"  # CUDA device to use across all stages
   target_fps: &target_fps 12  # FPS for both extraction and visualization
+  window_length: &window_length 16  # Number of frames per sliding window
   num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
-  continue: &continue true  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: &vis_flag true  # Enable/disable visualization videos
   
 # ===== PIPELINE STAGES =====
@@ -77,12 +78,13 @@ gsam:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 cotracker:
-  window_length: 16  # Number of frames per sliding window
+  window_length: *window_length  # Number of frames per sliding window
   stride: 1  # Step size between window starts
-  grid_size: 80  # Grid density for point tracking
+  grid_size: 100  # Grid density for point tracking
   visibility_threshold: 0.95  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   mask_erosion_pixels: 2  # Number of pixels to erode object mask (shrink) to avoid unreliable edge points
-  human_mask_dilation_pixels: 2  # Number of pixels to dilate human mask (expand) before subtraction to create buffer zone
+  subtract_human_masks: false  # Whether to subtract human masks from object masks (set to false to disable)
+  human_mask_dilation_pixels: 10  # Number of pixels to dilate human mask (expand) before subtraction to create buffer zone
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
   input_masks_dir: *masks_dir  # <- Input from gsam output (object masks)
   input_human_masks_dir: *human_masks_dir  # <- Input from gsam_human output (human masks to subtract)
@@ -92,5 +94,14 @@ cotracker:
   vis_flag: *vis_flag  # Enable visualization videos
   vis_path: *cotracker_vis_dir  # Where to save visualization videos
   vis_fps: *target_fps  # FPS for visualization videos
+  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+
+create_h5_dataset:
+  target_size: 128  # Target resolution for images (images will be center-cropped to square then resized)
+  num_track_ts: *window_length  # Number of future timesteps for tracks (should match cotracker window_length)
+  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
+  input_tracks_dir: *tracks_dir  # <- Input from cotracker output (track .pt files)
+  output_h5_dir: "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 

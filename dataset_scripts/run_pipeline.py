@@ -11,10 +11,11 @@ import time
 # Set to True to run the stage, False to skip it
 PIPELINE_CONFIG = {
     "preprocess": False,          # Extract and resize frames from videos
-    "gsam_human": True,          # Detect humans in frames
-    "diffueraser": True,         # Erase detected humans from frames
-    "gsam_world": True,          # Detect objects (e.g., blocks) in clean frames
-    "cotracker": True,           # Track points on clean frames
+    "gsam_human": False,          # Detect humans in frames
+    "diffueraser": False,         # Erase detected humans from frames
+    "gsam_world": False,          # Detect objects (e.g., blocks) in clean frames
+    "cotracker": False,           # Track points on clean frames
+    "create_h5_dataset": True,    # Create HDF5 dataset from tracks and frames
 }
 # =========================================
 
@@ -78,6 +79,7 @@ def main():
     print(f"  3. process_diffueraser.py - Erase humans from frames {'[ENABLED]' if PIPELINE_CONFIG['diffueraser'] else '[SKIPPED]'}")
     print(f"  4. process_gsam.py (world mode) - Detect objects on clean frames {'[ENABLED]' if PIPELINE_CONFIG['gsam_world'] else '[SKIPPED]'}")
     print(f"  5. process_cotracker.py - Track points on clean frames {'[ENABLED]' if PIPELINE_CONFIG['cotracker'] else '[SKIPPED]'}")
+    print(f"  6. create_h5_dataset.py - Create HDF5 dataset {'[ENABLED]' if PIPELINE_CONFIG['create_h5_dataset'] else '[SKIPPED]'}")
     print("="*70 + "\n")
     
     # Define all pipeline stages with their config keys
@@ -86,7 +88,8 @@ def main():
         ("gsam_human", "process_gsam.py", ["--mode", "human"]),
         ("diffueraser", "process_diffueraser.py", []),
         ("gsam_world", "process_gsam.py", ["--mode", "world"]),
-        ("cotracker", "process_cotracker.py", [])
+        ("cotracker", "process_cotracker.py", []),
+        ("create_h5_dataset", "create_h5_dataset.py", [])
     ]
     
     # Filter to only enabled scripts

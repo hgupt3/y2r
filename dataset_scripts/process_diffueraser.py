@@ -11,8 +11,12 @@ import time
 import shutil
 import tempfile
 
-# Add DiffuEraser to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'diffuEraser'))
+# Add thirdparty to path
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
+# Add diffuEraser to path for internal imports (libs, propainter, etc.)
+sys.path.insert(0, str(PROJECT_ROOT / "thirdparty" / "diffuEraser"))
 
 from diffuEraser.diffueraser.diffueraser import DiffuEraser
 from diffuEraser.propainter.inference import Propainter, get_device
@@ -104,8 +108,7 @@ def main():
     continue_mode = diffueraser_config.get('continue', False)
     
     # Model paths - set internally using relative paths
-    script_dir = Path(__file__).parent
-    diffueraser_dir = script_dir / "diffuEraser"
+    diffueraser_dir = PROJECT_ROOT / "thirdparty" / "diffuEraser"
     base_model_path = str(diffueraser_dir / "weights" / "stable-diffusion-v1-5")
     vae_path = str(diffueraser_dir / "weights" / "sd-vae-ft-mse")
     diffueraser_path = str(diffueraser_dir / "weights" / "diffuEraser")

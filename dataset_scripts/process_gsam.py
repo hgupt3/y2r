@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import torch
 import argparse
@@ -6,6 +7,12 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 import shutil
+
+# Add thirdparty to path
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
+
 from sam2.grounded_sam2 import gsam_video
 
 
@@ -93,8 +100,8 @@ def main():
     print("Loading SAM2 video predictor...")
     from sam2.build_sam import build_sam2_video_predictor
     sam2_predictor = build_sam2_video_predictor(
-        "configs/sam2.1/sam2.1_hiera_l.yaml",
-        "sam2/checkpoints/sam2.1_hiera_large.pt",
+        "configs/sam2.1/sam2.1_hiera_l.yaml",  # Hydra expects relative path to sam2 package
+        str(PROJECT_ROOT / "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"),
         device=device
     )
     print("✅ SAM2 loaded")

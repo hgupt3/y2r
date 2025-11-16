@@ -1,0 +1,20 @@
+dataset_dir: ???
+
+img_size: 128
+frame_stack: 1
+num_track_ts: 16
+num_track_ids: 32
+
+aug_prob: 0.9
+
+batch_size: 32
+num_workers: 4
+
+dataset_cfg:
+  img_size: ${img_size}
+  frame_stack: ${frame_stack}
+  num_track_ts: ${num_track_ts}
+  num_track_ids: ${num_track_ids}
+  cache_all: true
+  cache_image: false
+
