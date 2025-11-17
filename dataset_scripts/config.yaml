@@ -25,7 +25,7 @@ common:
   target_fps: &target_fps 12  # FPS for both extraction and visualization
   window_length: &window_length 16  # Number of frames per sliding window
   num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
-  continue: &continue true  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: &vis_flag true  # Enable/disable visualization videos
   
 # ===== PIPELINE STAGES =====
@@ -100,7 +100,7 @@ cotracker:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 create_h5_dataset:
-  target_size: 160  # Target resolution for images (images will be center-cropped to square then resized)
+  target_size: 224  # Target resolution for images (images will be center-cropped to square then resized)
   num_track_ts: *window_length  # Number of future timesteps for tracks (should match cotracker window_length)
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
   input_tracks_dir: *tracks_dir  # <- Input from cotracker output (track .pt files)

@@ -287,7 +287,46 @@ def process_video(video_folder, tracks_file, output_h5_path, config):
         'frames_with_tracks': frames_with_tracks,
         'avg_tracks': avg_tracks,
         'min_tracks_nonzero': min_tracks_nonzero,
-        'max_tracks': max_tracks
+        'max_tracks': max_tracks,
+        'tracks': per_frame_tracks_transformed  # For displacement statistics
+    }
+
+
+def compute_displacement_statistics(all_displacements):
+    """
+    Compute mean and std of displacements.
+    
+    Args:
+        all_displacements: List of displacement arrays, each (num_track_ts, N, 2)
+    
+    Returns:
+        dict with 'displacement_mean' and 'displacement_std'
+    """
+    # Flatten all displacements to (N_total, 2)
+    flattened = []
+    for disp in all_displacements:
+        # disp shape: (num_track_ts, N, 2)
+        if disp.shape[1] > 0:  # Skip empty tracks
+            flattened.append(disp.reshape(-1, 2))
+    
+    if len(flattened) == 0:
+        print("⚠ Warning: No tracks found for computing statistics!")
+        return {
+            'displacement_mean': [0.0, 0.0],
+            'displacement_std': [1.0, 1.0],
+            'num_samples': 0
+        }
+    
+    all_disp = np.concatenate(flattened, axis=0)  # (N_total, 2)
+    
+    # Compute statistics
+    disp_mean = all_disp.mean(axis=0).tolist()  # [mean_x, mean_y]
+    disp_std = all_disp.std(axis=0).tolist()    # [std_x, std_y]
+    
+    return {
+        'displacement_mean': disp_mean,
+        'displacement_std': disp_std,
+        'num_samples': int(len(all_disp))
     }
 
 
@@ -304,6 +343,9 @@ def main():
     output_h5_dir = Path(h5_config['output_h5_dir'])
     num_videos_to_process = h5_config['num_videos_to_process']
     continue_mode = h5_config.get('continue', False)
+    
+    # For displacement statistics computation
+    all_displacements = []
     
     # Delete previous output directory if not continuing
     if not continue_mode and output_h5_dir.exists():
@@ -382,6 +424,15 @@ def main():
                 all_stats.append(stats)
                 total_videos_processed += 1
                 
+                # Collect tracks for displacement statistics
+                # Convert positions to displacements (pos[t] - pos[0])
+                for tracks_t in stats['tracks']:
+                    # tracks_t shape: (num_track_ts, N, 2)
+                    if tracks_t.shape[1] > 0:  # Skip empty tracks
+                        initial_pos = tracks_t[0]  # (N, 2)
+                        displacements = tracks_t - initial_pos[None, :, :]  # (num_track_ts, N, 2)
+                        all_displacements.append(displacements)
+                
                 video_elapsed = time.time() - video_start_time
                 print(f"\n✓ Completed in {video_elapsed:.2f}s")
             else:
@@ -413,6 +464,29 @@ def main():
         print(f"  Total frames: {total_frames}")
         print(f"  Frames with tracks: {total_frames_with_tracks} ({100*total_frames_with_tracks/total_frames:.1f}%)")
         print(f"  Avg tracks per frame (non-zero): {avg_tracks_global:.1f}")
+    
+    # Compute and save displacement statistics
+    if all_displacements:
+        print(f"\n{'='*60}")
+        print(f"COMPUTING DISPLACEMENT STATISTICS")
+        print(f"{'='*60}")
+        print(f"Number of track samples: {len(all_displacements)}")
+        
+        disp_stats = compute_displacement_statistics(all_displacements)
+        
+        print(f"Displacement mean: {disp_stats['displacement_mean']}")
+        print(f"Displacement std: {disp_stats['displacement_std']}")
+        print(f"Total samples: {disp_stats['num_samples']}")
+        
+        # Save to YAML file in H5 directory
+        stats_path = output_h5_dir / 'normalization_stats.yaml'
+        with open(stats_path, 'w') as f:
+            yaml.dump(disp_stats, f)
+        
+        print(f"✓ Saved displacement statistics to: {stats_path}")
+        print(f"{'='*60}")
+    else:
+        print(f"\n⚠ Warning: No displacement data collected!")
     
     print(f"\nTotal time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:

@@ -1,20 +1,65 @@
 dataset_dir: "/home/harsh/sam/data/h5_dataset"
 
-img_size: 160
-frame_stack: 1
-num_track_ts: 16
-num_track_ids: 64
-
-aug_prob: 0.9
-
-batch_size: 32
-num_workers: 4
-
+# Dataset loader configuration
 dataset_cfg:
-  img_size: ${img_size}
-  frame_stack: ${frame_stack}
-  num_track_ts: ${num_track_ts}
-  num_track_ids: ${num_track_ids}
+  img_size: 224
+  frame_stack: 2
+  num_track_ts: 16
+  num_track_ids: 16
   cache_all: true
   cache_image: true  # Images are stored in HDF5 file, not separately on disk
 
+# Model configuration
+model:
+  num_future_steps: 16          # Match num_track_ts
+  hidden_size: 384
+  model_resolution: [224, 224]
+  add_space_attn: true
+  vit_model_name: 'dinov2_vits14'
+  vit_frozen: false             # Fine-tune ViT
+  time_depth: 7
+  space_depth: 7
+  num_heads: 8                  # Number of attention heads
+  mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
+  p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
+  frame_stack: 2                # Number of observation frames (match dataset_cfg.frame_stack)
+
+# Training configuration
+training:
+  # Training loop
+  num_epochs: 100
+  batch_size: 32                # Batch size (adjust based on GPU memory)
+  num_workers: 4                # DataLoader workers (adjust based on CPU cores)
+  aug_prob: 0.9                 # Data augmentation probability
+  
+  # Optimizer
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  
+  # Modern optimizations
+  use_amp: true                 # Mixed precision training
+  use_compile: true             # torch.compile for speed
+  ema_decay: 0.999              # Model EMA
+  
+  # Learning rate schedule (cosine with warmup)
+  lr_schedule: "cosine"
+  warmup_epochs: 5              # 5% of total epochs
+  min_lr: 1.0e-6                # Minimum LR for cosine decay
+  
+  # Validation
+  val_every_n_epochs: 5
+  val_split: 0.1                # 10% for validation
+  val_num_demos: null           # Or specify exact number
+  val_vis_samples: 64            # Number of samples to visualize
+  val_seed: 42                  # For consistent val split
+  
+  # Checkpointing
+  checkpoint_dir: "./checkpoints"  # Base directory (timestamped subdirs will be created)
+  
+  # Logging
+  wandb_project: "intent-tracker"
+  wandb_entity: null            # Your W&B username
+  log_every_n_steps: 10
+  log_gradients: true           # Log gradient norms
+  log_params: true              # Log parameter histograms (expensive, maybe every 100 steps)

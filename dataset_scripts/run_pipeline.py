@@ -10,11 +10,11 @@ import time
 # ===== PIPELINE STAGE CONFIGURATION =====
 # Set to True to run the stage, False to skip it
 PIPELINE_CONFIG = {
-    "preprocess": False,          # Extract and resize frames from videos
-    "gsam_human": False,          # Detect humans in frames
-    "diffueraser": False,         # Erase detected humans from frames
-    "gsam_world": False,          # Detect objects (e.g., blocks) in clean frames
-    "cotracker": False,           # Track points on clean frames
+    "preprocess": True,          # Extract and resize frames from videos
+    "gsam_human": True,          # Detect humans in frames
+    "diffueraser": True,         # Erase detected humans from frames
+    "gsam_world": True,          # Detect objects (e.g., blocks) in clean frames
+    "cotracker": True,           # Track points on clean frames
     "create_h5_dataset": True,    # Create HDF5 dataset from tracks and frames
 }
 # =========================================
