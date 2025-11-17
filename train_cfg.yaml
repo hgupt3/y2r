@@ -1,9 +1,9 @@
-dataset_dir: ???
+dataset_dir: "/home/harsh/sam/data/h5_dataset"
 
-img_size: 128
+img_size: 160
 frame_stack: 1
 num_track_ts: 16
-num_track_ids: 32
+num_track_ids: 64
 
 aug_prob: 0.9
 
@@ -16,5 +16,5 @@ dataset_cfg:
   num_track_ts: ${num_track_ts}
   num_track_ids: ${num_track_ids}
   cache_all: true
-  cache_image: false
+  cache_image: true  # Images are stored in HDF5 file, not separately on disk
 

@@ -288,31 +288,47 @@ def main():
     total_windows_processed = 0
     skipped_videos = 0
     start_time = time.time()
-    start_idx = 0
+    videos_to_process = []
     
-    # Efficient resume: Check only the last output .pt file
+    # Comprehensive resume: Check ALL output .pt files for completeness
     if continue_mode and output_tracks_dir.exists():
-        existing_tracks = sorted([f for f in output_tracks_dir.iterdir() if f.suffix == '.pt'])
+        print(f"\n{'='*60}")
+        print(f"CHECKING ALL EXISTING OUTPUTS FOR COMPLETENESS")
+        print(f"{'='*60}\n")
         
-        if existing_tracks:
-            last_track = existing_tracks[-1]
-            video_name = last_track.stem  # e.g., "00039.pt" -> "00039"
+        for idx, video_folder in enumerate(video_folders):
+            tracks_file = output_tracks_dir / f"{video_folder.name}.pt"
             
-            print(f"\n✓ Last tracks file {video_name}.pt exists (torch.save is atomic, so it's complete)")
+            # Check if .pt file exists (1a - just existence check)
+            if not tracks_file.exists():
+                videos_to_process.append(idx)
+                continue
             
-            # Find index in video_folders list and start from next
-            for i, vf in enumerate(video_folders):
-                if vf.name == video_name:
-                    start_idx = i + 1
-                    skipped_videos = i + 1
-                    break
-            
-            if start_idx > 0:
-                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
-                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+            # File exists, so it's complete (torch.save is atomic)
+            print(f"✓ Tracks file {video_folder.name}.pt exists")
+            skipped_videos += 1
+        
+        # Check for and delete orphaned visualization files (no corresponding .pt file)
+        if vis_flag and vis_path and vis_path.exists():
+            for vis_file in vis_path.glob("*_trajectory_summary.mp4"):
+                # Extract video name from filename (e.g., "00039_trajectory_summary.mp4" -> "00039")
+                video_name = vis_file.stem.replace("_trajectory_summary", "")
+                tracks_file = output_tracks_dir / f"{video_name}.pt"
+                if not tracks_file.exists():
+                    print(f"🗑️  Deleting orphaned visualization: {vis_file}")
+                    vis_file.unlink()
+        
+        if videos_to_process:
+            print(f"\n🔄 Found {len(videos_to_process)} videos to process")
+            print(f"⏭️  Skipping {skipped_videos} already complete videos\n")
+        else:
+            print(f"\n✅ All {skipped_videos} videos are already complete!\n")
+    else:
+        # Not continuing, process all videos
+        videos_to_process = list(range(len(video_folders)))
     
-    # Process each video folder with progress bar, starting from start_idx
-    for idx in range(start_idx, len(video_folders)):
+    # Process each video folder with progress bar, starting from videos_to_process
+    for idx in videos_to_process:
         video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")

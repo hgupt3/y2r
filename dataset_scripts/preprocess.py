@@ -199,57 +199,58 @@ def main():
     
     total_frames_processed = 0
     skipped_videos = 0
-    start_idx = 0
+    videos_to_process = []
     
-    # Efficient resume: Check only the last output folder
+    # Comprehensive resume: Check ALL output folders for completeness
     if CONTINUE and output_dir.exists():
-        existing_outputs = sorted([d for d in output_dir.iterdir() if d.is_dir() and d.name.isdigit()])
+        print(f"\n{'='*60}")
+        print(f"CHECKING ALL EXISTING OUTPUTS FOR COMPLETENESS")
+        print(f"{'='*60}\n")
         
-        if existing_outputs:
-            last_output = existing_outputs[-1]
-            video_idx = int(last_output.name)  # e.g., "00039" -> 39
+        for idx, video_path in enumerate(video_files):
+            output_folder = output_dir / f"{idx:05d}"
             
-            if video_idx < len(video_files):
-                video_path = video_files[video_idx]
-                
-                # Get video metadata to calculate expected frames
-                cap = cv2.VideoCapture(str(video_path))
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                original_fps = cap.get(cv2.CAP_PROP_FPS)
-                duration = total_frames / original_fps if original_fps > 0 else 0
-                cap.release()
-                
-                # Calculate expected output frames
-                if TARGET_FPS is not None and TARGET_FPS > 0:
-                    expected_output_frames = int(duration * TARGET_FPS)
-                else:
-                    expected_output_frames = total_frames
-                
-                # Check if last frame exists
-                if expected_output_frames > 0:
-                    last_frame_path = last_output / f"{expected_output_frames - 1:05d}.png"
-                    
-                    if last_frame_path.exists():
-                        print(f"\n✓ Last output {last_output.name} is complete ({expected_output_frames} frames)")
-                        start_idx = video_idx + 1  # Resume from next video
-                        skipped_videos = video_idx + 1  # Count all previous as skipped
-                    else:
-                        print(f"\n⚠️  Last output {last_output.name} is incomplete (expected {expected_output_frames} frames)")
-                        print(f"🗑️  Deleting incomplete output: {last_output}")
-                        shutil.rmtree(last_output)
-                        start_idx = video_idx  # Reprocess this video
-                        skipped_videos = video_idx  # Count all previous as skipped
-                else:
-                    # Can't determine expected frames, start from this video
-                    start_idx = video_idx
-                    skipped_videos = video_idx
+            # If output doesn't exist, mark for processing
+            if not output_folder.exists():
+                videos_to_process.append(idx)
+                continue
             
-            if start_idx > 0:
-                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_files)}")
-                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+            # Get video metadata to calculate expected frames
+            cap = cv2.VideoCapture(str(video_path))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            original_fps = cap.get(cv2.CAP_PROP_FPS)
+            duration = total_frames / original_fps if original_fps > 0 else 0
+            cap.release()
+            
+            # Calculate expected output frames
+            if TARGET_FPS is not None and TARGET_FPS > 0:
+                expected_output_frames = int(duration * TARGET_FPS)
+            else:
+                expected_output_frames = total_frames
+            
+            # Count actual frames in output folder
+            actual_frames = len(list(output_folder.glob("*.png")))
+            
+            if actual_frames != expected_output_frames:
+                print(f"⚠️  Output {output_folder.name} is incomplete: {actual_frames}/{expected_output_frames} frames")
+                print(f"🗑️  Deleting incomplete output: {output_folder}")
+                shutil.rmtree(output_folder)
+                videos_to_process.append(idx)
+            else:
+                print(f"✓ Output {output_folder.name} is complete ({actual_frames} frames)")
+                skipped_videos += 1
+        
+        if videos_to_process:
+            print(f"\n🔄 Found {len(videos_to_process)} videos to process")
+            print(f"⏭️  Skipping {skipped_videos} already complete videos\n")
+        else:
+            print(f"\n✅ All {skipped_videos} videos are already complete!\n")
+    else:
+        # Not continuing, process all videos
+        videos_to_process = list(range(len(video_files)))
     
-    # Process each video with overall progress, starting from start_idx
-    for idx in range(start_idx, len(video_files)):
+    # Process each video that needs processing
+    for idx in videos_to_process:
         video_path = video_files[idx]
         print(f"📹 Video {idx + 1}/{len(video_files)}")
         

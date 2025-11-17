@@ -20,11 +20,12 @@ common:
   cotracker_vis_dir: &cotracker_vis_dir "/home/harsh/sam/data/cotracker_vis"
   
   # Common parameters
+  detection_model: &detection_model "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
   device: &device "cuda:0"  # CUDA device to use across all stages
   target_fps: &target_fps 12  # FPS for both extraction and visualization
   window_length: &window_length 16  # Number of frames per sliding window
   num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
-  continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  continue: &continue true  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: &vis_flag true  # Enable/disable visualization videos
   
 # ===== PIPELINE STAGES =====
@@ -40,6 +41,7 @@ preprocess:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam_human:
+  detection_model: *detection_model  # Detection model: "grounding-dino" or "florence-2"
   text_prompt: "person."  # Text prompt for object detection (better detection than "human.")
   key_frame_idx: -1  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
   input_images_dir: *frames_dir  # <- Input from preprocess output
@@ -66,7 +68,8 @@ diffueraser:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam:
-  text_prompt: "small red T-shaped block."  # Text prompt for object detection
+  detection_model: *detection_model  # Detection model: "grounding-dino" or "florence-2"
+  text_prompt: "small red t-shaped block."  # Text prompt for object detection
   key_frame_idx: 0  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
   device: *device  # CUDA device to use
@@ -97,11 +100,11 @@ cotracker:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 create_h5_dataset:
-  target_size: 128  # Target resolution for images (images will be center-cropped to square then resized)
+  target_size: 160  # Target resolution for images (images will be center-cropped to square then resized)
   num_track_ts: *window_length  # Number of future timesteps for tracks (should match cotracker window_length)
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
   input_tracks_dir: *tracks_dir  # <- Input from cotracker output (track .pt files)
   output_h5_dir: "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  num_videos_to_process: null # *num_videos_to_process  # Number of video folders to process (set to null to process all)
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 

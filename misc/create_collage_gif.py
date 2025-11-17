@@ -7,17 +7,40 @@ import random
 from PIL import Image
 import imageio
 
-def load_video_frames(video_folder):
-    """Load all frames from a video folder"""
+def load_video_frames(video_source):
+    """
+    Load all frames from a video source (either MP4 file or folder with PNG frames)
+    Args:
+        video_source: Path object pointing to either an MP4 file or a folder with frames
+    Returns:
+        List of frames as numpy arrays (RGB format)
+    """
     frames = []
-    frame_files = sorted(video_folder.glob("*.png"))
     
-    for frame_file in frame_files:
-        img = cv2.imread(str(frame_file))
-        if img is not None:
-            # Convert BGR to RGB for PIL
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            frames.append(img)
+    if video_source.is_file() and video_source.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']:
+        # Load from video file
+        cap = cv2.VideoCapture(str(video_source))
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+        
+        cap.release()
+        
+    elif video_source.is_dir():
+        # Load from folder with PNG frames
+        frame_files = sorted(video_source.glob("*.png"))
+        
+        for frame_file in frame_files:
+            img = cv2.imread(str(frame_file))
+            if img is not None:
+                # Convert BGR to RGB
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                frames.append(img)
     
     return frames
 
@@ -86,37 +109,59 @@ def create_collage_gif(processed_videos_dir, output_file, grid_size=7, speed_mul
     print(f"Output: {output_file}")
     print(f"{'='*60}\n")
     
-    # Get all video folders
-    video_folders = sorted([f for f in Path(processed_videos_dir).iterdir() if f.is_dir()])
+    # Get all video sources (both MP4 files and folders with frames)
+    video_sources = []
+    for item in Path(processed_videos_dir).iterdir():
+        if item.is_dir():
+            # Check if directory contains PNG frames
+            if list(item.glob("*.png")):
+                video_sources.append(item)
+        elif item.is_file() and item.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']:
+            video_sources.append(item)
     
-    if len(video_folders) < grid_size * grid_size:
-        print(f"⚠️  Warning: Found {len(video_folders)} videos, but need {grid_size*grid_size} for a {grid_size}x{grid_size} grid.")
+    video_sources = sorted(video_sources)
+    
+    print(f"🔍 Found {len(video_sources)} video sources")
+    mp4_count = sum(1 for v in video_sources if v.is_file())
+    folder_count = sum(1 for v in video_sources if v.is_dir())
+    print(f"   - MP4 files: {mp4_count}")
+    print(f"   - Frame folders: {folder_count}\n")
+    
+    if len(video_sources) < grid_size * grid_size:
+        print(f"⚠️  Warning: Found {len(video_sources)} videos, but need {grid_size*grid_size} for a {grid_size}x{grid_size} grid.")
         print(f"   Will duplicate videos to fill the grid.\n")
+    
+    # Check if we have any videos at all
+    if len(video_sources) == 0:
+        print(f"❌ Error: No video sources found in {processed_videos_dir}")
+        print(f"   Expected: MP4 files or subdirectories containing PNG frames")
+        return
     
     # Randomly select and order videos
     required_videos = grid_size * grid_size
-    if len(video_folders) >= required_videos:
-        selected_folders = random.sample(video_folders, required_videos)
+    if len(video_sources) >= required_videos:
+        selected_sources = random.sample(video_sources, required_videos)
     else:
         # Duplicate videos if we don't have enough
-        selected_folders = []
-        while len(selected_folders) < required_videos:
-            selected_folders.extend(video_folders)
-        selected_folders = selected_folders[:required_videos]
-        random.shuffle(selected_folders)
+        selected_sources = []
+        while len(selected_sources) < required_videos:
+            selected_sources.extend(video_sources)
+        selected_sources = selected_sources[:required_videos]
+        random.shuffle(selected_sources)
     
-    print(f"📁 Loading {len(selected_folders)} videos...\n")
+    print(f"📁 Loading {len(selected_sources)} videos...\n")
     
     # Load all video frames
     video_frames_list = []
-    for i, folder in enumerate(tqdm(selected_folders, desc="Loading videos", unit="video")):
-        frames = load_video_frames(folder)
+    for i, source in enumerate(tqdm(selected_sources, desc="Loading videos", unit="video")):
+        frames = load_video_frames(source)
         if frames:
             video_frames_list.append(frames)
             if i == 0:
                 print(f"   Frame size: {frames[0].shape[1]}x{frames[0].shape[0]}")
+                print(f"   Sample source: {source.name} ({'MP4' if source.is_file() else 'folder'})")
         else:
-            print(f"   Warning: No frames found in {folder}")
+            print(f"   Warning: No frames found in {source}")
     
     if not video_frames_list:
         print("❌ Error: No video frames loaded!")
@@ -206,7 +251,7 @@ def create_collage_gif(processed_videos_dir, output_file, grid_size=7, speed_mul
 
 def main():
     # CONFIGURATION
-    PROCESSED_VIDEOS_DIR = "/home/harsh/sam/data/clean_frames"
+    PROCESSED_VIDEOS_DIR = "/home/harsh/sam/data/cotracker_vis"
     OUTPUT_FILE = "/home/harsh/sam/collage.gif"
     GRID_SIZE = 7  # 7x7 grid
     SPEED_MULTIPLIER = 3  # 3x speed

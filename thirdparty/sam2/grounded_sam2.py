@@ -23,7 +23,11 @@ def gsam_video(
     fps=12,
     grounding_model=None,  
     processor=None,  
-    sam2_predictor=None 
+    sam2_predictor=None,
+    detection_model="grounding-dino",  # "grounding-dino" or "florence-2"
+    florence2_model=None,  # Pre-loaded Florence-2 model
+    florence2_processor=None,  # Pre-loaded Florence-2 processor
+    florence2_model_id="microsoft/Florence-2-large"  # Florence-2 model ID
 ):
     """
     Processes a folder of PNG frames to detect and segment objects based on a text prompt.
@@ -40,6 +44,10 @@ def gsam_video(
         box_threshold (float, optional): Confidence threshold for bounding boxes. 
         text_threshold (float, optional): Confidence threshold for text labels.
         fps (float, optional): FPS for output visualization video. Defaults to 12.
+        detection_model (str, optional): Detection model to use ("grounding-dino" or "florence-2"). Defaults to "grounding-dino".
+        florence2_model (optional): Pre-loaded Florence-2 model (used when detection_model is "florence-2").
+        florence2_processor (optional): Pre-loaded Florence-2 processor (used when detection_model is "florence-2").
+        florence2_model_id (str, optional): HuggingFace model ID for Florence-2. Defaults to "microsoft/Florence-2-large".
 
     Returns:
         numpy.ndarray: 4D array of masks with shape (T, O, H, W).
@@ -94,48 +102,112 @@ def gsam_video(
     key_frame_rgb = cv2.cvtColor(key_frame, cv2.COLOR_BGR2RGB)
 
     # ------------------------------
-    # Step 2: Run Grounding DINO on a key frame
+    # Step 2: Run object detection on a key frame
     # ------------------------------
-    # Load models only if not provided (for backwards compatibility)
-    if processor is None or grounding_model is None:
-        print("Loading Grounding DINO model...")
-        processor = AutoProcessor.from_pretrained(grounding_model_id)
-        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(grounding_model_id).to(device)
-    
-    print(f"Running object detection on key frame {actual_key_frame_idx} (of {T} total frames) with prompt: '{text_prompt}'...")
     key_frame_pil = Image.fromarray(key_frame_rgb)
+    
+    if detection_model == "grounding-dino":
+        # Load Grounding DINO models only if not provided (for backwards compatibility)
+        if processor is None or grounding_model is None:
+            print("Loading Grounding DINO model...")
+            processor = AutoProcessor.from_pretrained(grounding_model_id)
+            grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(grounding_model_id).to(device)
+        
+        print(f"Running Grounding DINO detection on key frame {actual_key_frame_idx} (of {T} total frames) with prompt: '{text_prompt}'...")
 
-    # Prepare input for Grounding DINO
-    inputs = processor(
-        images=key_frame_pil,
-        text=text_prompt,
-        return_tensors="pt"
-    ).to(device)
+        # Prepare input for Grounding DINO
+        inputs = processor(
+            images=key_frame_pil,
+            text=text_prompt,
+            return_tensors="pt"
+        ).to(device)
+        
+        with torch.no_grad():
+            outputs = grounding_model(**inputs)
+        
+        # Post-process the results to get bounding boxes and text labels
+        # Note: post_process_grounded_object_detection API changed in transformers 4.57+
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            target_sizes=[key_frame_pil.size[::-1]],  # (height, width)
+            threshold=box_threshold  # Combined threshold parameter in newer versions
+        )
+        
+        print(f"Detection complete. Found {len(results[0]['boxes'])} objects.")
+        
+        if len(results[0]["boxes"]) == 0:
+            print("No objects found by Grounding DINO.")
+            return None, None
+        
+        # Boxes (Nx4) and text labels (list of strings)
+        input_boxes = results[0]["boxes"].cpu().numpy()        # shape (N, 4)
+        text_labels = results[0]["labels"]                     # list of N strings
+        num_objects = len(input_boxes)
     
-    with torch.no_grad():
-        outputs = grounding_model(**inputs)
+    elif detection_model == "florence-2":
+        # Load Florence-2 models only if not provided
+        if florence2_processor is None or florence2_model is None:
+            print(f"Loading Florence-2 model ({florence2_model_id})...")
+            from transformers import AutoModelForCausalLM
+            florence2_processor = AutoProcessor.from_pretrained(florence2_model_id, trust_remote_code=True)
+            florence2_model = AutoModelForCausalLM.from_pretrained(
+                florence2_model_id, 
+                trust_remote_code=True, 
+                attn_implementation="eager"  # Use eager attention to avoid compatibility issues
+            ).eval().to(device)
+        
+        print(f"Running Florence-2 detection on key frame {actual_key_frame_idx} (of {T} total frames) with prompt: '{text_prompt}'...")
+        
+        # Use OPEN_VOCABULARY_DETECTION task for Florence-2
+        task_prompt = "<OPEN_VOCABULARY_DETECTION>"
+        prompt = task_prompt + text_prompt
+        
+        # Prepare input for Florence-2
+        inputs = florence2_processor(
+            text=prompt,
+            images=key_frame_pil,
+            return_tensors="pt"
+        ).to(device)
+        
+        # Generate predictions
+        with torch.no_grad():
+            generated_ids = florence2_model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                early_stopping=False,
+                do_sample=False,
+                num_beams=3,
+                use_cache=False  # Disable KV cache to avoid beam search issues
+            )
+        
+        # Decode and parse results
+        generated_text = florence2_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        parsed_answer = florence2_processor.post_process_generation(
+            generated_text,
+            task=task_prompt,
+            image_size=(key_frame_pil.width, key_frame_pil.height)
+        )
+        
+        # Extract results from Florence-2 format
+        results = parsed_answer[task_prompt]
+        
+        if len(results.get("bboxes", [])) == 0:
+            print("No objects found by Florence-2.")
+            return None, None
+        
+        print(f"Detection complete. Found {len(results['bboxes'])} objects.")
+        
+        # Parse Florence-2 detection results
+        input_boxes = np.array(results["bboxes"])              # shape (N, 4)
+        text_labels = results["bboxes_labels"]                  # list of N strings
+        num_objects = len(input_boxes)
     
-    # Post-process the results to get bounding boxes and text labels
-    # Note: post_process_grounded_object_detection API changed in transformers 4.57+
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        target_sizes=[key_frame_pil.size[::-1]],  # (height, width)
-        threshold=box_threshold  # Combined threshold parameter in newer versions
-    )
-    
-    print(f"Detection complete. Found {len(results[0]['boxes'])} objects.")
-    
-    if len(results[0]["boxes"]) == 0:
-        print("No objects found by Grounding DINO.")
-        return None, None
-    
-    # Boxes (Nx4) and text labels (list of strings)
-    input_boxes = results[0]["boxes"].cpu().numpy()        # shape (N, 4)
-    text_labels = results[0]["labels"]                     # list of N strings
-    num_objects = len(input_boxes)
+    else:
+        raise ValueError(f"Unknown detection_model: {detection_model}. Must be 'grounding-dino' or 'florence-2'.")
 
-    # Build an object ID -> name mapping from DINO's text labels
+    # Build an object ID -> name mapping from detection model's text labels
     # e.g. {1: "apple", 2: "apple", 3: "pear", ...}
     object_dict = {}
     for i, label_str in enumerate(text_labels):

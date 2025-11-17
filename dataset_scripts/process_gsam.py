@@ -38,6 +38,7 @@ def main():
     gsam_config = config[config_key]
     
     # Extract configuration
+    detection_model = gsam_config.get('detection_model', 'grounding-dino')  # Default to grounding-dino
     text_prompt = gsam_config['text_prompt']
     key_frame_idx = gsam_config.get('key_frame_idx', 0)  # Default to 0 if not specified
     input_images_dir = Path(gsam_config['input_images_dir'])
@@ -76,6 +77,7 @@ def main():
     print(f"GSAM VIDEO PROCESSING CONFIGURATION")
     print(f"{'='*60}")
     print(f"Mode: {args.mode}")
+    print(f"Detection model: {detection_model}")
     print(f"Text prompt: {text_prompt}")
     print(f"Key frame index: {key_frame_idx} ({'middle frame' if key_frame_idx == -1 else f'frame {key_frame_idx}'})")
     print(f"Input directory: {input_images_dir}")
@@ -91,11 +93,32 @@ def main():
     print(f"{'='*60}")
     print("LOADING MODELS (one-time initialization)")
     print(f"{'='*60}")
-    print("Loading Grounding DINO model...")
-    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-    processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").to(device)
-    print("✅ Grounding DINO loaded")
+    
+    # Initialize variables for detection models
+    grounding_model = None
+    processor = None
+    florence2_model = None
+    florence2_processor = None
+    
+    # Load detection model based on configuration
+    if detection_model == "grounding-dino":
+        print("Loading Grounding DINO model...")
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
+        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").to(device)
+        print("✅ Grounding DINO loaded")
+    elif detection_model == "florence-2":
+        print(f"Loading Florence-2 model (microsoft/Florence-2-large)...")
+        from transformers import AutoProcessor, AutoModelForCausalLM
+        florence2_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
+        florence2_model = AutoModelForCausalLM.from_pretrained(
+            "microsoft/Florence-2-large",
+            trust_remote_code=True,
+            attn_implementation="eager"  # Use eager attention to avoid compatibility issues
+        ).eval().to(device)
+        print("✅ Florence-2 loaded")
+    else:
+        raise ValueError(f"Unknown detection_model: {detection_model}. Must be 'grounding-dino' or 'florence-2'.")
     
     print("Loading SAM2 video predictor...")
     from sam2.build_sam import build_sam2_video_predictor
@@ -110,31 +133,46 @@ def main():
     total_videos_processed = 0
     skipped_videos = 0
     start_time = time.time()
-    start_idx = 0
+    videos_to_process = []
     
-    # Efficient resume: Check only the last output .pt file
+    # Comprehensive resume: Check ALL output .pt files for completeness
     if continue_mode and output_masks_dir.exists():
-        existing_masks = sorted([f for f in output_masks_dir.iterdir() if f.suffix == '.pt'])
+        print(f"\n{'='*60}")
+        print(f"CHECKING ALL EXISTING OUTPUTS FOR COMPLETENESS")
+        print(f"{'='*60}\n")
         
-        if existing_masks:
-            last_mask = existing_masks[-1]
-            video_name = last_mask.stem  # e.g., "00039.pt" -> "00039"
+        for idx, video_folder in enumerate(video_folders):
+            mask_file = output_masks_dir / f"{video_folder.name}.pt"
             
-            print(f"\n✓ Last mask file {video_name}.pt exists (torch.save is atomic, so it's complete)")
+            # Check if .pt file exists (1a - just existence check)
+            if not mask_file.exists():
+                videos_to_process.append(idx)
+                continue
             
-            # Find index in video_folders list and start from next
-            for i, vf in enumerate(video_folders):
-                if vf.name == video_name:
-                    start_idx = i + 1
-                    skipped_videos = i + 1
-                    break
-            
-            if start_idx > 0:
-                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
-                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+            # File exists, so it's complete (torch.save is atomic)
+            print(f"✓ Mask file {video_folder.name}.pt exists")
+            skipped_videos += 1
+        
+        # Check for and delete orphaned visualization files (no corresponding .pt file)
+        if vis_flag and vis_path and vis_path.exists():
+            for vis_file in vis_path.glob("*.mp4"):
+                video_name = vis_file.stem  # e.g., "00039.mp4" -> "00039"
+                mask_file = output_masks_dir / f"{video_name}.pt"
+                if not mask_file.exists():
+                    print(f"🗑️  Deleting orphaned visualization: {vis_file}")
+                    vis_file.unlink()
+        
+        if videos_to_process:
+            print(f"\n🔄 Found {len(videos_to_process)} videos to process")
+            print(f"⏭️  Skipping {skipped_videos} already complete videos\n")
+        else:
+            print(f"\n✅ All {skipped_videos} videos are already complete!\n")
+    else:
+        # Not continuing, process all videos
+        videos_to_process = list(range(len(video_folders)))
     
-    # Process each video folder, starting from start_idx
-    for idx in range(start_idx, len(video_folders)):
+    # Process each video folder that needs processing
+    for idx in videos_to_process:
         video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
@@ -156,9 +194,12 @@ def main():
             video_name=video_name,  # Pass video name for unique filenames
             device=device,
             fps=vis_fps,
-            grounding_model=grounding_model,  # Pass pre-loaded model
-            processor=processor,  # Pass pre-loaded processor
-            sam2_predictor=sam2_predictor  # Pass pre-loaded SAM2 predictor
+            grounding_model=grounding_model,  # Pass pre-loaded DINO model (if using DINO)
+            processor=processor,  # Pass pre-loaded DINO processor (if using DINO)
+            sam2_predictor=sam2_predictor,  # Pass pre-loaded SAM2 predictor
+            detection_model=detection_model,  # Pass detection model choice
+            florence2_model=florence2_model,  # Pass pre-loaded Florence-2 model (if using Florence)
+            florence2_processor=florence2_processor  # Pass pre-loaded Florence-2 processor (if using Florence)
         )
         
         if masks_4d is None:

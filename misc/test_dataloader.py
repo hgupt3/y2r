@@ -16,9 +16,10 @@ from dataloaders.track_dataloader import TrackDataset
 from dataloaders.utils import get_dataloader
 
 
-def visualize_sample(imgs, tracks, sample_idx, output_dir, img_size=128):
+def visualize_sample(imgs, tracks, sample_idx, output_dir, img_size=128, vis_scale=4):
     """
-    Visualize a sample with trajectory overlay.
+    Visualize a sample with trajectory overlay using CoTracker-style visualization.
+    Upscales the image for better visualization quality.
     
     Args:
         imgs: (frame_stack, C, H, W) - image tensor [0-255]
@@ -26,59 +27,63 @@ def visualize_sample(imgs, tracks, sample_idx, output_dir, img_size=128):
         sample_idx: Sample index for filename
         output_dir: Directory to save visualization
         img_size: Image size
+        vis_scale: Scale factor for visualization (default 4x = 512x512 from 128x128)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Import CoTracker visualizer
+    import sys
+    from pathlib import Path as P
+    sys.path.insert(0, str(P(__file__).parent / "thirdparty"))
+    from cotracker3.cotracker.utils.visualizer import Visualizer
+    import torch.nn.functional as F
+    
     # Get the last frame (most recent observation)
-    frame = imgs[-1].numpy()  # (C, H, W)
-    frame = np.transpose(frame, (1, 2, 0))  # (H, W, C)
-    frame = frame.astype(np.uint8)
-    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # For cv2 saving
+    frame = imgs[-1]  # (C, H, W), float32 [0-255]
     
-    # Create visualization canvas
-    vis_frame = frame.copy()
+    # Upscale frame for better visualization
+    vis_size = img_size * vis_scale
+    frame_upscaled = F.interpolate(
+        frame.unsqueeze(0),  # Add batch: (1, C, H, W)
+        size=(vis_size, vis_size),
+        mode='bilinear',
+        align_corners=False
+    ).squeeze(0)  # Remove batch: (C, H, W)
     
-    num_track_ts, num_points, _ = tracks.shape
+    # Darken frame for better trajectory visibility (like CoTracker does)
+    frame_darkened = frame_upscaled * 0.5
     
-    # Generate colors for each track point
-    np.random.seed(42)  # Consistent colors
-    colors = []
-    for _ in range(num_points):
-        color = (
-            int(np.random.randint(50, 255)),
-            int(np.random.randint(50, 255)),
-            int(np.random.randint(50, 255))
-        )
-        colors.append(color)
+    # Convert tracks to pixel coordinates at upscaled resolution
+    tracks_px = tracks.clone()
+    tracks_px = tracks_px * vis_size  # Denormalize to upscaled pixel space
     
-    # Draw trajectories
-    for point_idx in range(num_points):
-        trajectory = tracks[:, point_idx, :]  # (num_track_ts, 2)
-        
-        # Convert normalized coordinates to pixel coordinates
-        trajectory_px = trajectory.numpy() * img_size
-        trajectory_px = trajectory_px.astype(np.int32)
-        
-        # Draw lines connecting trajectory points
-        for t in range(len(trajectory_px) - 1):
-            pt1 = tuple(trajectory_px[t])
-            pt2 = tuple(trajectory_px[t + 1])
-            cv2.line(vis_frame, pt1, pt2, colors[point_idx], thickness=1, lineType=cv2.LINE_AA)
-        
-        # Draw start point (larger circle)
-        start_pt = tuple(trajectory_px[0])
-        cv2.circle(vis_frame, start_pt, radius=3, color=colors[point_idx], thickness=-1)
+    # Add batch dimension: (num_track_ts, num_points, 2) -> (1, num_track_ts, num_points, 2)
+    tracks_batch = tracks_px.unsqueeze(0)
+    
+    # Create visualizer with thin lines (circle radius = linewidth * 2)
+    # At 4x upscale, linewidth=1 gives nice thin lines and small circles
+    vis = Visualizer(save_dir=str(output_dir), pad_value=0, linewidth=1)
+    
+    # Render trajectory on frame
+    rendered_frame = vis.visualize_trajectory_on_frame(
+        frame=frame_darkened,
+        tracks=tracks_batch,  # (1, num_track_ts, num_points, 2)
+        visibility=None,
+        segm_mask=None,
+        query_frame=0,
+        opacity=1.0,
+    )
     
     # Save visualization
     output_path = output_dir / f"sample_{sample_idx:03d}_trajectories.png"
-    cv2.imwrite(str(output_path), vis_frame)
+    cv2.imwrite(str(output_path), cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR))
     
     return output_path
 
 
 def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_track_ids=32, 
-                   visualize=False, vis_dir="test_visualizations", num_vis_samples=5):
+                   visualize=False, vis_dir="test_visualizations", num_vis_samples=5, vis_scale=4):
     """
     Test loading data from HDF5 files.
     
@@ -91,6 +96,7 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
         visualize: Whether to create visualizations (default False)
         vis_dir: Directory to save visualizations (default "test_visualizations")
         num_vis_samples: Number of samples to visualize (default 5)
+        vis_scale: Upscaling factor for visualization quality (default 4x)
     """
     print(f"\n{'='*70}")
     print("TESTING DATALOADER WITH H5 DATASET")
@@ -112,7 +118,7 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
             num_track_ids=num_track_ids,
             frame_stack=frame_stack,
             cache_all=True,
-            cache_image=False,
+            cache_image=True,  # Images are stored in HDF5, keep them in cache
             num_demos=None,
             aug_prob=0.0  # No augmentation for testing
         )
@@ -199,6 +205,15 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
         print(f"\nCreating visualizations...")
         vis_output_dir = Path(vis_dir)
         
+        # Delete previous visualizations
+        if vis_output_dir.exists():
+            import shutil
+            print(f"  Deleting previous visualizations in {vis_output_dir}...")
+            shutil.rmtree(vis_output_dir)
+        
+        # Create fresh output directory
+        vis_output_dir.mkdir(parents=True, exist_ok=True)
+        
         # Select random samples to visualize
         num_to_vis = min(num_vis_samples, len(dataset))
         sample_indices = random.sample(range(len(dataset)), num_to_vis)
@@ -206,7 +221,7 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
         for i, idx in enumerate(sample_indices):
             try:
                 imgs, tracks = dataset[idx]
-                output_path = visualize_sample(imgs, tracks, idx, vis_output_dir, img_size)
+                output_path = visualize_sample(imgs, tracks, idx, vis_output_dir, img_size, vis_scale=vis_scale)
                 print(f"  ✓ Saved visualization {i+1}/{num_to_vis}: {output_path}")
             except Exception as e:
                 print(f"  ✗ Failed to visualize sample {idx}: {e}")
@@ -224,24 +239,40 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
 
 if __name__ == "__main__":
     import argparse
+    import yaml
+    
+    # Load defaults from train_cfg.yaml
+    train_cfg_path = Path(__file__).parent / "train_cfg.yaml"
+    if train_cfg_path.exists():
+        with open(train_cfg_path, 'r') as f:
+            train_cfg = yaml.safe_load(f)
+        default_h5_dir = train_cfg.get('dataset_dir', '/home/harsh/sam/data/h5_dataset')
+        default_img_size = train_cfg.get('img_size', 128)
+        default_frame_stack = train_cfg.get('frame_stack', 1)
+        default_num_track_ts = train_cfg.get('num_track_ts', 16)
+        default_num_track_ids = train_cfg.get('num_track_ids', 32)
+    else:
+        raise ValueError(f"train_cfg.yaml not found at {train_cfg_path}")
     
     parser = argparse.ArgumentParser(description="Test HDF5 dataset with dataloader")
-    parser.add_argument("--h5_dir", type=str, default="/home/harsh/sam/data/h5_dataset",
-                        help="Directory containing .hdf5 files")
-    parser.add_argument("--img_size", type=int, default=128,
-                        help="Image size")
-    parser.add_argument("--frame_stack", type=int, default=1,
-                        help="Number of frames to stack")
-    parser.add_argument("--num_track_ts", type=int, default=16,
-                        help="Number of future track timesteps")
-    parser.add_argument("--num_track_ids", type=int, default=32,
-                        help="Minimum number of tracks per frame")
+    parser.add_argument("--h5_dir", type=str, default=default_h5_dir,
+                        help=f"Directory containing .hdf5 files (default: from train_cfg.yaml)")
+    parser.add_argument("--img_size", type=int, default=default_img_size,
+                        help=f"Image size (default: {default_img_size} from train_cfg.yaml)")
+    parser.add_argument("--frame_stack", type=int, default=default_frame_stack,
+                        help=f"Number of frames to stack (default: {default_frame_stack} from train_cfg.yaml)")
+    parser.add_argument("--num_track_ts", type=int, default=default_num_track_ts,
+                        help=f"Number of future track timesteps (default: {default_num_track_ts} from train_cfg.yaml)")
+    parser.add_argument("--num_track_ids", type=int, default=default_num_track_ids,
+                        help=f"Minimum number of tracks per frame (default: {default_num_track_ids} from train_cfg.yaml)")
     parser.add_argument("--visualize", action="store_true",
                         help="Create visualizations of samples")
     parser.add_argument("--vis_dir", type=str, default="test_visualizations",
                         help="Directory to save visualizations")
-    parser.add_argument("--num_vis_samples", type=int, default=5,
+    parser.add_argument("--num_vis_samples", type=int, default=20,
                         help="Number of samples to visualize")
+    parser.add_argument("--vis_scale", type=int, default=2,
+                        help="Upscaling factor for visualization (e.g., 4 = 512x512 from 128x128)")
     
     args = parser.parse_args()
     
@@ -253,7 +284,8 @@ if __name__ == "__main__":
         num_track_ids=args.num_track_ids,
         visualize=args.visualize,
         vis_dir=args.vis_dir,
-        num_vis_samples=args.num_vis_samples
+        num_vis_samples=args.num_vis_samples,
+        vis_scale=args.vis_scale
     )
     
     sys.exit(0 if success else 1)

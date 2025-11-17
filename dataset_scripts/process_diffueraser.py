@@ -160,52 +160,50 @@ def main():
     total_videos_processed = 0
     skipped_videos = 0
     start_time = time.time()
-    start_idx = 0
+    videos_to_process = []
     
-    # Efficient resume: Check only the last output folder
+    # Comprehensive resume: Check ALL output folders for completeness
     if continue_mode and output_frames_dir.exists():
-        existing_outputs = sorted([d for d in output_frames_dir.iterdir() if d.is_dir()])
+        print(f"\n{'='*60}")
+        print(f"CHECKING ALL EXISTING OUTPUTS FOR COMPLETENESS")
+        print(f"{'='*60}\n")
         
-        if existing_outputs:
-            last_output = existing_outputs[-1]
-            video_name = last_output.name
+        for idx, video_folder in enumerate(video_folders):
+            output_folder = output_frames_dir / video_folder.name
             
-            # Find corresponding input folder
-            input_folder = input_images_dir / video_name
+            # If output doesn't exist, mark for processing
+            if not output_folder.exists():
+                videos_to_process.append(idx)
+                continue
             
-            if input_folder.exists():
-                # Get last frame from input
-                input_frames = sorted(input_folder.glob("*.png"))
-                
-                if input_frames:
-                    last_frame_name = input_frames[-1].name
-                    last_output_frame = last_output / last_frame_name
-                    
-                    if last_output_frame.exists():
-                        print(f"\n✓ Last output {video_name} is complete (last frame: {last_frame_name})")
-                        # Find index in video_folders list and start from next
-                        for i, vf in enumerate(video_folders):
-                            if vf.name == video_name:
-                                start_idx = i + 1
-                                skipped_videos = i + 1
-                                break
-                    else:
-                        print(f"\n⚠️  Last output {video_name} is incomplete (missing last frame: {last_frame_name})")
-                        print(f"🗑️  Deleting incomplete output: {last_output}")
-                        shutil.rmtree(last_output)
-                        # Find index and reprocess this video
-                        for i, vf in enumerate(video_folders):
-                            if vf.name == video_name:
-                                start_idx = i
-                                skipped_videos = i
-                                break
+            # Get input frame count
+            input_frames = sorted(video_folder.glob("*.png"))
+            expected_frame_count = len(input_frames)
             
-            if start_idx > 0:
-                print(f"🔄 Resuming from video {start_idx + 1}/{len(video_folders)}")
-                print(f"⏭️  Skipping {start_idx} already processed videos\n")
+            # Count actual frames in output folder
+            output_frames = sorted(output_folder.glob("*.png"))
+            actual_frame_count = len(output_frames)
+            
+            if actual_frame_count != expected_frame_count:
+                print(f"⚠️  Output {video_folder.name} is incomplete: {actual_frame_count}/{expected_frame_count} frames")
+                print(f"🗑️  Deleting incomplete output: {output_folder}")
+                shutil.rmtree(output_folder)
+                videos_to_process.append(idx)
+            else:
+                print(f"✓ Output {video_folder.name} is complete ({actual_frame_count} frames)")
+                skipped_videos += 1
+        
+        if videos_to_process:
+            print(f"\n🔄 Found {len(videos_to_process)} videos to process")
+            print(f"⏭️  Skipping {skipped_videos} already complete videos\n")
+        else:
+            print(f"\n✅ All {skipped_videos} videos are already complete!\n")
+    else:
+        # Not continuing, process all videos
+        videos_to_process = list(range(len(video_folders)))
     
-    # Process each video folder, starting from start_idx
-    for idx in range(start_idx, len(video_folders)):
+    # Process each video folder that needs processing
+    for idx in videos_to_process:
         video_folder = video_folders[idx]
         print(f"\n{'='*60}")
         print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
