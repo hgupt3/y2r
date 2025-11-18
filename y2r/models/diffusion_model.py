@@ -73,11 +73,12 @@ class DiffusionIntentTracker(nn.Module):
 
         # Observation temporal embeddings for past frames
         # Frames at relative times: [-frame_stack+1, ..., -1, 0]
+        # NOTE: This is ADDED to ViT features, so it must be hidden_size (384), not temporal_dim
         obs_time_grid = torch.linspace(-(frame_stack - 1), 0, frame_stack).reshape(
             1, frame_stack, 1
         )
         self.register_buffer(
-            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, obs_time_grid[0])
+            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
         )
         
         # Diffusion timestep embedding (for encoding which diffusion step we're at)
