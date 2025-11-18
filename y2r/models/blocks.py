@@ -411,8 +411,9 @@ class AttnBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # Don't pass 'drop' to attention - it's only for MLP
+        dim_head = hidden_size // num_heads
         self.attn = attn_class(
-            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
+            hidden_size, num_heads=num_heads, dim_head=dim_head, qkv_bias=True, **block_kwargs
         )
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -446,10 +447,12 @@ class CrossAttnBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm_context = nn.LayerNorm(hidden_size)
+        dim_head = hidden_size // num_heads
         self.cross_attn = Attention(
             hidden_size,
             context_dim=context_dim,
             num_heads=num_heads,
+            dim_head=dim_head,
             qkv_bias=True,
             **block_kwargs
         )
@@ -484,7 +487,7 @@ class CrossAttnBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
     
-
+    
 class EfficientUpdateFormer(nn.Module):
     """
     Transformer model that updates track estimates.

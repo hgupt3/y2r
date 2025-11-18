@@ -168,7 +168,7 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     
     Args:
         vis_data: List of dicts with keys:
-            - 'frame': (1, 3, H, W) tensor
+            - 'frame': (1, frame_stack, 3, H, W) tensor
             - 'gt_tracks': (num_track_ts, N, 2) tensor - GT positions in [0, 1]
             - 'pred_disp': (1, N, T, 2) tensor - predicted displacements (normalized)
             - 'query_coords': (N, 2) tensor - initial positions in [0, 1]
@@ -184,7 +184,8 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     std = disp_stats['displacement_std']
     
     for idx, sample in enumerate(vis_data):
-        frame = sample['frame'][0]  # (3, H, W)
+        # Use the last (most recent) frame for visualization
+        frame = sample['frame'][0, -1]  # (3, H, W)
         gt_tracks_data = sample['gt_tracks']  # (T, N, 2) - positions
         pred_disp = sample['pred_disp'][0]  # (N, T, 2) - displacements (normalized)
         query_coords = sample['query_coords']  # (N, 2)

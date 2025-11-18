@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import torch
 import torchvision.transforms.functional as TF
 
@@ -39,14 +40,17 @@ class TrackDataset(SimpleBaseDataset):
     """
     
     def __init__(self, h5_files=None, dataset_dir=None, img_size=224, num_track_ts=16, 
-                 num_track_ids=64, frame_stack=1, cache_all=False, cache_image=False, 
-                 num_demos=None, aug_prob=0.):
+                 num_track_ids=64, frame_stack=1, downsample_factor=1, cache_all=False, cache_image=False, 
+                 num_demos=None, aug_prob=0.,
+                 aug_color_jitter=None, aug_translation_px=0, aug_rotation_deg=0,
+                 aug_hflip_prob=0.0, aug_vflip_prob=0.0, aug_noise_std=0.0):
         """
         Initialize TrackDataset.
         
         Args:
             h5_files: Optional list of specific .hdf5 file paths (for train/val split)
             dataset_dir: Optional directory to scan for .hdf5 files (alternative to h5_files)
+            aug_*: Augmentation configuration parameters
             Other args: Same as SimpleBaseDataset
         """
         if h5_files is not None and dataset_dir is not None:
@@ -71,6 +75,7 @@ class TrackDataset(SimpleBaseDataset):
             img_size = (img_size, img_size)
         self.img_size = img_size
         self.frame_stack = frame_stack
+        self.downsample_factor = downsample_factor
         self.num_demos = num_demos
         self.num_track_ts = num_track_ts
         self.num_track_ids = num_track_ids
@@ -123,12 +128,137 @@ class TrackDataset(SimpleBaseDataset):
         
         # Setup augmentation
         from torchvision import transforms
-        from .utils import ImgTrackColorJitter, ImgViewDiffTranslationAug
+        from .utils import (ImgTrackColorJitter, ImgViewDiffTranslationAug, 
+                           ImgTrackRandomRotate, ImgTrackRandomHorizontalFlip,
+                           ImgTrackRandomVerticalFlip, ImgTrackGaussianNoise)
         
-        self.augmentor = transforms.Compose([
-            ImgTrackColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.3),
-            ImgViewDiffTranslationAug(input_shape=img_size, translation=8, augment_track=True),
-        ])
+        # Conditionally build augmentor based on config (0 or None means disabled)
+        aug_list = []
+        
+        # Color jitter (dict or Namespace with brightness, contrast, saturation, hue)
+        if aug_color_jitter is not None:
+            # Handle both dict and Namespace
+            if isinstance(aug_color_jitter, dict):
+                brightness = aug_color_jitter.get('brightness', 0)
+                contrast = aug_color_jitter.get('contrast', 0)
+                saturation = aug_color_jitter.get('saturation', 0)
+                hue = aug_color_jitter.get('hue', 0)
+            else:
+                brightness = getattr(aug_color_jitter, 'brightness', 0)
+                contrast = getattr(aug_color_jitter, 'contrast', 0)
+                saturation = getattr(aug_color_jitter, 'saturation', 0)
+                hue = getattr(aug_color_jitter, 'hue', 0)
+            
+            aug_list.append(ImgTrackColorJitter(
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                hue=hue
+            ))
+        
+        # Translation (in pixels)
+        if aug_translation_px > 0:
+            aug_list.append(ImgViewDiffTranslationAug(
+                input_shape=img_size,
+                translation=aug_translation_px,
+                augment_track=True
+            ))
+        
+        # Rotation (in degrees)
+        if aug_rotation_deg > 0:
+            aug_list.append(ImgTrackRandomRotate(degrees=aug_rotation_deg))
+        
+        # Horizontal flip (probability)
+        if aug_hflip_prob > 0:
+            aug_list.append(ImgTrackRandomHorizontalFlip(p=aug_hflip_prob))
+        
+        # Vertical flip (probability)
+        if aug_vflip_prob > 0:
+            aug_list.append(ImgTrackRandomVerticalFlip(p=aug_vflip_prob))
+        
+        # Gaussian noise (std)
+        if aug_noise_std > 0:
+            aug_list.append(ImgTrackGaussianNoise(std=aug_noise_std))
+        
+        # Only create augmentor if there are augmentations to apply
+        self.augmentor = transforms.Compose(aug_list) if aug_list else None
+
+    def _load_image_list_from_demo(self, demo, time_offset, num_frames=None, backward=False):
+        """
+        Load images from cached demo with temporal downsampling support.
+        
+        Args:
+            demo: Cached demo dict
+            time_offset: Current frame index
+            num_frames: Number of frames to load (defaults to frame_stack)
+            backward: If True, load past frames with spacing based on downsample_factor
+        """
+        num_frames = self.frame_stack if num_frames is None else num_frames
+        demo_length = demo["root"]["video"].shape[0]
+        
+        if backward:
+            # Load frames with spacing based on downsample_factor
+            # For downsample_factor=1: [t-1, t] (consecutive)
+            # For downsample_factor=2: [t-2, t] (skip 1 frame)
+            spacing = self.downsample_factor
+            start_offset = time_offset - (num_frames - 1) * spacing
+            image_indices = np.arange(start_offset, time_offset + 1, spacing)
+            image_indices = np.clip(image_indices, 0, demo_length - 1)
+            frames = demo['root']["video"][image_indices]
+            
+            # Pad with first frame if needed (when at start of trajectory)
+            if len(frames) < num_frames:
+                first_frame = frames[0:1]  # Keep dims: (1, C, H, W)
+                num_padding = num_frames - len(frames)
+                padding_frames = first_frame.repeat(num_padding, 1, 1, 1)
+                frames = torch.cat([padding_frames, frames], dim=0)
+            return frames
+        else:
+            # Forward loading with spacing (if needed)
+            spacing = self.downsample_factor
+            image_indices = np.arange(time_offset, time_offset + num_frames * spacing, spacing)
+            image_indices = np.clip(image_indices, 0, demo_length - 1)
+            return demo['root']["video"][image_indices]
+
+    def _load_image_list_from_disk(self, demo_id, time_offset, num_frames=None, backward=False):
+        """
+        Load images from disk with temporal downsampling support.
+        
+        Args:
+            demo_id: Demo ID
+            time_offset: Current frame index
+            num_frames: Number of frames to load (defaults to frame_stack)
+            backward: If True, load past frames with spacing based on downsample_factor
+        """
+        num_frames = self.frame_stack if num_frames is None else num_frames
+
+        demo_length = self._demo_id_to_demo_length[demo_id]
+        demo_path = self._demo_id_to_path[demo_id]
+        demo_parent_dir = os.path.dirname(os.path.dirname(demo_path))
+        demo_name = os.path.basename(demo_path).split(".")[0]
+        images_dir = os.path.join(demo_parent_dir, "images", demo_name)
+
+        spacing = self.downsample_factor
+        
+        if backward:
+            start_offset = time_offset - (num_frames - 1) * spacing
+            image_indices = np.arange(start_offset, time_offset + 1, spacing)
+            image_indices = np.clip(image_indices, 0, demo_length - 1)
+            frames = [self.load_image_func(os.path.join(images_dir, f"{img_idx}.png")) for img_idx in image_indices]
+            # Pad with first frame if needed (when at start of trajectory)
+            num_padding = num_frames - len(frames)
+            if num_padding > 0:
+                frames = [frames[0]] * num_padding + frames
+        else:
+            image_indices = np.arange(time_offset, time_offset + num_frames * spacing, spacing)
+            image_indices = np.clip(image_indices, 0, demo_length - 1)
+            frames = [self.load_image_func(os.path.join(images_dir, f"{img_idx}.png")) for img_idx in image_indices]
+
+        frames = np.stack(frames)  # T, H, W, C
+        frames = torch.Tensor(frames)
+        from einops import rearrange
+        frames = rearrange(frames, "t h w c -> t c h w")
+        return frames
 
     def __getitem__(self, index):
         """
@@ -157,13 +287,32 @@ class TrackDataset(SimpleBaseDataset):
             imgs = self._load_image_list_from_demo(demo, time_offset, backward=True)
 
         # Load future tracks at this timestep
-        # tracks shape: (num_track_ts, num_points, 2)
+        # tracks shape: (stored_num_track_ts, num_points, 2)
         track_key = f"frame_{time_offset:04d}"
         tracks = demo["root"]["tracks"][track_key]  # Load from per-frame dataset
         tracks = torch.Tensor(tracks)
         
+        # Apply temporal downsampling
+        stored_num_track_ts = tracks.shape[0]
+        required_stored_ts = self.num_track_ts * self.downsample_factor
+        
+        if stored_num_track_ts < required_stored_ts:
+            raise ValueError(
+                f"Requested {self.num_track_ts} track timesteps with {self.downsample_factor}x downsample "
+                f"(requires {required_stored_ts} stored timesteps) but HDF5 only contains {stored_num_track_ts}. "
+                f"Please regenerate data with more timesteps or reduce num_track_ts/downsample_factor in config."
+            )
+        
+        # Downsample: take indices [0, step, 2*step, ...]
+        if self.downsample_factor > 1:
+            indices = torch.arange(0, required_stored_ts, self.downsample_factor)
+            tracks = tracks[indices]  # Shape: (num_track_ts, num_points, 2)
+        else:
+            # No downsampling, just truncate to num_track_ts
+            tracks = tracks[:self.num_track_ts]
+        
         # Data augmentation
-        if np.random.rand() < self.aug_prob:
+        if self.augmentor is not None and np.random.rand() < self.aug_prob:
             # Expand dimensions for augmentor
             # imgs: (frame_stack, c, h, w) -> (1, frame_stack, c, h, w)
             # tracks: (num_track_ts, n, 2) -> (1, 1, num_track_ts, n, 2)
@@ -179,6 +328,9 @@ class TrackDataset(SimpleBaseDataset):
         else:
             # No augmentation, normalize to [0, 1]
             imgs = imgs / 255.0
+        
+        # Clip tracks to valid [0, 1] range (handles out-of-bounds after augmentation)
+        tracks = torch.clamp(tracks, 0, 1)
         
         # Apply ImageNet normalization for DINOv2
         # imgs: (frame_stack, c, h, w) in [0, 1] range

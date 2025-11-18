@@ -30,14 +30,14 @@ class IntentTracker(nn.Module):
         self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
         self.vit.requires_grad_(not vit_frozen)
         
-        # Temporal embeddings for future predictions (dimension = hidden_size = 384 for ADDITION)
+        # Temporal embeddings for future predictions (dimension = hidden_size = H for ADDITION)
         time_grid = torch.linspace(0, num_future_steps - 1, num_future_steps).reshape(
             1, num_future_steps, 1
         )
         self.register_buffer(
             "time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, time_grid[0])
         )
-        
+
         # Observation temporal embeddings for past frames
         # Frames at relative times: [-frame_stack+1, ..., -1, 0]
         obs_time_grid = torch.linspace(-(frame_stack - 1), 0, frame_stack).reshape(
@@ -91,9 +91,9 @@ class IntentTracker(nn.Module):
         scene_tokens = scene_tokens.view(B, T_obs, num_patches, feature_dim)  # (B, T_obs, num_patches, feature_dim)
         
         # Add temporal encoding to distinguish frames
-        # obs_time_emb: (T_obs, feature_dim)
-        # Expand to (1, T_obs, 1, feature_dim) to broadcast over batch and patches
-        obs_time_encoding = self.obs_time_emb.unsqueeze(0).unsqueeze(2)  # (1, T_obs, 1, feature_dim)
+        # obs_time_emb: (1, T_obs, feature_dim) - has extra batch dim from get_1d_sincos_pos_embed_from_grid
+        # Reshape to (1, T_obs, 1, feature_dim) to broadcast over batch and patches
+        obs_time_encoding = self.obs_time_emb.unsqueeze(2)  # (1, T_obs, 1, feature_dim)
         scene_tokens = scene_tokens + obs_time_encoding  # (B, T_obs, num_patches, feature_dim)
         
         # Concatenate tokens from all frames: (B, T_obs, num_patches, feature_dim) -> (B, T_obs*num_patches, feature_dim)
@@ -118,7 +118,7 @@ class IntentTracker(nn.Module):
         T = self.num_future_steps
         
         # 1. Extract ViT scene features with temporal encoding (provides ALL visual context)
-        scene_tokens = self.extract_vit_features(frame)  # (B, frame_stack*256, 384)
+        scene_tokens = self.extract_vit_features(frame)  # (B, frame_stack*256, H)
         
         # 2. Compute 2D sincos position encoding (same approach as temporal)
         # query_coords are in [0, 1], scale to reasonable range for sincos
@@ -128,21 +128,21 @@ class IntentTracker(nn.Module):
         grid = coords_normalized.permute(2, 0, 1)  # (2, B, N)
         
         # Apply 2d sincos embedding
-        pos_encoding = get_2d_sincos_pos_embed_from_grid(self.hidden_size, grid)  # (1, B*N, 384)
+        pos_encoding = get_2d_sincos_pos_embed_from_grid(self.hidden_size, grid)  # (1, B*N, H)
         
-        # Reshape to (B, N, 384)
+        # Reshape to (B, N, H)
         pos_encoding = pos_encoding.squeeze(0).reshape(B, N, self.hidden_size)
         
         # 3. Expand position encoding to all future timesteps
-        pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, 384)
+        pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, H)
         
         # 4. Prepare temporal encoding
-        # time_emb shape: (1, T, 384), we need (B, N, T, 384)
-        temporal_encoding = self.time_emb.view(1, 1, T, self.hidden_size).expand(B, N, -1, -1)  # (B, N, T, 384)
+        # time_emb shape: (1, T, H), we need (B, N, T, H)
+        temporal_encoding = self.time_emb.view(1, 1, T, self.hidden_size).expand(B, N, -1, -1)  # (B, N, T, H)
         
         # 5. ADD position + temporal (no visual features!)
         transformer_input = pos_encoding_expanded + temporal_encoding
-        # Shape: (B, N, T, 384) - purely positional/temporal tokens
+        # Shape: (B, N, T, H) - purely positional/temporal tokens
         
         # 6. Transformer queries scene via cross-attention for all visual info
         displacements = self.updateformer(

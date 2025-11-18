@@ -100,8 +100,8 @@ def validate(model, val_loader, disp_stats, device, vis_sample_indices=None):
             frame_stack = imgs.shape[1]
             
             for b in range(B):
-                # Get single frame (use first frame from stack)
-                frame = imgs[b, 0:1]  # (1, C, H, W)
+                # Get all frames from stack
+                frame = imgs[b:b+1]  # (1, frame_stack, C, H, W)
                 
                 # Get tracks for this sample
                 gt_positions = tracks[b]  # (T, N, 2)
@@ -170,8 +170,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         B = imgs.shape[0]
         frame_stack = imgs.shape[1]
         
-        # Get first frame from stack
-        frames = imgs[:, 0]  # (B, C, H, W)
+        # Use all frames from stack
+        frames = imgs  # (B, frame_stack, C, H, W)
         
         # Convert tracks to displacements
         # tracks: (B, T, N, 2)
@@ -317,9 +317,17 @@ def main():
         frame_stack=cfg.dataset_cfg.frame_stack,
         num_track_ts=cfg.dataset_cfg.num_track_ts,
         num_track_ids=cfg.dataset_cfg.num_track_ids,
+        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
         aug_prob=cfg.training.aug_prob,
         cache_all=cfg.dataset_cfg.cache_all,
-        cache_image=cfg.dataset_cfg.cache_image
+        cache_image=cfg.dataset_cfg.cache_image,
+        # Augmentation parameters (compact format)
+        aug_color_jitter=getattr(cfg.dataset_cfg, 'aug_color_jitter', None),
+        aug_translation_px=getattr(cfg.dataset_cfg, 'aug_translation_px', 0),
+        aug_rotation_deg=getattr(cfg.dataset_cfg, 'aug_rotation_deg', 0),
+        aug_hflip_prob=getattr(cfg.dataset_cfg, 'aug_hflip_prob', 0.0),
+        aug_vflip_prob=getattr(cfg.dataset_cfg, 'aug_vflip_prob', 0.0),
+        aug_noise_std=getattr(cfg.dataset_cfg, 'aug_noise_std', 0.0)
     )
     
     val_dataset = TrackDataset(
@@ -328,6 +336,7 @@ def main():
         frame_stack=cfg.dataset_cfg.frame_stack,
         num_track_ts=cfg.dataset_cfg.num_track_ts,
         num_track_ids=cfg.dataset_cfg.num_track_ids,
+        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
         aug_prob=0.0,  # No augmentation for validation
         cache_all=cfg.dataset_cfg.cache_all,
         cache_image=cfg.dataset_cfg.cache_image

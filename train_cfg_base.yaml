@@ -3,16 +3,16 @@ dataset_dir: "/home/harsh/sam/data/h5_dataset"
 # Dataset loader configuration
 dataset_cfg:
   img_size: 224
-  frame_stack: 2
+  frame_stack: 1
   num_track_ts: 8
-  num_track_ids: 16
+  num_track_ids: 32
   downsample_factor: 2  # 1=consecutive frames, 2=every 2nd frame, etc.
   cache_all: true
   cache_image: true  # Images are stored in HDF5 file, not separately on disk
   
   # Augmentations (applied with prob=training.aug_prob when enabled)
   aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
-  aug_translation_px: 16
+  aug_translation_px: 20
   aug_rotation_deg: 20
   aug_hflip_prob: 0.5
   aug_vflip_prob: 0.0
@@ -21,23 +21,23 @@ dataset_cfg:
 # Model configuration
 model:
   num_future_steps: 8          # Match num_track_ts
-  hidden_size: 384
+  hidden_size: 768              # DINOv2 base output dimension
   model_resolution: [224, 224]
   add_space_attn: true
-  vit_model_name: 'dinov2_vits14'
+  vit_model_name: 'dinov2_vitb14'  # DINOv2 base (768 dims)
   vit_frozen: false             # Fine-tune ViT
   time_depth: 7
   space_depth: 7
-  num_heads: 6                  # Number of attention heads (384/6=64 per head, standard ViT-S)
+  num_heads: 12                 # Number of attention heads (768/12=64 per head)
   mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
   p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
-  frame_stack: 2                # Number of observation frames (match dataset_cfg.frame_stack)
+  frame_stack: 1                # Number of observation frames (match dataset_cfg.frame_stack)
 
 # Training configuration
 training:
   # Training loop
-  num_epochs: 120
-  batch_size: 32                # Batch size (adjust based on GPU memory)
+  num_epochs: 100
+  batch_size: 16                # Reduced for larger model (adjust based on GPU memory)
   num_workers: 4                # DataLoader workers (adjust based on CPU cores)
   aug_prob: 0.9                 # Data augmentation probability
   
@@ -72,3 +72,4 @@ training:
   log_every_n_steps: 10
   log_gradients: true           # Log gradient norms
   log_params: true              # Log parameter histograms (expensive, maybe every 100 steps)
+
