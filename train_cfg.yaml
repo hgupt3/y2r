@@ -20,6 +20,7 @@ dataset_cfg:
 
 # Model configuration
 model:
+  model_type: 'direct'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker
   num_future_steps: 8          # Match num_track_ts
   hidden_size: 384
   model_resolution: [224, 224]
@@ -32,6 +33,12 @@ model:
   mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
   p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
   frame_stack: 2                # Number of observation frames (match dataset_cfg.frame_stack)
+  
+  # Diffusion-specific parameters (only used when model_type='diffusion')
+  num_diffusion_steps: 100      # Number of diffusion training timesteps
+  num_inference_steps: 10       # Number of inference steps (DDIM sampling)
+  beta_schedule: 'squaredcos_cap_v2'  # Noise schedule: 'linear', 'squaredcos_cap_v2', etc.
+  cache_quantized_position_encoding: false  # false=compute on-the-fly, true=use cached 224x224 lookup
 
 # Training configuration
 training:

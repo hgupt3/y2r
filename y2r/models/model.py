@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from y2r.models.blocks import EfficientUpdateFormer
+from y2r.models.blocks import EfficientUpdateFormer, Mlp
 from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
 
 class IntentTracker(nn.Module):
@@ -19,23 +20,31 @@ class IntentTracker(nn.Module):
         mlp_ratio=4.0,
         p_drop_attn=0.0,
         frame_stack=1,
+        cache_quantized_position_encoding=False,
     ):
         super(IntentTracker, self).__init__()
         self.num_future_steps = num_future_steps
         self.hidden_size = hidden_size
         self.model_resolution = model_resolution
         self.frame_stack = frame_stack
+        self.cache_quantized_position_encoding = cache_quantized_position_encoding
 
         # ViT encoder (provides all visual context)
         self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
         self.vit.requires_grad_(not vit_frozen)
         
-        # Temporal embeddings for future predictions (dimension = hidden_size = H for ADDITION)
+        # Embedding dimensions (following modern diffusion literature like DiT)
+        # Position (2D spatial) = full model dim (most complex signal)
+        # Temporal (1D discrete) = ~25% of model dim (simpler signal)
+        self.position_dim = hidden_size  # 384
+        self.temporal_dim = hidden_size // 4  # 96
+        
+        # Temporal embeddings for future predictions
         time_grid = torch.linspace(0, num_future_steps - 1, num_future_steps).reshape(
             1, num_future_steps, 1
         )
         self.register_buffer(
-            "time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, time_grid[0])
+            "time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, time_grid[0])
         )
 
         # Observation temporal embeddings for past frames
@@ -44,7 +53,17 @@ class IntentTracker(nn.Module):
             1, frame_stack, 1
         )
         self.register_buffer(
-            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
+            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, obs_time_grid[0])
+        )
+        
+        # MLP to combine position and temporal encodings
+        # Input: position_dim + temporal_dim = 384 + 96 = 480
+        self.encoding_combiner = Mlp(
+            in_features=self.position_dim + self.temporal_dim,
+            hidden_features=hidden_size,
+            out_features=hidden_size,
+            act_layer=nn.GELU,
+            drop=0.0
         )
 
         # Transformer
@@ -60,6 +79,10 @@ class IntentTracker(nn.Module):
             p_drop_attn=p_drop_attn,
             linear_layer_for_vis_conf=False,
         )
+        
+        # Build position encoding cache if using cached encoding
+        if cache_quantized_position_encoding:
+            self._build_position_cache()
     
     def extract_vit_features(self, frame):
         """
@@ -101,6 +124,39 @@ class IntentTracker(nn.Module):
         
         return scene_tokens
     
+    def _build_position_cache(self):
+        """Pre-compute position encodings for all 224x224 pixel locations."""
+        print(f"Building position encoding cache (224x224x{self.position_dim})...")
+        cache = torch.zeros(224, 224, self.position_dim)
+        
+        for x in range(224):
+            for y in range(224):
+                grid = torch.tensor([[float(x)], [float(y)]])
+                enc = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid)
+                cache[x, y] = enc.squeeze(0).squeeze(0)
+        
+        self.register_buffer('pos_encoding_cache', cache)
+        print(f"  Cache size: {cache.numel() * 4 / 1e6:.1f} MB")
+    
+    def get_position_encoding_cached(self, positions):
+        """
+        Get position encodings from pre-computed cache.
+        
+        Args:
+            positions: (..., 2) in [0,1] normalized coordinates
+                      Can be (B, N, 2) or (B, N, T, 2)
+        
+        Returns:
+            encodings: (..., H) same shape as input with last dim = hidden_size
+        """
+        # Quantize to pixel coordinates [0, 223]
+        pixel_coords = (positions * 223.0).long().clamp(0, 223)
+        
+        # Lookup in cache
+        encodings = self.pos_encoding_cache[pixel_coords[..., 0], pixel_coords[..., 1]]
+        
+        return encodings
+    
     def forward(self, frame, query_coords):
         """
         Predict future point trajectories from observation frames.
@@ -120,29 +176,33 @@ class IntentTracker(nn.Module):
         # 1. Extract ViT scene features with temporal encoding (provides ALL visual context)
         scene_tokens = self.extract_vit_features(frame)  # (B, frame_stack*256, H)
         
-        # 2. Compute 2D sincos position encoding (same approach as temporal)
-        # query_coords are in [0, 1], scale to reasonable range for sincos
-        coords_normalized = query_coords * 224.0  # Scale to [0, 224] like image coordinates
-        
-        # Prepare grid format: (B, N, 2) → (2, B, N) where [0] is x, [1] is y
-        grid = coords_normalized.permute(2, 0, 1)  # (2, B, N)
-        
-        # Apply 2d sincos embedding
-        pos_encoding = get_2d_sincos_pos_embed_from_grid(self.hidden_size, grid)  # (1, B*N, H)
-        
-        # Reshape to (B, N, H)
-        pos_encoding = pos_encoding.squeeze(0).reshape(B, N, self.hidden_size)
-        
-        # 3. Expand position encoding to all future timesteps
-        pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, H)
+        # 2. Position encoding - CONDITIONAL based on cache_quantized_position_encoding flag
+        if self.cache_quantized_position_encoding:
+            # Use cached lookup for initial positions (faster)
+            pos_encoding = self.get_position_encoding_cached(query_coords)  # (B, N, H)
+            # Expand to all future timesteps
+            pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, H)
+        else:
+            # Current behavior: compute position encoding from scratch
+            coords_normalized = query_coords * 224.0  # Scale to [0, 224]
+            grid = coords_normalized.permute(2, 0, 1)  # (2, B, N)
+            pos_encoding = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid)  # (1, B*N, position_dim)
+            pos_encoding = pos_encoding.squeeze(0).reshape(B, N, self.position_dim)
+            # Expand to all future timesteps
+            pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, position_dim)
         
         # 4. Prepare temporal encoding
-        # time_emb shape: (1, T, H), we need (B, N, T, H)
-        temporal_encoding = self.time_emb.view(1, 1, T, self.hidden_size).expand(B, N, -1, -1)  # (B, N, T, H)
+        # time_emb shape: (1, T, temporal_dim), we need (B, N, T, temporal_dim)
+        temporal_encoding = self.time_emb.view(1, 1, T, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T, temporal_dim)
         
-        # 5. ADD position + temporal (no visual features!)
-        transformer_input = pos_encoding_expanded + temporal_encoding
-        # Shape: (B, N, T, H) - purely positional/temporal tokens
+        # 5. Combine position and temporal encodings using MLP
+        # Concatenate position and temporal encodings
+        combined_encoding = torch.cat([pos_encoding_expanded, temporal_encoding], dim=-1)
+        # Shape: (B, N, T, 2*H)
+        
+        # Pass through MLP to combine into single hidden representation
+        transformer_input = self.encoding_combiner(combined_encoding)
+        # Shape: (B, N, T, H) - combined positional/temporal tokens
         
         # 6. Transformer queries scene via cross-attention for all visual info
         displacements = self.updateformer(
@@ -153,3 +213,69 @@ class IntentTracker(nn.Module):
         # Shape: (B, N, T, 2) - direct prediction
         
         return displacements  # Cumulative displacements (0→1, 0→2, ..., 0→T)
+    
+    def compute_loss(self, batch):
+        """
+        Compute loss for training. Encapsulates loss computation within the model.
+        
+        Args:
+            batch: dict with keys:
+                - 'frames': (B, frame_stack, 3, H, W) - RGB frames
+                - 'query_coords': (B, N, 2) - initial positions in [0, 1]
+                - 'gt_disp_normalized': (B, N, T, 2) - GT displacements (normalized)
+                - 'disp_std': (2,) - displacement std for loss scaling
+        
+        Returns:
+            loss: scalar tensor
+        """
+        frames = batch['frames']
+        query_coords = batch['query_coords']
+        gt_disp_normalized = batch['gt_disp_normalized']
+        disp_std = batch['disp_std']
+        
+        # Forward pass
+        pred_disp = self(frames, query_coords)  # (B, N, T, 2)
+        
+        # Compute normalized displacement loss
+        device = pred_disp.device
+        std_tensor = torch.tensor(disp_std, device=device, dtype=pred_disp.dtype)
+        
+        # Denormalize to compute loss in pixel space
+        pred_disp_denorm = pred_disp * std_tensor
+        gt_disp_denorm = gt_disp_normalized * std_tensor
+        
+        # L2 distance
+        error = torch.norm(pred_disp_denorm - gt_disp_denorm, dim=-1)  # (B, N, T)
+        
+        # Mask out t=0 (should always be zero displacement)
+        loss_mask = torch.ones_like(error)
+        loss_mask[:, :, 0] = 0.0  # Don't compute loss for t=0
+        
+        masked_error = error * loss_mask
+        loss = masked_error.sum() / loss_mask.sum()
+        
+        return loss
+    
+    def predict(self, frames, query_coords, return_intermediate=False):
+        """
+        Prediction method for inference. Wrapper around forward for API consistency.
+        
+        Args:
+            frames: (B, frame_stack, 3, H, W) - RGB frames
+            query_coords: (B, N, 2) - initial positions in [0, 1]
+            return_intermediate: bool - ignored for direct model (for API compatibility)
+        
+        Returns:
+            pred_disp: (B, N, T, 2) - predicted displacements (normalized)
+            (If return_intermediate=True, returns only pred_disp since no intermediate steps)
+        """
+        pred_disp = self(frames, query_coords)
+        
+        # Force t=0 to zero (no displacement at initial timestep)
+        pred_disp[:, :, 0, :] = 0.0
+        
+        # For API compatibility with diffusion model
+        # Direct model has no intermediate steps, so just return final prediction
+        if return_intermediate:
+            return pred_disp, []  # Empty list for intermediate
+        return pred_disp

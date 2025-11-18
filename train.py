@@ -26,10 +26,11 @@ import wandb
 warnings.filterwarnings("ignore", message="xFormers is available")
 
 from y2r.models.model import IntentTracker
+from y2r.models.diffusion_model import DiffusionIntentTracker
 from y2r.dataloaders.track_dataloader import TrackDataset
 from y2r.dataloaders.split_dataset import create_train_val_split
 from y2r.losses import normalized_displacement_loss
-from y2r.visualization import visualize_predictions
+from y2r.visualization import visualize_predictions, visualize_diffusion_process
 
 
 def load_config(config_path):
@@ -66,16 +67,17 @@ def normalize_displacements(disp, mean, std):
     return disp_normalized
 
 
-def validate(model, val_loader, disp_stats, device, vis_sample_indices=None):
+def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_diffusion=False):
     """
     Run validation and return metrics + visualizations.
     
     Args:
-        model: IntentTracker model
+        model: IntentTracker or DiffusionIntentTracker model
         val_loader: Validation dataloader
         disp_stats: dict with displacement statistics
         device: torch device
         vis_sample_indices: list of indices to visualize
+        is_diffusion: bool, whether model is diffusion-based
         
     Returns:
         metrics: dict with 'avg_error'
@@ -97,50 +99,57 @@ def validate(model, val_loader, disp_stats, device, vis_sample_indices=None):
             # tracks: (B, num_track_ts, N, 2) - GT future positions in [0, 1]
             
             B = imgs.shape[0]
-            frame_stack = imgs.shape[1]
             
-            for b in range(B):
-                # Get all frames from stack
-                frame = imgs[b:b+1]  # (1, frame_stack, C, H, W)
-                
-                # Get tracks for this sample
-                gt_positions = tracks[b]  # (T, N, 2)
-                query_coords = gt_positions[0]  # (N, 2) - initial positions
-                
-                # Convert GT positions to displacements
-                gt_disp = gt_positions - query_coords.unsqueeze(0)  # (T, N, 2)
-                gt_disp = gt_disp.permute(1, 0, 2)  # (N, T, 2)
-                
-                # Normalize GT displacements
-                gt_disp_normalized = normalize_displacements(gt_disp, mean, std)
-                
-                # Move to device
-                frame = frame.to(device)
-                query_coords = query_coords.to(device)
-                gt_disp_normalized = gt_disp_normalized.to(device)
-                
-                # Predict
-                pred_disp = model(frame, query_coords.unsqueeze(0))  # (1, N, T, 2) - normalized
-                
-                # Compute error (using normalized displacement loss)
-                loss = normalized_displacement_loss(
-                    pred_disp,
-                    gt_disp_normalized.unsqueeze(0),
-                    std
-                )
-                
-                total_error += loss.item() * pred_disp.shape[1] * pred_disp.shape[2]
-                total_points += pred_disp.shape[1] * pred_disp.shape[2]
-                
-                # Collect visualization samples
-                global_idx = batch_idx * B + b
-                if vis_sample_indices is not None and global_idx in vis_sample_indices:
-                    vis_data.append({
-                        'frame': frame.cpu(),
-                        'gt_tracks': gt_positions.cpu(),  # (T, N, 2) - positions
-                        'pred_disp': pred_disp.cpu(),  # (1, N, T, 2) - normalized displacements
-                        'query_coords': query_coords.cpu()
-                    })
+            # Move to device
+            imgs = imgs.to(device)
+            tracks = tracks.to(device)
+            
+            # Extract query coords (initial positions)
+            query_coords = tracks[:, 0, :, :]  # (B, N, 2)
+            
+            # Convert GT positions to displacements
+            gt_disp = tracks - query_coords.unsqueeze(1)  # (B, T, N, 2)
+            gt_disp = gt_disp.permute(0, 2, 1, 3)  # (B, N, T, 2)
+            
+            # Normalize GT displacements
+            gt_disp_normalized = normalize_displacements(gt_disp, mean, std)
+            
+            # BATCHED prediction (much faster!)
+            pred_disp = model.predict(imgs, query_coords)  # (B, N, T, 2)
+            
+            # Compute error (batched)
+            loss = normalized_displacement_loss(pred_disp, gt_disp_normalized, std)
+            
+            total_error += loss.item() * pred_disp.shape[0] * pred_disp.shape[1] * pred_disp.shape[2]
+            total_points += pred_disp.shape[0] * pred_disp.shape[1] * pred_disp.shape[2]
+            
+            # Collect visualization samples (only for specific indices)
+            if vis_sample_indices is not None:
+                for b in range(B):
+                    global_idx = batch_idx * B + b
+                    if global_idx in vis_sample_indices:
+                        # For diffusion models, re-run prediction with intermediate for this sample
+                        if is_diffusion:
+                            frame = imgs[b:b+1]
+                            qc = query_coords[b:b+1]
+                            pred_single, intermediate = model.predict(
+                                frame, qc, return_intermediate=True
+                            )
+                            vis_dict = {
+                                'frame': frame.cpu(),
+                                'gt_tracks': tracks[b].cpu(),  # (T, N, 2) - positions
+                                'pred_disp': pred_single.cpu(),  # (1, N, T, 2)
+                                'query_coords': qc[0].cpu(),
+                                'intermediate': [x.cpu() for x in intermediate]
+                            }
+                        else:
+                            vis_dict = {
+                                'frame': imgs[b:b+1].cpu(),
+                                'gt_tracks': tracks[b].cpu(),  # (T, N, 2) - positions
+                                'pred_disp': pred_disp[b:b+1].cpu(),  # (1, N, T, 2)
+                                'query_coords': query_coords[b].cpu()
+                            }
+                        vis_data.append(vis_dict)
     
     metrics = {
         'avg_error': total_error / total_points if total_points > 0 else 0.0,
@@ -190,12 +199,18 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         query_coords = query_coords.to(device)
         gt_disp_normalized = gt_disp_normalized.to(device)
         
+        # Prepare batch dict for model
+        batch = {
+            'frames': frames,
+            'query_coords': query_coords,
+            'gt_disp_normalized': gt_disp_normalized,
+            'disp_std': std
+        }
+        
         # Forward pass with mixed precision
         with autocast(enabled=cfg.training.use_amp):
-            pred_disp = model(frames, query_coords)  # (B, N, T, 2)
-            
-            # Compute loss
-            loss = normalized_displacement_loss(pred_disp, gt_disp_normalized, std)
+            # Use model's compute_loss method
+            loss = model.compute_loss(batch)
         
         # Backward pass
         optimizer.zero_grad()
@@ -368,21 +383,48 @@ def main():
     vis_sample_indices = np.linspace(0, num_val_samples-1, cfg.training.val_vis_samples, dtype=int).tolist()
     print(f"Visualization samples: {vis_sample_indices}")
     
-    # Create model
-    model = IntentTracker(
-        num_future_steps=cfg.model.num_future_steps,
-        hidden_size=cfg.model.hidden_size,
-        model_resolution=cfg.model.model_resolution,
-        add_space_attn=cfg.model.add_space_attn,
-        vit_model_name=cfg.model.vit_model_name,
-        vit_frozen=cfg.model.vit_frozen,
-        time_depth=cfg.model.time_depth,
-        space_depth=cfg.model.space_depth,
-        num_heads=cfg.model.num_heads,
-        mlp_ratio=cfg.model.mlp_ratio,
-        p_drop_attn=cfg.model.p_drop_attn,
-        frame_stack=cfg.model.frame_stack,
-    ).to(device)
+    # Create model (support both direct and diffusion models)
+    model_type = getattr(cfg.model, 'model_type', 'direct')
+    is_diffusion = (model_type == 'diffusion')
+    
+    if is_diffusion:
+        print(f"Creating DiffusionIntentTracker model...")
+        model = DiffusionIntentTracker(
+            num_future_steps=cfg.model.num_future_steps,
+            hidden_size=cfg.model.hidden_size,
+            model_resolution=cfg.model.model_resolution,
+            add_space_attn=cfg.model.add_space_attn,
+            vit_model_name=cfg.model.vit_model_name,
+            vit_frozen=cfg.model.vit_frozen,
+            time_depth=cfg.model.time_depth,
+            space_depth=cfg.model.space_depth,
+            num_heads=cfg.model.num_heads,
+            mlp_ratio=cfg.model.mlp_ratio,
+            p_drop_attn=cfg.model.p_drop_attn,
+            frame_stack=cfg.model.frame_stack,
+            num_diffusion_steps=getattr(cfg.model, 'num_diffusion_steps', 100),
+            beta_schedule=getattr(cfg.model, 'beta_schedule', 'squaredcos_cap_v2'),
+            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
+            disp_mean=disp_stats['displacement_mean'],
+            disp_std=disp_stats['displacement_std'],
+        ).to(device)
+    else:
+        print(f"Creating IntentTracker model (direct prediction)...")
+        model = IntentTracker(
+            num_future_steps=cfg.model.num_future_steps,
+            hidden_size=cfg.model.hidden_size,
+            model_resolution=cfg.model.model_resolution,
+            add_space_attn=cfg.model.add_space_attn,
+            vit_model_name=cfg.model.vit_model_name,
+            vit_frozen=cfg.model.vit_frozen,
+            time_depth=cfg.model.time_depth,
+            space_depth=cfg.model.space_depth,
+            num_heads=cfg.model.num_heads,
+            mlp_ratio=cfg.model.mlp_ratio,
+            p_drop_attn=cfg.model.p_drop_attn,
+            frame_stack=cfg.model.frame_stack,
+                cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
+        ).to(device)
     
     # Compile model if requested
     if cfg.training.use_compile:
@@ -475,7 +517,7 @@ def main():
             # Use EMA model for validation
             # Note: ema_model.module gives us the averaged model
             metrics, vis_data = validate(
-                ema_model.module, val_loader, disp_stats, device, vis_sample_indices
+                ema_model.module, val_loader, disp_stats, device, vis_sample_indices, is_diffusion
             )
             
             print(f"Validation avg error: {metrics['avg_error']:.4f}")
@@ -490,6 +532,15 @@ def main():
             if len(vis_data) > 0:
                 images = visualize_predictions(vis_data, disp_stats, epoch + 1)
                 wandb.log({'val/predictions': images}, step=global_step)
+                
+                # For diffusion models, also visualize the denoising process
+                if is_diffusion:
+                    # Only visualize first few samples to avoid clutter
+                    diffusion_vis_samples = vis_data[:min(3, len(vis_data))]
+                    diffusion_images = visualize_diffusion_process(
+                        diffusion_vis_samples, disp_stats, epoch + 1
+                    )
+                    wandb.log({'val/diffusion_process': diffusion_images}, step=global_step)
             
             # Save checkpoints
             # Always save latest checkpoint
