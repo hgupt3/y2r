@@ -2,7 +2,7 @@
 # This config references dataset_config.yaml for dataset and derived model parameters
 
 # Dataset configuration
-dataset_config: "configs/dataset_config.yaml"  # Path to shared dataset config
+dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative to this file)
 
 # Model configuration
 model:
@@ -25,7 +25,7 @@ model:
 # Training configuration
 training:
   # Device configuration
-  device: 'cuda'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
+  device: 'cuda:1'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
   
   # Training loop
   num_epochs: 150

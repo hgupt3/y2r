@@ -2,7 +2,7 @@
 # This config references dataset_config.yaml for dataset and derived model parameters
 
 # Dataset configuration
-dataset_config: "configs/dataset_config.yaml"  # Path to shared dataset config
+dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative to this file)
 
 # Model configuration
 model:
