@@ -34,10 +34,10 @@ class IntentTracker(nn.Module):
         self.vit.requires_grad_(not vit_frozen)
         
         # Embedding dimensions (following modern diffusion literature like DiT)
-        # Position (2D spatial) = full model dim (most complex signal)
-        # Temporal (1D discrete) = ~25% of model dim (simpler signal)
-        self.position_dim = hidden_size  # 384
-        self.temporal_dim = hidden_size // 4  # 96
+        # Query (2D spatial) = ~50% of model dim for explicit localization
+        # Temporal (1D discrete) = ~50% of model dim
+        self.query_dim = hidden_size
+        self.temporal_dim = hidden_size
         
         # Temporal embeddings for future predictions
         time_grid = torch.linspace(0, num_future_steps - 1, num_future_steps).reshape(
@@ -56,21 +56,10 @@ class IntentTracker(nn.Module):
         self.register_buffer(
             "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
         )
-        
-        # MLP to combine position and temporal encodings
-        # Input: position_dim + temporal_dim = 384 + 96 = 480
-        self.encoding_combiner = Mlp(
-            in_features=self.position_dim + self.temporal_dim,
-            hidden_features=hidden_size,
-            out_features=hidden_size,
-            act_layer=nn.GELU,
-            drop=0.0
-        )
 
         # Transformer
         self.updateformer = EfficientUpdateFormer(
-            space_depth=space_depth,
-            time_depth=time_depth,
+            depth=time_depth,
             input_dim=hidden_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -80,10 +69,6 @@ class IntentTracker(nn.Module):
             p_drop_attn=p_drop_attn,
             linear_layer_for_vis_conf=False,
         )
-        
-        # Build position encoding cache if using cached encoding
-        if cache_quantized_position_encoding:
-            self._build_position_cache()
     
     def extract_vit_features(self, frame):
         """
@@ -125,64 +110,6 @@ class IntentTracker(nn.Module):
         
         return scene_tokens
     
-    def _build_position_cache(self):
-        """Pre-compute position encodings for all 224x224 pixel locations."""
-        print(f"Building position encoding cache (224x224x{self.position_dim})...")
-        cache = torch.zeros(224, 224, self.position_dim)
-        
-        for x in range(224):
-            for y in range(224):
-                grid = torch.tensor([[float(x)], [float(y)]])
-                enc = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid)
-                cache[x, y] = enc.squeeze(0).squeeze(0)
-        
-        self.register_buffer('pos_encoding_cache', cache)
-        cache_size_mb = cache.numel() * 4 / 1e6
-        print(f"  Cache size: {cache_size_mb:.1f} MB (dim={self.position_dim})")
-    
-    def get_position_encoding_cached(self, positions):
-        """
-        Get position encodings from pre-computed cache using bilinear interpolation.
-        
-        Args:
-            positions: (..., 2) in [0,1] normalized coordinates
-                      Can be (B, N, 2) or (B, N, T, 2)
-        
-        Returns:
-            encodings: (..., H) same shape as input with last dim = hidden_size
-        """
-        # Convert to continuous pixel coordinates [0, 223]
-        pixel_coords = positions * 223.0  # (..., 2)
-        
-        # Clamp to valid range
-        pixel_coords = pixel_coords.clamp(0.0, 223.0)
-        
-        # Get integer coordinates for the 4 corners
-        x0 = torch.floor(pixel_coords[..., 0]).long().clamp(0, 223)  # (...)
-        y0 = torch.floor(pixel_coords[..., 1]).long().clamp(0, 223)  # (...)
-        x1 = torch.ceil(pixel_coords[..., 0]).long().clamp(0, 223)   # (...)
-        y1 = torch.ceil(pixel_coords[..., 1]).long().clamp(0, 223)   # (...)
-        
-        # Get fractional parts (these are differentiable)
-        wx = pixel_coords[..., 0] - x0.float()  # (...) in [0, 1]
-        wy = pixel_coords[..., 1] - y0.float()  # (...) in [0, 1]
-        
-        # Get encodings at 4 corners
-        enc_00 = self.pos_encoding_cache[x0, y0]  # (..., H)
-        enc_01 = self.pos_encoding_cache[x0, y1]  # (..., H)
-        enc_10 = self.pos_encoding_cache[x1, y0]  # (..., H)
-        enc_11 = self.pos_encoding_cache[x1, y1]  # (..., H)
-        
-        # Bilinear interpolation
-        # First interpolate along x-axis
-        enc_0 = enc_00 * (1 - wx.unsqueeze(-1)) + enc_10 * wx.unsqueeze(-1)  # (..., H)
-        enc_1 = enc_01 * (1 - wx.unsqueeze(-1)) + enc_11 * wx.unsqueeze(-1)  # (..., H)
-        
-        # Then interpolate along y-axis
-        encodings = enc_0 * (1 - wy.unsqueeze(-1)) + enc_1 * wy.unsqueeze(-1)  # (..., H)
-        
-        return encodings
-    
     def forward(self, frame, query_coords):
         """
         Predict future point trajectories from observation frames.
@@ -202,35 +129,25 @@ class IntentTracker(nn.Module):
         # 1. Extract ViT scene features with temporal encoding (provides ALL visual context)
         scene_tokens = self.extract_vit_features(frame)  # (B, frame_stack*256, H)
         
-        # 2. Position encoding - CONDITIONAL based on cache_quantized_position_encoding flag
-        if self.cache_quantized_position_encoding:
-            # Use cached lookup for initial positions (faster)
-            pos_encoding = self.get_position_encoding_cached(query_coords)  # (B, N, H)
-            # Expand to all future timesteps
-            pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, H)
-        else:
-            # Current behavior: compute position encoding from scratch
-            coords_normalized = query_coords * 224.0  # Scale to [0, 224]
-            grid = coords_normalized.permute(2, 0, 1)  # (2, B, N)
-            pos_encoding = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid)  # (1, B*N, position_dim)
-            pos_encoding = pos_encoding.squeeze(0).reshape(B, N, self.position_dim)
-            # Expand to all future timesteps
-            pos_encoding_expanded = pos_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, position_dim)
+        # 2. Query encoding: encode initial query coordinates (where trajectories start)
+        # Use 2D sinusoidal positional encoding for spatial localization
+        coords_pixel = query_coords * 224.0  # (B, N, 2) -> [0, 224]
+        grid = coords_pixel.permute(2, 0, 1)  # (2, B, N)
+        query_encoding = get_2d_sincos_pos_embed_from_grid(self.query_dim, grid)  # (1, B*N, query_dim)
+        query_encoding = query_encoding.squeeze(0).reshape(B, N, self.query_dim)
+        # Expand to all future timesteps
+        query_encoding_expanded = query_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, query_dim)
         
-        # 4. Prepare temporal encoding
+        # 3. Prepare temporal encoding
         # time_emb shape: (1, T, temporal_dim), we need (B, N, T, temporal_dim)
         temporal_encoding = self.time_emb.view(1, 1, T, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T, temporal_dim)
         
-        # 5. Combine position and temporal encodings using MLP
-        # Concatenate position and temporal encodings
-        combined_encoding = torch.cat([pos_encoding_expanded, temporal_encoding], dim=-1)
-        # Shape: (B, N, T, 2*H)
+        # 4. Combine query and temporal encodings using MLP
+        # Add query and temporal encodings
+        transformer_input = query_encoding_expanded + temporal_encoding
+        # Shape: (B, N, T, H) - combined query/temporal tokens
         
-        # Pass through MLP to combine into single hidden representation
-        transformer_input = self.encoding_combiner(combined_encoding)
-        # Shape: (B, N, T, H) - combined positional/temporal tokens
-        
-        # 6. Transformer queries scene via cross-attention for all visual info
+        # 5. Transformer queries scene via cross-attention for all visual info
         displacements = self.updateformer(
             transformer_input, 
             scene_tokens, 

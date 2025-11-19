@@ -1,0 +1,71 @@
+dataset_dir: "/home/harsh/sam/data/h5_dataset"
+
+# Dataset loader configuration
+dataset_cfg:
+  img_size: 224
+  frame_stack: 2
+  num_track_ts: 8
+  num_track_ids: 16
+  downsample_factor: 2
+  cache_all: true
+  cache_image: true
+
+  # Augmentations
+  aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
+  aug_translation_px: 16
+  aug_rotation_deg: 20
+  aug_hflip_prob: 0.5
+  aug_vflip_prob: 0.0
+  aug_noise_std: 0.02
+
+# Model configuration
+model:
+  model_type: 'autoreg'          # Use AutoregressiveIntentTracker
+  num_future_steps: 8            # Match dataset_cfg.num_track_ts
+  hidden_size: 384
+  model_resolution: [224, 224]
+  add_space_attn: true
+  vit_model_name: 'dinov2_vits14'
+  vit_frozen: false
+  num_heads: 8
+  mlp_ratio: 4.0
+  p_drop_attn: 0.1
+  frame_stack: 2
+  cache_quantized_position_encoding: false
+
+# Training configuration
+training:
+  # Device configuration
+  device: 'cuda'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
+  
+  num_epochs: 150
+  batch_size: 32
+  num_workers: 4
+  aug_prob: 0.9
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+
+  use_amp: true
+  use_compile: true
+  ema_decay: 0.999
+
+  lr_schedule: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+  val_every_n_epochs: 5
+  val_split: 0.1
+  val_num_demos: null
+  val_vis_samples: 64
+  val_seed: 42
+
+  checkpoint_dir: "./checkpoints"
+
+  wandb_project: "intent-tracker"
+  wandb_entity: null
+  log_every_n_steps: 10
+  log_gradients: true
+  log_params: true
+

@@ -8,7 +8,7 @@ Diffusion Policy architecture. The model denoises trajectory outputs using DDIM 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.schedulers import DDIMScheduler
+from diffusers.schedulers import DDIMScheduler, DDPMScheduler
 
 from y2r.models.blocks import EfficientUpdateFormer, Mlp
 from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
@@ -37,6 +37,7 @@ class DiffusionIntentTracker(nn.Module):
     ):
         super(DiffusionIntentTracker, self).__init__()
         self.num_future_steps = num_future_steps
+        self.total_token_steps = num_future_steps + 1  # include conditioning slot
         self.hidden_size = hidden_size
         self.model_resolution = model_resolution
         self.frame_stack = frame_stack
@@ -56,16 +57,15 @@ class DiffusionIntentTracker(nn.Module):
         self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
         self.vit.requires_grad_(not vit_frozen)
         
-        # Embedding dimensions (following modern diffusion literature like DiT)
-        # Position (2D spatial) = full model dim (most complex signal)
-        # Temporal/Diffusion timestep (1D discrete) = ~25% of model dim (simpler signals)
-        self.position_dim = hidden_size  # 384
-        self.temporal_dim = hidden_size // 4  # 96
-        self.diffusion_timestep_dim = hidden_size // 4  # 96
+        # Embedding dimensions
+        self.position_dim = 384  # Sin/cos encoding of absolute positions
+        self.traj_dim = 96      # Linear projection of normalized noisy displacement
+        self.temporal_dim = 96
+        self.diffusion_timestep_dim = 96
         
         # Temporal embeddings for future predictions
-        time_grid = torch.linspace(0, num_future_steps - 1, num_future_steps).reshape(
-            1, num_future_steps, 1
+        time_grid = torch.linspace(0, self.total_token_steps - 1, self.total_token_steps).reshape(
+            1, self.total_token_steps, 1
         )
         self.register_buffer(
             "time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, time_grid[0])
@@ -89,10 +89,13 @@ class DiffusionIntentTracker(nn.Module):
             "diffusion_time_emb", get_1d_sincos_pos_embed_from_grid(self.diffusion_timestep_dim, diffusion_time_grid[0])
         )
         
-        # MLP to combine position, temporal, and diffusion timestep encodings
-        # Input: position_dim + temporal_dim + diffusion_timestep_dim = 384 + 96 + 96 = 576
+        # Trajectory embedding: project normalized noisy displacement
+        self.traj_embed = nn.Linear(2, self.traj_dim)
+        
+        # MLP to combine position, trajectory, temporal, and diffusion timestep encodings
+        # Input: position_dim + traj_dim + temporal_dim + diffusion_timestep_dim
         self.encoding_combiner = Mlp(
-            in_features=self.position_dim + self.temporal_dim + self.diffusion_timestep_dim,
+            in_features=self.position_dim + self.traj_dim + self.temporal_dim + self.diffusion_timestep_dim,
             hidden_features=hidden_size,
             out_features=hidden_size,
             act_layer=nn.GELU,
@@ -101,8 +104,7 @@ class DiffusionIntentTracker(nn.Module):
 
         # Transformer (predicts noise instead of direct displacements)
         self.updateformer = EfficientUpdateFormer(
-            space_depth=space_depth,
-            time_depth=time_depth,
+            depth=time_depth,
             input_dim=hidden_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -113,17 +115,21 @@ class DiffusionIntentTracker(nn.Module):
             linear_layer_for_vis_conf=False,
         )
         
-        # Diffusion scheduler (DDIM)
-        self.noise_scheduler = DDIMScheduler(
+        # Diffusion scheduler (DDPM for training)
+        self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_diffusion_steps,
             beta_schedule=beta_schedule,
             clip_sample=False,  # Don't clip, we're in normalized space
             prediction_type='epsilon',  # Predict noise
         )
         
-        # Build position encoding cache if using cached encoding
-        if cache_quantized_position_encoding:
-            self._build_position_cache()
+        # Inference scheduler (DDIM for fast sampling)
+        self.inference_scheduler = DDIMScheduler(
+            num_train_timesteps=num_diffusion_steps,
+            beta_schedule=beta_schedule,
+            clip_sample=False,
+            prediction_type='epsilon',
+        )
     
     def extract_vit_features(self, frame):
         """
@@ -165,139 +171,65 @@ class DiffusionIntentTracker(nn.Module):
         
         return scene_tokens
     
-    def _build_position_cache(self):
-        """Pre-compute position encodings for all 224x224 pixel locations."""
-        print(f"Building position encoding cache (224x224x{self.position_dim})...")
-        cache = torch.zeros(224, 224, self.position_dim)
-        
-        for x in range(224):
-            for y in range(224):
-                grid = torch.tensor([[float(x)], [float(y)]])
-                enc = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid)
-                cache[x, y] = enc.squeeze(0).squeeze(0)
-        
-        self.register_buffer('pos_encoding_cache', cache)
-        cache_size_mb = cache.numel() * 4 / 1e6
-        print(f"  Cache size: {cache_size_mb:.1f} MB (dim={self.position_dim})")
-    
-    def get_position_encoding_cached(self, positions):
+    def forward(self, frames, query_coords, noisy_traj, timestep, scene_tokens=None):
         """
-        Get position encodings from pre-computed cache using bilinear interpolation.
-        
-        Args:
-            positions: (..., 2) in [0,1] normalized coordinates
-                      Can be (B, N, 2) or (B, N, T, 2)
-        
-        Returns:
-            encodings: (..., H) same shape as input with last dim = hidden_size
-        """
-        # Convert to continuous pixel coordinates [0, 223]
-        pixel_coords = positions * 223.0  # (..., 2)
-        
-        # Clamp to valid range
-        pixel_coords = pixel_coords.clamp(0.0, 223.0)
-        
-        # Get integer coordinates for the 4 corners
-        x0 = torch.floor(pixel_coords[..., 0]).long().clamp(0, 223)  # (...)
-        y0 = torch.floor(pixel_coords[..., 1]).long().clamp(0, 223)  # (...)
-        x1 = torch.ceil(pixel_coords[..., 0]).long().clamp(0, 223)   # (...)
-        y1 = torch.ceil(pixel_coords[..., 1]).long().clamp(0, 223)   # (...)
-        
-        # Get fractional parts (these are differentiable)
-        wx = pixel_coords[..., 0] - x0.float()  # (...) in [0, 1]
-        wy = pixel_coords[..., 1] - y0.float()  # (...) in [0, 1]
-        
-        # Get encodings at 4 corners
-        enc_00 = self.pos_encoding_cache[x0, y0]  # (..., H)
-        enc_01 = self.pos_encoding_cache[x0, y1]  # (..., H)
-        enc_10 = self.pos_encoding_cache[x1, y0]  # (..., H)
-        enc_11 = self.pos_encoding_cache[x1, y1]  # (..., H)
-        
-        # Bilinear interpolation
-        # First interpolate along x-axis
-        enc_0 = enc_00 * (1 - wx.unsqueeze(-1)) + enc_10 * wx.unsqueeze(-1)  # (..., H)
-        enc_1 = enc_01 * (1 - wx.unsqueeze(-1)) + enc_11 * wx.unsqueeze(-1)  # (..., H)
-        
-        # Then interpolate along y-axis
-        encodings = enc_0 * (1 - wy.unsqueeze(-1)) + enc_1 * wy.unsqueeze(-1)  # (..., H)
-        
-        return encodings
-    
-    def forward(self, frames, query_coords, noisy_disp, timestep, scene_tokens=None):
-        """
-        Forward pass: predict noise in noisy displacements.
+        Forward pass: predict noise in noisy trajectory tokens (conditioned slot + future steps).
         OPTIMIZED: Supports cached vision features for efficiency.
         
         Args:
             frames: (B, frame_stack, 3, 224, 224) - RGB frames (ImageNet normalized)
                    Can be None if scene_tokens is provided.
-            query_coords: (B, N, 2) - Initial (x, y) positions in [0, 1] normalized coordinates
-            noisy_disp: (B, N, T, 2) - Noisy displacements (normalized space)
+            query_coords: (B, N, 2) - Initial (x, y) positions in [0, 1]
+            noisy_traj: (B, N, T+1, 2) - Noisy tokens (t=0 conditioned slot + T future steps)
             timestep: (B,) - Diffusion timestep for each sample in batch
             scene_tokens: (B, T_obs*num_patches, H) - Optional pre-computed ViT features.
                          If provided, frames can be None. If not provided, computed from frames.
             
         Returns:
-            predicted_noise: (B, N, T, 2) - Predicted noise in displacements
+            predicted_noise: (B, N, T+1, 2) - Predicted noise for each token
         """
-        B = query_coords.shape[0]
-        N = query_coords.shape[1]
-        T = self.num_future_steps
+        B = noisy_traj.shape[0]
+        N = noisy_traj.shape[1]
+        T_tokens = self.total_token_steps
         
         # 1. Extract or use cached ViT scene features
         if scene_tokens is None:
             scene_tokens = self.extract_vit_features(frames)  # (B, frame_stack*256, H)
         
-        # 2. Denormalize noisy_disp to [0,1] coordinate space before adding to query_coords
-        # noisy_disp is in normalized space (mean-subtracted, std-divided)
-        # query_coords is in [0, 1] coordinate space
-        # We need to denormalize noisy_disp first!
-        disp_mean = self.disp_mean.to(dtype=noisy_disp.dtype)
-        disp_std = self.disp_std.to(dtype=noisy_disp.dtype)
-        noisy_disp_denorm = noisy_disp * disp_std + disp_mean  # (B, N, T, 2) in [0,1] space
+        # 2. Encode absolute positions with high-frequency sin/cos
+        disp_mean = self.disp_mean.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
+        disp_std = self.disp_std.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
+        noisy_disp_denorm = noisy_traj * disp_std + disp_mean  # (B, N, T+1, 2)
+        current_pos = (query_coords.unsqueeze(2) + noisy_disp_denorm).clamp(0.0, 1.0)
+        pos_grid = current_pos.reshape(B * N * T_tokens, 2).permute(1, 0)  # (2, B*N*T_tokens)
+        pos_encoding = get_2d_sincos_pos_embed_from_grid(self.position_dim, pos_grid)
+        pos_encoding = pos_encoding.squeeze(0).reshape(B, N, T_tokens, self.position_dim)
         
-        # 3. Position encoding of PREDICTED positions (where the point IS at each timestep)
-        predicted_positions = query_coords.unsqueeze(2) + noisy_disp_denorm  # (B, N, T, 2) in [0,1]
+        # 3. Trajectory embedding: direct noisy displacement signal
+        traj_embedding = self.traj_embed(noisy_traj)  # (B, N, T+1, traj_dim)
         
-        if self.cache_quantized_position_encoding:
-            # Use cached lookup (fast)
-            pos_encoding_expanded = self.get_position_encoding_cached(predicted_positions)  # (B, N, T, H)
-        else:
-            # Compute position encoding for each predicted position (slower but more precise)
-            # Process each timestep separately
-            pos_encodings = []
-            for t in range(T):
-                pred_pos_t = predicted_positions[:, :, t, :]  # (B, N, 2) in [0,1]
-                coords_norm_t = pred_pos_t * 224.0  # Scale to [0, 224]
-                grid_t = coords_norm_t.permute(2, 0, 1)  # (2, B, N)
-                pos_enc_t = get_2d_sincos_pos_embed_from_grid(self.position_dim, grid_t)  # (1, B*N, position_dim)
-                pos_enc_t = pos_enc_t.squeeze(0).reshape(B, N, self.position_dim)
-                pos_encodings.append(pos_enc_t)
-            pos_encoding_expanded = torch.stack(pos_encodings, dim=2)  # (B, N, T, position_dim)
-        
-        # 4. Prepare temporal encoding for future timesteps
-        temporal_encoding = self.time_emb.view(1, 1, T, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T, temporal_dim)
+        # 4. Prepare temporal encoding for all token steps (including conditioned slot)
+        temporal_encoding = self.time_emb.view(1, 1, T_tokens, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T+1, temporal_dim)
         
         # 5. Prepare diffusion timestep encoding
         timestep_encoding = self.diffusion_time_emb[0, timestep, :]  # (B, diffusion_timestep_dim)
-        timestep_encoding = timestep_encoding.view(B, 1, 1, self.diffusion_timestep_dim).expand(-1, N, T, -1)  # (B, N, T, diffusion_timestep_dim)
+        timestep_encoding = timestep_encoding.view(B, 1, 1, self.diffusion_timestep_dim).expand(-1, N, T_tokens, -1)  # (B, N, T+1, diffusion_timestep_dim)
         
-        # 6. Combine all encodings using MLP (NO trajectory tokens!)
-        # Concatenate position, temporal, and diffusion timestep encodings
-        combined_encoding = torch.cat([pos_encoding_expanded, temporal_encoding, timestep_encoding], dim=-1)
-        # Shape: (B, N, T, 3*H)
+        # 6. Combine all encodings using MLP
+        combined_encoding = torch.cat([pos_encoding, traj_embedding, temporal_encoding, timestep_encoding], dim=-1)
+        # Shape: (B, N, T+1, position_dim + traj_dim + temporal_dim + diffusion_timestep_dim)
         
         # Pass through MLP to combine into single hidden representation
         transformer_input = self.encoding_combiner(combined_encoding)
-        # Shape: (B, N, T, H)
+        # Shape: (B, N, T+1, H)
         
-        # 7. Transformer predicts noise via cross-attention to scene
+        # 6. Transformer predicts noise via cross-attention to scene
         predicted_noise = self.updateformer(
             transformer_input, 
             scene_tokens, 
             add_space_attn=True
         )
-        # Shape: (B, N, T, 2) - noise prediction
+        # Shape: (B, N, T+1, 2) - noise prediction
         
         return predicted_noise
     
@@ -321,6 +253,17 @@ class DiffusionIntentTracker(nn.Module):
         
         B, N, T, _ = gt_disp_normalized.shape
         device = gt_disp_normalized.device
+        total_steps = self.total_token_steps
+        
+        # Build x0 = [zero displacement (normalized), future displacements (normalized)]
+        zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=gt_disp_normalized.dtype)
+        x0 = torch.zeros(B, N, total_steps, 2, device=device, dtype=gt_disp_normalized.dtype)
+        x0[:, :, 0, :] = zero_disp_normalized
+        x0[:, :, 1:, :] = gt_disp_normalized
+        
+        # Condition mask (True where values must stay fixed)
+        condition_mask = torch.zeros_like(x0, dtype=torch.bool)
+        condition_mask[:, :, 0, :] = True
         
         # Sample random diffusion timestep for each sample in batch
         timestep = torch.randint(
@@ -328,36 +271,22 @@ class DiffusionIntentTracker(nn.Module):
             (B,), device=device
         ).long()
         
-        # Sample noise
-        noise = torch.randn_like(gt_disp_normalized)
+        # Sample noise for full tensor
+        noise = torch.randn_like(x0)
         
-        # Add noise to GT displacements using the scheduler
-        noisy_disp = self.noise_scheduler.add_noise(gt_disp_normalized, noise, timestep)
-        
-        # Force t=0 to represent "zero displacement in real space" in normalized coordinates
-        # Zero in real space = 0.0
-        # Zero in normalized space = (0.0 - mean) / std = -mean/std
-        zero_disp_normalized = -self.disp_mean / self.disp_std  # (2,)
-        noisy_disp[:, :, 0, :] = zero_disp_normalized
-        
-        # Set target noise at t=0 to zero (doesn't matter since we mask t=0 in loss)
-        noise[:, :, 0, :] = 0.0
+        # Add noise using scheduler, then reapply conditioning mask (Diffusion Policy style)
+        noisy_traj = self.noise_scheduler.add_noise(x0, noise, timestep)
+        noisy_traj = torch.where(condition_mask, x0, noisy_traj)
+        noise = torch.where(condition_mask, torch.zeros_like(noise), noise)
         
         # Predict the noise
-        predicted_noise = self(frames, query_coords, noisy_disp, timestep)
+        predicted_noise = self(frames, query_coords, noisy_traj, timestep)
         
-        # Compute MSE loss with masking for t=0
-        # t=0 should always be zero displacement (no movement yet)
-        # Create mask: 0 for t=0, 1 for t>0
-        loss_mask = torch.ones_like(noise)
-        loss_mask[:, :, 0, :] = 0.0  # Mask out t=0
-        
-        # Apply mask to both predicted and target noise
+        # Compute loss only on unconditioned slots
+        loss_mask = (~condition_mask).float()
         masked_pred = predicted_noise * loss_mask
         masked_target = noise * loss_mask
-        
-        # Compute loss only on non-masked elements
-        num_elements = loss_mask.sum()
+        num_elements = loss_mask.sum().clamp_min(1.0)
         loss = F.mse_loss(masked_pred, masked_target, reduction='sum') / num_elements
         
         return loss
@@ -380,53 +309,60 @@ class DiffusionIntentTracker(nn.Module):
         B = frames.shape[0]
         N = query_coords.shape[1]
         T = self.num_future_steps
+        total_steps = self.total_token_steps
         device = frames.device
         
         # OPTIMIZATION: Extract vision features ONCE (not at every diffusion step)
         scene_tokens = self.extract_vit_features(frames)  # (B, frame_stack*256, H)
         
+        # Conditioning tensors (slot 0 = zero displacement in normalized space)
+        zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=scene_tokens.dtype)
+        condition_data = torch.zeros(B, N, total_steps, 2, device=device, dtype=scene_tokens.dtype)
+        condition_data[:, :, 0, :] = zero_disp_normalized
+        condition_mask = torch.zeros_like(condition_data, dtype=torch.bool)
+        condition_mask[:, :, 0, :] = True
+        
         # Set the number of inference timesteps
-        self.noise_scheduler.set_timesteps(num_inference_steps, device=device)
+        self.inference_scheduler.set_timesteps(num_inference_steps, device=device)
         
-        # Start from pure noise (match the dtype of the model for FP16 support)
-        noisy_disp = torch.randn(B, N, T, 2, device=device, dtype=scene_tokens.dtype)
+        # Start from pure noise but respect conditioning mask
+        noisy_traj = torch.randn_like(condition_data)
+        noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
         
-        # Force t=0 to represent "zero displacement in real space" in normalized coordinates
-        # Zero in real space = 0.0
-        # Zero in normalized space = (0.0 - mean) / std = -mean/std
-        zero_disp_normalized = (-self.disp_mean / self.disp_std).to(dtype=scene_tokens.dtype)
-        noisy_disp[:, :, 0, :] = zero_disp_normalized
-        
-        # Store intermediate predictions if requested
+        # Store intermediate predictions if requested (only unconditioned slots)
         intermediate = [] if return_intermediate else None
         
         # DDIM sampling loop with cached vision features
-        for t in self.noise_scheduler.timesteps:
+        for t in self.inference_scheduler.timesteps:
             # Create timestep tensor for batch
             timestep = torch.full((B,), t, device=device, dtype=torch.long)
+            
+            # Ensure conditioned slots stay clean before network evaluation
+            noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
             
             # Predict noise using cached scene tokens (pass scene_tokens to skip re-extraction)
             predicted_noise = self(
                 frames=None,  # Not needed since we have scene_tokens
                 query_coords=query_coords,
-                noisy_disp=noisy_disp,
+                noisy_traj=noisy_traj,
                 timestep=timestep,
                 scene_tokens=scene_tokens  # Use cached features
             )
             
             # Denoise using scheduler
-            noisy_disp = self.noise_scheduler.step(
-                predicted_noise, t, noisy_disp
+            noisy_traj = self.inference_scheduler.step(
+                predicted_noise, t, noisy_traj
             ).prev_sample
             
-            # Ensure t=0 stays at "zero displacement" after denoising
-            noisy_disp[:, :, 0, :] = zero_disp_normalized
+            # Reapply conditioning after the update
+            noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
             
-            # Store intermediate result if requested
+            # Store intermediate result if requested (drop conditioned slot)
             if return_intermediate:
-                intermediate.append(noisy_disp.clone())
+                intermediate.append(noisy_traj[:, :, 1:, :].clone())
         
-        clean_disp = noisy_disp
+        clean_traj = noisy_traj
+        clean_disp = clean_traj[:, :, 1:, :]
         
         if return_intermediate:
             return clean_disp, intermediate

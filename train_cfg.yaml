@@ -27,9 +27,7 @@ model:
   add_space_attn: true
   vit_model_name: 'dinov2_vits14'
   vit_frozen: false             # Fine-tune ViT
-  time_depth: 7
-  space_depth: 7
-  num_heads: 6                  # Number of attention heads (384/6=64 per head, standard ViT-S)
+  num_heads: 8                  # Number of attention heads (384/6=64 per head, standard ViT-S)
   mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
   p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
   frame_stack: 2                # Number of observation frames (match dataset_cfg.frame_stack)
@@ -42,8 +40,11 @@ model:
 
 # Training configuration
 training:
+  # Device configuration
+  device: 'cuda'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
+  
   # Training loop
-  num_epochs: 120
+  num_epochs: 150
   batch_size: 32                # Batch size (adjust based on GPU memory)
   num_workers: 4                # DataLoader workers (adjust based on CPU cores)
   aug_prob: 0.9                 # Data augmentation probability

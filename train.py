@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore", message="xFormers is available")
 
 from y2r.models.model import IntentTracker
 from y2r.models.diffusion_model import DiffusionIntentTracker
+from y2r.models.autoreg_model import AutoregressiveIntentTracker
 from y2r.dataloaders.track_dataloader import TrackDataset
 from y2r.dataloaders.split_dataset import create_train_val_split
 from y2r.losses import normalized_displacement_loss
@@ -287,17 +288,29 @@ def main():
     # Load config
     cfg = load_config(args.config)
     
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Set device from config
+    device_str = getattr(cfg.training, 'device', 'cuda')
+    if device_str == 'cuda' and not torch.cuda.is_available():
+        print("Warning: CUDA requested but not available, falling back to CPU")
+        device_str = 'cpu'
+    device = torch.device(device_str)
     print(f"Using device: {device}")
     
-    # Create timestamped checkpoint directory for this run
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_checkpoint_dir = os.path.join(cfg.training.checkpoint_dir, timestamp)
+    # Determine model type for naming
+    model_type = getattr(cfg.model, 'model_type', 'direct')
+    
+    # Create human-readable timestamp for this run
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"{model_type}_{timestamp}"
+    
+    # Create organized checkpoint directory: checkpoints/{model_type}/{timestamp}/
+    run_checkpoint_dir = os.path.join(cfg.training.checkpoint_dir, model_type, timestamp)
     os.makedirs(run_checkpoint_dir, exist_ok=True)
+    print(f"Model type: {model_type}")
+    print(f"Run name: {run_name}")
     print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
     
-    # Initialize W&B
+    # Initialize W&B with descriptive run name
     wandb.init(
         project=cfg.training.wandb_project,
         entity=cfg.training.wandb_entity,
@@ -306,7 +319,7 @@ def main():
             'training': vars(cfg.training),
             'dataset': vars(cfg.dataset_cfg),
         },
-        name=timestamp  # Use timestamp as run name
+        name=run_name  # Use model_type_timestamp as run name
     )
     
     # Load displacement statistics from H5 directory
@@ -401,7 +414,6 @@ def main():
             vit_model_name=cfg.model.vit_model_name,
             vit_frozen=cfg.model.vit_frozen,
             time_depth=cfg.model.time_depth,
-            space_depth=cfg.model.space_depth,
             num_heads=cfg.model.num_heads,
             mlp_ratio=cfg.model.mlp_ratio,
             p_drop_attn=cfg.model.p_drop_attn,
@@ -411,6 +423,22 @@ def main():
             cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
             disp_mean=disp_stats['displacement_mean'],
             disp_std=disp_stats['displacement_std'],
+        ).to(device)
+    elif model_type == 'autoreg':
+        print(f"Creating AutoregressiveIntentTracker model...")
+        model = AutoregressiveIntentTracker(
+            num_future_steps=cfg.model.num_future_steps,
+            hidden_size=cfg.model.hidden_size,
+            model_resolution=cfg.model.model_resolution,
+            add_space_attn=cfg.model.add_space_attn,
+            vit_model_name=cfg.model.vit_model_name,
+            vit_frozen=cfg.model.vit_frozen,
+            time_depth=cfg.model.time_depth,
+            num_heads=cfg.model.num_heads,
+            mlp_ratio=cfg.model.mlp_ratio,
+            p_drop_attn=cfg.model.p_drop_attn,
+            frame_stack=cfg.model.frame_stack,
+            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
         ).to(device)
     else:
         print(f"Creating IntentTracker model (direct prediction)...")
@@ -422,7 +450,6 @@ def main():
             vit_model_name=cfg.model.vit_model_name,
             vit_frozen=cfg.model.vit_frozen,
             time_depth=cfg.model.time_depth,
-            space_depth=cfg.model.space_depth,
             num_heads=cfg.model.num_heads,
             mlp_ratio=cfg.model.mlp_ratio,
             p_drop_attn=cfg.model.p_drop_attn,
@@ -547,14 +574,22 @@ def main():
                     )
                     wandb.log({'val/diffusion_process': diffusion_images}, step=global_step)
             
-            # Save checkpoints
-            # Always save latest checkpoint
+            # Save checkpoints every validation
+            # 1. Save checkpoint for this specific epoch
+            epoch_checkpoint_name = f'epoch_{epoch+1:03d}.pth'
+            save_checkpoint(
+                model, optimizer, scheduler, ema_model, epoch, best_val_error,
+                run_checkpoint_dir, epoch_checkpoint_name
+            )
+            print(f"Saved checkpoint: {epoch_checkpoint_name}")
+            
+            # 2. Always save/update latest checkpoint
             save_checkpoint(
                 model, optimizer, scheduler, ema_model, epoch, best_val_error,
                 run_checkpoint_dir, 'latest.pth'
             )
             
-            # Save best checkpoint if this is a new best
+            # 3. Save best checkpoint if this is a new best
             if metrics['avg_error'] < best_val_error:
                 best_val_error = metrics['avg_error']
                 save_checkpoint(

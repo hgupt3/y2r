@@ -491,48 +491,42 @@ class CrossAttnBlock(nn.Module):
 class EfficientUpdateFormer(nn.Module):
     """
     Transformer model that updates track estimates.
-    Modified for future prediction without virtual tracks and with scene cross-attention.
+    Modified for future prediction with joint space-time attention and scene cross-attention.
     """
 
     def __init__(
         self,
-        space_depth=6,
-        time_depth=6,
+        depth=6,
         input_dim=320,
         hidden_size=384,
         num_heads=8,
         output_dim=130,
         mlp_ratio=4.0,
-        add_space_attn=True,
+        add_space_attn=True,  # Kept for backward compatibility, but ignored
         p_drop_attn=0.0,
         linear_layer_for_vis_conf=False,
+        # Legacy parameters for backward compatibility
+        space_depth=None,
+        time_depth=None,
     ):
         super().__init__()
+        # Handle legacy parameters
+        if time_depth is not None:
+            depth = time_depth
+        
         self.out_channels = 2
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.depth = depth
         self.input_transform = torch.nn.Linear(input_dim, hidden_size, bias=True) if input_dim != hidden_size else nn.Identity()
         if linear_layer_for_vis_conf:
             self.flow_head = torch.nn.Linear(hidden_size, output_dim - 2, bias=True)
             self.vis_conf_head = torch.nn.Linear(hidden_size, 2, bias=True)
         else:
             self.flow_head = torch.nn.Linear(hidden_size, output_dim, bias=True)
-        self.add_space_attn = add_space_attn
         self.linear_layer_for_vis_conf = linear_layer_for_vis_conf
         
-        # Time attention blocks
-        self.time_blocks = nn.ModuleList([
-                AttnBlock(
-                    hidden_size,
-                    num_heads,
-                    mlp_ratio=mlp_ratio,
-                    attn_class=Attention,
-                    drop=p_drop_attn,
-                )
-                for _ in range(time_depth)
-        ])
-        
-        # Cross-attention blocks for scene context (one per time layer)
+        # Cross-attention blocks for scene context (one per layer)
         self.scene_cross_attn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 hidden_size,
@@ -541,22 +535,21 @@ class EfficientUpdateFormer(nn.Module):
                 mlp_ratio=mlp_ratio,
                 drop=p_drop_attn,
             )
-            for _ in range(time_depth)
+            for _ in range(depth)
         ])
-
-        # Space attention blocks (simple self-attention across points, no virtual tracks)
-        if add_space_attn:
-            self.space_blocks = nn.ModuleList([
-                    AttnBlock(
-                        hidden_size,
-                        num_heads,
-                        mlp_ratio=mlp_ratio,
-                        attn_class=Attention,
-                        drop=p_drop_attn,
-                    )
-                    for _ in range(space_depth)
-            ])
-            assert len(self.time_blocks) >= len(self.space_blocks)
+        
+        # Joint space-time attention blocks (self-attention across all N*T tokens)
+        self.blocks = nn.ModuleList([
+                AttnBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_class=Attention,
+                    drop=p_drop_attn,
+                )
+                for _ in range(depth)
+        ])
+        
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -574,13 +567,13 @@ class EfficientUpdateFormer(nn.Module):
 
     def forward(self, input_tensor, scene_tokens, mask=None, add_space_attn=True):
         """
-        Forward pass with scene cross-attention.
+        Forward pass with scene cross-attention and joint space-time attention.
         
         Args:
             input_tensor: (B, N, T, input_dim) - point features with temporal encoding
             scene_tokens: (B, num_patches, hidden_size) - ViT scene features
-            mask: optional attention mask
-            add_space_attn: whether to apply space attention
+            mask: optional attention mask (ignored in new implementation)
+            add_space_attn: kept for backward compatibility (ignored)
         
         Returns:
             flow: (B, N, T, output_dim) - predicted displacements
@@ -588,33 +581,21 @@ class EfficientUpdateFormer(nn.Module):
         tokens = self.input_transform(input_tensor)  # (B, N, T, hidden_size)
         B, N, T, _ = tokens.shape
         
-        # Main transformer loop: Cross-Attn (scene) → Time → Space
-        space_idx = 0
-        for i in range(len(self.time_blocks)):
-            # 1. CROSS-ATTENTION TO SCENE: points attend to ViT scene tokens FIRST
-            # Reshape: (B, N, T, C) → (B, N*T, C) for independent attention
+        # Main transformer loop: Cross-Attn (scene) → Joint Space-Time Attn
+        for i in range(self.depth):
+            # 1. JOINT SPACE-TIME ATTENTION: self-attention across all N*T tokens
+            # Reshape: (B, N, T, C) → (B, N*T, C) for joint attention
+            joint_tokens = tokens.contiguous().view(B, N * T, -1)
+            joint_tokens = self.blocks[i](joint_tokens, mask=mask)
+            tokens = joint_tokens.contiguous().view(B, N, T, -1)  # (B, N, T, C)
+            
+            # 2. CROSS-ATTENTION TO SCENE: points attend to ViT scene tokens
+            # Reshape: (B, N, T, C) → (B, N*T, C) for cross-attention
             cross_tokens = tokens.contiguous().view(B, N * T, -1)
             cross_tokens = self.scene_cross_attn_blocks[i](
                 cross_tokens, scene_tokens, mask=None
             )
             tokens = cross_tokens.contiguous().view(B, N, T, -1)  # (B, N, T, C)
-            
-            # 2. TIME ATTENTION: self-attention across T for each point (scene-aware)
-            time_tokens = tokens.contiguous().view(B * N, T, -1)  # (B*N, T, C)
-            time_tokens = self.time_blocks[i](time_tokens)
-            tokens = time_tokens.contiguous().view(B, N, T, -1)  # (B, N, T, C)
-
-            # 3. SPACE ATTENTION: self-attention across N points (periodically)
-            if (
-                add_space_attn
-                and hasattr(self, "space_blocks")
-                and (i % (len(self.time_blocks) // len(self.space_blocks)) == 0)
-            ):
-                # Reshape: (B, N, T, C) → (B*T, N, C) for space attention
-                space_tokens = tokens.permute(0, 2, 1, 3).contiguous().view(B * T, N, -1)
-                space_tokens = self.space_blocks[space_idx](space_tokens, mask=mask)
-                tokens = space_tokens.contiguous().view(B, T, N, -1).permute(0, 2, 1, 3).contiguous()  # (B, N, T, C)
-                space_idx += 1
         
         # Output head
         flow = self.flow_head(tokens)
