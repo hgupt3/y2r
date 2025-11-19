@@ -38,7 +38,7 @@ model:
   num_diffusion_steps: 100      # Number of diffusion training timesteps
   num_inference_steps: 10       # Number of inference steps (DDIM sampling, faster than training)
   beta_schedule: 'squaredcos_cap_v2'  # Noise schedule: 'linear', 'squaredcos_cap_v2', etc.
-  cache_quantized_position_encoding: true  # false=compute on-the-fly, true=use cached 224x224 lookup
+  cache_quantized_position_encoding: false  # false=compute on-the-fly, true=use cached 224x224 lookup
 
 # Training configuration
 training:

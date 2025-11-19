@@ -67,7 +67,7 @@ def normalize_displacements(disp, mean, std):
     return disp_normalized
 
 
-def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_diffusion=False):
+def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_diffusion=False, num_inference_steps=10):
     """
     Run validation and return metrics + visualizations.
     
@@ -78,6 +78,7 @@ def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_
         device: torch device
         vis_sample_indices: list of indices to visualize
         is_diffusion: bool, whether model is diffusion-based
+        num_inference_steps: int, number of DDIM steps for diffusion models (ignored for direct models)
         
     Returns:
         metrics: dict with 'avg_error'
@@ -115,7 +116,10 @@ def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_
             gt_disp_normalized = normalize_displacements(gt_disp, mean, std)
             
             # BATCHED prediction (much faster!)
-            pred_disp = model.predict(imgs, query_coords)  # (B, N, T, 2)
+            if is_diffusion:
+                pred_disp = model.predict(imgs, query_coords, num_inference_steps=num_inference_steps)  # (B, N, T, 2)
+            else:
+                pred_disp = model.predict(imgs, query_coords)  # (B, N, T, 2)
             
             # Compute error (batched)
             loss = normalized_displacement_loss(pred_disp, gt_disp_normalized, std)
@@ -133,7 +137,7 @@ def validate(model, val_loader, disp_stats, device, vis_sample_indices=None, is_
                             frame = imgs[b:b+1]
                             qc = query_coords[b:b+1]
                             pred_single, intermediate = model.predict(
-                                frame, qc, return_intermediate=True
+                                frame, qc, num_inference_steps=num_inference_steps, return_intermediate=True
                             )
                             vis_dict = {
                                 'frame': frame.cpu(),
@@ -423,7 +427,7 @@ def main():
             mlp_ratio=cfg.model.mlp_ratio,
             p_drop_attn=cfg.model.p_drop_attn,
             frame_stack=cfg.model.frame_stack,
-                cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
+            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
         ).to(device)
     
     # Compile model if requested
@@ -516,8 +520,9 @@ def main():
             
             # Use EMA model for validation
             # Note: ema_model.module gives us the averaged model
+            num_inference_steps = getattr(cfg.model, 'num_inference_steps', 10)
             metrics, vis_data = validate(
-                ema_model.module, val_loader, disp_stats, device, vis_sample_indices, is_diffusion
+                ema_model.module, val_loader, disp_stats, device, vis_sample_indices, is_diffusion, num_inference_steps
             )
             
             print(f"Validation avg error: {metrics['avg_error']:.4f}")
@@ -565,4 +570,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

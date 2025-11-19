@@ -137,11 +137,12 @@ class IntentTracker(nn.Module):
                 cache[x, y] = enc.squeeze(0).squeeze(0)
         
         self.register_buffer('pos_encoding_cache', cache)
-        print(f"  Cache size: {cache.numel() * 4 / 1e6:.1f} MB")
+        cache_size_mb = cache.numel() * 4 / 1e6
+        print(f"  Cache size: {cache_size_mb:.1f} MB (dim={self.position_dim})")
     
     def get_position_encoding_cached(self, positions):
         """
-        Get position encodings from pre-computed cache.
+        Get position encodings from pre-computed cache using bilinear interpolation.
         
         Args:
             positions: (..., 2) in [0,1] normalized coordinates
@@ -150,11 +151,35 @@ class IntentTracker(nn.Module):
         Returns:
             encodings: (..., H) same shape as input with last dim = hidden_size
         """
-        # Quantize to pixel coordinates [0, 223]
-        pixel_coords = (positions * 223.0).long().clamp(0, 223)
+        # Convert to continuous pixel coordinates [0, 223]
+        pixel_coords = positions * 223.0  # (..., 2)
         
-        # Lookup in cache
-        encodings = self.pos_encoding_cache[pixel_coords[..., 0], pixel_coords[..., 1]]
+        # Clamp to valid range
+        pixel_coords = pixel_coords.clamp(0.0, 223.0)
+        
+        # Get integer coordinates for the 4 corners
+        x0 = torch.floor(pixel_coords[..., 0]).long().clamp(0, 223)  # (...)
+        y0 = torch.floor(pixel_coords[..., 1]).long().clamp(0, 223)  # (...)
+        x1 = torch.ceil(pixel_coords[..., 0]).long().clamp(0, 223)   # (...)
+        y1 = torch.ceil(pixel_coords[..., 1]).long().clamp(0, 223)   # (...)
+        
+        # Get fractional parts (these are differentiable)
+        wx = pixel_coords[..., 0] - x0.float()  # (...) in [0, 1]
+        wy = pixel_coords[..., 1] - y0.float()  # (...) in [0, 1]
+        
+        # Get encodings at 4 corners
+        enc_00 = self.pos_encoding_cache[x0, y0]  # (..., H)
+        enc_01 = self.pos_encoding_cache[x0, y1]  # (..., H)
+        enc_10 = self.pos_encoding_cache[x1, y0]  # (..., H)
+        enc_11 = self.pos_encoding_cache[x1, y1]  # (..., H)
+        
+        # Bilinear interpolation
+        # First interpolate along x-axis
+        enc_0 = enc_00 * (1 - wx.unsqueeze(-1)) + enc_10 * wx.unsqueeze(-1)  # (..., H)
+        enc_1 = enc_01 * (1 - wx.unsqueeze(-1)) + enc_11 * wx.unsqueeze(-1)  # (..., H)
+        
+        # Then interpolate along y-axis
+        encodings = enc_0 * (1 - wy.unsqueeze(-1)) + enc_1 * wy.unsqueeze(-1)  # (..., H)
         
         return encodings
     
