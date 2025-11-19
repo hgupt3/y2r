@@ -1,27 +1,13 @@
-dataset_dir: "/home/harsh/sam/data/h5_dataset"
+# Training configuration for autoregressive IntentTracker model
+# This config references dataset_config.yaml for dataset and derived model parameters
 
-# Dataset loader configuration
-dataset_cfg:
-  img_size: 224
-  frame_stack: 2
-  num_track_ts: 8
-  num_track_ids: 16
-  downsample_factor: 2
-  cache_all: true
-  cache_image: true
-
-  # Augmentations
-  aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
-  aug_translation_px: 16
-  aug_rotation_deg: 20
-  aug_hflip_prob: 0.5
-  aug_vflip_prob: 0.0
-  aug_noise_std: 0.02
+# Dataset configuration
+dataset_config: "configs/dataset_config.yaml"  # Path to shared dataset config
 
 # Model configuration
 model:
-  model_type: 'autoreg'          # Use AutoregressiveIntentTracker
-  num_future_steps: 8            # Match dataset_cfg.num_track_ts
+  model_type: 'autoreg'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
   hidden_size: 384
   model_resolution: [224, 224]
   add_space_attn: true
@@ -30,8 +16,6 @@ model:
   num_heads: 8
   mlp_ratio: 4.0
   p_drop_attn: 0.1
-  frame_stack: 2
-  cache_quantized_position_encoding: false
 
 # Training configuration
 training:

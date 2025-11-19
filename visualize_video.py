@@ -6,6 +6,7 @@ Generates MP4 videos showing model predictions overlaid on video frames.
 
 import argparse
 import os
+import warnings
 import yaml
 from pathlib import Path
 import numpy as np
@@ -19,16 +20,37 @@ import matplotlib.cm as cm
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap
 
-from y2r.models.model import IntentTracker
-from y2r.models.diffusion_model import DiffusionIntentTracker
-from y2r.models.autoreg_model import AutoregressiveIntentTracker
+# Suppress xFormers informational warnings from DINOv2
+warnings.filterwarnings("ignore", message="xFormers is available")
+
+from y2r.models.factory import create_model
 from y2r.dataloaders.split_dataset import create_train_val_split
 
 
 def load_config(config_path):
-    """Load YAML configuration file."""
+    """Load YAML configuration file and associated dataset config."""
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
+    
+    # Load dataset config if referenced
+    if 'dataset_config' in cfg:
+        dataset_config_path = cfg['dataset_config']
+        # Handle relative paths
+        if not os.path.isabs(dataset_config_path):
+            config_dir = os.path.dirname(config_path)
+            dataset_config_path = os.path.join(config_dir, dataset_config_path)
+        
+        with open(dataset_config_path, 'r') as f:
+            dataset_cfg = yaml.safe_load(f)
+        
+        # Add dataset config to main config
+        cfg['dataset_cfg'] = dataset_cfg
+        cfg['dataset_dir'] = dataset_cfg['dataset_dir']
+        
+        # Derive model parameters from dataset config
+        if 'model' in cfg:
+            cfg['model']['num_future_steps'] = dataset_cfg['num_track_ts']
+            cfg['model']['frame_stack'] = dataset_cfg['frame_stack']
     
     # Convert to namespace for easier access
     class Namespace:
@@ -61,64 +83,11 @@ def load_model(checkpoint_path, cfg, disp_stats, device):
     # Load to CPU first to avoid CUDA memory issues
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    # Determine model type
+    # Create model using factory
     model_type = getattr(cfg.model, 'model_type', 'direct')
     is_diffusion = (model_type == 'diffusion')
     
-    if is_diffusion:
-        print("Loading DiffusionIntentTracker model...")
-        model = DiffusionIntentTracker(
-            num_future_steps=getattr(cfg.model, 'num_future_steps', 8),
-            hidden_size=getattr(cfg.model, 'hidden_size', 384),
-            model_resolution=tuple(getattr(cfg.model, 'model_resolution', [224, 224])),
-            add_space_attn=getattr(cfg.model, 'add_space_attn', True),
-            vit_model_name=getattr(cfg.model, 'vit_model_name', 'dinov2_vits14'),
-            vit_frozen=getattr(cfg.model, 'vit_frozen', False),
-            time_depth=getattr(cfg.model, 'time_depth', 6),
-            space_depth=getattr(cfg.model, 'space_depth', 3),
-            num_heads=getattr(cfg.model, 'num_heads', 8),
-            mlp_ratio=getattr(cfg.model, 'mlp_ratio', 4.0),
-            p_drop_attn=getattr(cfg.model, 'p_drop_attn', 0.0),
-            frame_stack=getattr(cfg.model, 'frame_stack', 1),
-            num_diffusion_steps=getattr(cfg.model, 'num_diffusion_steps', 100),
-            beta_schedule=getattr(cfg.model, 'beta_schedule', 'squaredcos_cap_v2'),
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-            disp_mean=disp_stats['displacement_mean'],
-            disp_std=disp_stats['displacement_std'],
-        ).to(device)
-    elif model_type == 'autoreg':
-        print("Loading AutoregressiveIntentTracker model...")
-        model = AutoregressiveIntentTracker(
-            num_future_steps=getattr(cfg.model, 'num_future_steps', 10),
-            hidden_size=getattr(cfg.model, 'hidden_size', 384),
-            model_resolution=tuple(getattr(cfg.model, 'model_resolution', [224, 224])),
-            add_space_attn=getattr(cfg.model, 'add_space_attn', True),
-            vit_model_name=getattr(cfg.model, 'vit_model_name', 'dinov2_vits14'),
-            vit_frozen=getattr(cfg.model, 'vit_frozen', False),
-            time_depth=getattr(cfg.model, 'time_depth', 6),
-            num_heads=getattr(cfg.model, 'num_heads', 8),
-            mlp_ratio=getattr(cfg.model, 'mlp_ratio', 4.0),
-            p_drop_attn=getattr(cfg.model, 'p_drop_attn', 0.0),
-            frame_stack=getattr(cfg.model, 'frame_stack', 1),
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-        ).to(device)
-    else:
-        print("Loading IntentTracker model (direct prediction)...")
-        model = IntentTracker(
-            num_future_steps=getattr(cfg.model, 'num_future_steps', 10),
-            hidden_size=getattr(cfg.model, 'hidden_size', 384),
-            model_resolution=tuple(getattr(cfg.model, 'model_resolution', [224, 224])),
-            add_space_attn=getattr(cfg.model, 'add_space_attn', True),
-            vit_model_name=getattr(cfg.model, 'vit_model_name', 'dinov2_vits14'),
-            vit_frozen=getattr(cfg.model, 'vit_frozen', False),
-            time_depth=getattr(cfg.model, 'time_depth', 6),
-            space_depth=getattr(cfg.model, 'space_depth', 3),
-            num_heads=getattr(cfg.model, 'num_heads', 8),
-            mlp_ratio=getattr(cfg.model, 'mlp_ratio', 4.0),
-            p_drop_attn=getattr(cfg.model, 'p_drop_attn', 0.0),
-            frame_stack=getattr(cfg.model, 'frame_stack', 1),
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-        ).to(device)
+    model = create_model(cfg, disp_stats=disp_stats, device=device)
     
     # Load state dict (handle both EMA and regular checkpoints)
     if 'ema_model_state_dict' in checkpoint:
@@ -421,7 +390,7 @@ def visualize_trajectories(frame, query_coords, pred_disp, gt_disp, frame_idx, e
 
 def main():
     parser = argparse.ArgumentParser(description="Generate video visualizations of model predictions")
-    parser.add_argument('--config', type=str, default='train_cfg_diffusion.yaml',
+    parser.add_argument('--config', type=str, required=True,
                        help='Path to training config YAML')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')

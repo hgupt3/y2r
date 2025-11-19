@@ -1,42 +1,26 @@
-dataset_dir: "/home/harsh/sam/data/h5_dataset"
+# Training configuration for direct (non-diffusion) IntentTracker model
+# This config references dataset_config.yaml for dataset and derived model parameters
 
-# Dataset loader configuration
-dataset_cfg:
-  img_size: 224
-  frame_stack: 2
-  num_track_ts: 8
-  num_track_ids: 16
-  downsample_factor: 2  # 1=consecutive frames, 2=every 2nd frame, etc.
-  cache_all: true
-  cache_image: true  # Images are stored in HDF5 file, not separately on disk
-  
-  # Augmentations (applied with prob=training.aug_prob when enabled)
-  aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
-  aug_translation_px: 16
-  aug_rotation_deg: 20
-  aug_hflip_prob: 0.5
-  aug_vflip_prob: 0.0
-  aug_noise_std: 0.02  # Gaussian noise std (0 = disabled)
+# Dataset configuration
+dataset_config: "configs/dataset_config.yaml"  # Path to shared dataset config
 
 # Model configuration
 model:
-  model_type: 'direct'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker
-  num_future_steps: 8          # Match num_track_ts
+  model_type: 'direct'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
   hidden_size: 384
   model_resolution: [224, 224]
   add_space_attn: true
   vit_model_name: 'dinov2_vits14'
   vit_frozen: false             # Fine-tune ViT
-  num_heads: 8                  # Number of attention heads (384/6=64 per head, standard ViT-S)
+  num_heads: 8                  # Number of attention heads (384/8=48 per head)
   mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
   p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
-  frame_stack: 2                # Number of observation frames (match dataset_cfg.frame_stack)
   
   # Diffusion-specific parameters (only used when model_type='diffusion')
   num_diffusion_steps: 100      # Number of diffusion training timesteps
   num_inference_steps: 10       # Number of inference steps (DDIM sampling)
   beta_schedule: 'squaredcos_cap_v2'  # Noise schedule: 'linear', 'squaredcos_cap_v2', etc.
-  cache_quantized_position_encoding: false  # false=compute on-the-fly, true=use cached 224x224 lookup
 
 # Training configuration
 training:

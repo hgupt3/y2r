@@ -25,9 +25,7 @@ import wandb
 # Suppress xFormers informational warnings from DINOv2
 warnings.filterwarnings("ignore", message="xFormers is available")
 
-from y2r.models.model import IntentTracker
-from y2r.models.diffusion_model import DiffusionIntentTracker
-from y2r.models.autoreg_model import AutoregressiveIntentTracker
+from y2r.models.factory import create_model
 from y2r.dataloaders.track_dataloader import TrackDataset
 from y2r.dataloaders.split_dataset import create_train_val_split
 from y2r.losses import normalized_displacement_loss
@@ -35,9 +33,29 @@ from y2r.visualization import visualize_predictions, visualize_diffusion_process
 
 
 def load_config(config_path):
-    """Load YAML configuration file."""
+    """Load YAML configuration file and associated dataset config."""
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
+    
+    # Load dataset config if referenced
+    if 'dataset_config' in cfg:
+        dataset_config_path = cfg['dataset_config']
+        # Handle relative paths
+        if not os.path.isabs(dataset_config_path):
+            config_dir = os.path.dirname(config_path)
+            dataset_config_path = os.path.join(config_dir, dataset_config_path)
+        
+        with open(dataset_config_path, 'r') as f:
+            dataset_cfg = yaml.safe_load(f)
+        
+        # Add dataset config to main config
+        cfg['dataset_cfg'] = dataset_cfg
+        cfg['dataset_dir'] = dataset_cfg['dataset_dir']
+        
+        # Derive model parameters from dataset config
+        if 'model' in cfg:
+            cfg['model']['num_future_steps'] = dataset_cfg['num_track_ts']
+            cfg['model']['frame_stack'] = dataset_cfg['frame_stack']
     
     # Convert to namespace for easier access
     class Namespace:
@@ -273,7 +291,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="train_cfg.yaml",
+        required=True,
         help="Path to configuration file"
     )
     parser.add_argument(
@@ -400,62 +418,11 @@ def main():
     vis_sample_indices = np.linspace(0, num_val_samples-1, cfg.training.val_vis_samples, dtype=int).tolist()
     print(f"Visualization samples: {vis_sample_indices}")
     
-    # Create model (support both direct and diffusion models)
+    # Create model using factory
     model_type = getattr(cfg.model, 'model_type', 'direct')
     is_diffusion = (model_type == 'diffusion')
     
-    if is_diffusion:
-        print(f"Creating DiffusionIntentTracker model...")
-        model = DiffusionIntentTracker(
-            num_future_steps=cfg.model.num_future_steps,
-            hidden_size=cfg.model.hidden_size,
-            model_resolution=cfg.model.model_resolution,
-            add_space_attn=cfg.model.add_space_attn,
-            vit_model_name=cfg.model.vit_model_name,
-            vit_frozen=cfg.model.vit_frozen,
-            time_depth=cfg.model.time_depth,
-            num_heads=cfg.model.num_heads,
-            mlp_ratio=cfg.model.mlp_ratio,
-            p_drop_attn=cfg.model.p_drop_attn,
-            frame_stack=cfg.model.frame_stack,
-            num_diffusion_steps=getattr(cfg.model, 'num_diffusion_steps', 100),
-            beta_schedule=getattr(cfg.model, 'beta_schedule', 'squaredcos_cap_v2'),
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-            disp_mean=disp_stats['displacement_mean'],
-            disp_std=disp_stats['displacement_std'],
-        ).to(device)
-    elif model_type == 'autoreg':
-        print(f"Creating AutoregressiveIntentTracker model...")
-        model = AutoregressiveIntentTracker(
-            num_future_steps=cfg.model.num_future_steps,
-            hidden_size=cfg.model.hidden_size,
-            model_resolution=cfg.model.model_resolution,
-            add_space_attn=cfg.model.add_space_attn,
-            vit_model_name=cfg.model.vit_model_name,
-            vit_frozen=cfg.model.vit_frozen,
-            time_depth=cfg.model.time_depth,
-            num_heads=cfg.model.num_heads,
-            mlp_ratio=cfg.model.mlp_ratio,
-            p_drop_attn=cfg.model.p_drop_attn,
-            frame_stack=cfg.model.frame_stack,
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-        ).to(device)
-    else:
-        print(f"Creating IntentTracker model (direct prediction)...")
-        model = IntentTracker(
-            num_future_steps=cfg.model.num_future_steps,
-            hidden_size=cfg.model.hidden_size,
-            model_resolution=cfg.model.model_resolution,
-            add_space_attn=cfg.model.add_space_attn,
-            vit_model_name=cfg.model.vit_model_name,
-            vit_frozen=cfg.model.vit_frozen,
-            time_depth=cfg.model.time_depth,
-            num_heads=cfg.model.num_heads,
-            mlp_ratio=cfg.model.mlp_ratio,
-            p_drop_attn=cfg.model.p_drop_attn,
-            frame_stack=cfg.model.frame_stack,
-            cache_quantized_position_encoding=getattr(cfg.model, 'cache_quantized_position_encoding', False),
-        ).to(device)
+    model = create_model(cfg, disp_stats=disp_stats, device=device)
     
     # Compile model if requested
     if cfg.training.use_compile:
