@@ -269,17 +269,36 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
     return global_step
 
 
+def _clean_state_dict(state_dict):
+    """
+    Remove torch.compile and EMA wrapper prefixes from state dict.
+    - Removes '_orig_mod.' prefix (from torch.compile)
+    - Removes 'module.' prefix (from AveragedModel/DDP)
+    - Removes 'n_averaged' entry (from AveragedModel)
+    """
+    cleaned = {}
+    for k, v in state_dict.items():
+        if k == 'n_averaged':
+            continue
+        # Remove module. prefix
+        k = k.replace('module.', '', 1)
+        # Remove _orig_mod. prefix
+        k = k.replace('_orig_mod.', '', 1)
+        cleaned[k] = v
+    return cleaned
+
+
 def save_checkpoint(model, optimizer, scheduler, ema_model, epoch, best_val_error, checkpoint_dir, filename):
-    """Save model checkpoint."""
+    """Save model checkpoint with clean state dicts."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, filename)
     
     torch.save({
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': _clean_state_dict(model.state_dict()),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'ema_model_state_dict': ema_model.state_dict(),
+        'ema_model_state_dict': _clean_state_dict(ema_model.state_dict()),
         'best_val_error': best_val_error,
     }, checkpoint_path)
     

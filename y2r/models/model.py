@@ -214,9 +214,6 @@ class IntentTracker(nn.Module):
         """
         pred_disp = self(frames, query_coords)
         
-        # Force t=0 to zero (no displacement at initial timestep)
-        pred_disp[:, :, 0, :] = 0.0
-        
         # For API compatibility with diffusion model
         # Direct model has no intermediate steps, so just return final prediction
         if return_intermediate:

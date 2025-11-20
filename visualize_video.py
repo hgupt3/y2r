@@ -11,7 +11,7 @@ import yaml
 from pathlib import Path
 import numpy as np
 import torch
-import h5py
+from torch.utils.data import DataLoader
 import cv2
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -25,6 +25,8 @@ warnings.filterwarnings("ignore", message="xFormers is available")
 
 from y2r.models.factory import create_model
 from y2r.dataloaders.split_dataset import create_train_val_split
+from y2r.dataloaders.track_dataloader import TrackDataset
+from y2r.visualization import visualize_tracks_on_frame, denormalize_displacements
 
 
 def load_config(config_path):
@@ -71,12 +73,6 @@ def load_normalization_stats(stats_path):
     return stats
 
 
-def denormalize_displacements(disp_normalized, mean, std):
-    """Denormalize displacements using dataset statistics."""
-    disp = disp_normalized * std + mean
-    return disp
-
-
 def load_model(checkpoint_path, cfg, disp_stats, device):
     """Load trained model from checkpoint."""
     print(f"Loading checkpoint from: {checkpoint_path}")
@@ -92,19 +88,14 @@ def load_model(checkpoint_path, cfg, disp_stats, device):
     # Load state dict (handle both EMA and regular checkpoints)
     if 'ema_model_state_dict' in checkpoint:
         # Use EMA model for validation (better quality)
-        state_dict = checkpoint['ema_model_state_dict']
-        # EMA from torch.optim.swa_utils.AveragedModel wraps with 'module.'
-        # Remove 'module.' prefix if present
-        if any(k.startswith('module.') for k in state_dict.keys()):
-            state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(checkpoint['ema_model_state_dict'])
         print("Loaded EMA model state")
     elif 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
         print("Loaded regular model state")
     else:
         # Direct state dict
-        model.load_state_dict(checkpoint, strict=False)
+        model.load_state_dict(checkpoint)
         print("Loaded model state directly")
     
     model.eval()
@@ -115,34 +106,10 @@ def load_model(checkpoint_path, cfg, disp_stats, device):
     return model, is_diffusion, epoch
 
 
-def normalize_frame_for_model(frame):
-    """
-    Normalize frame for model input.
-    
-    Args:
-        frame: (H, W, 3) RGB frame in [0, 255]
-    
-    Returns:
-        normalized: (3, H, W) ImageNet normalized frame
-    """
-    # Convert to [0, 1]
-    frame = frame.astype(np.float32) / 255.0
-    
-    # ImageNet normalization
-    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
-    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
-    
-    # (H, W, 3) -> (3, H, W)
-    frame = frame.transpose(2, 0, 1)
-    frame = (frame - mean) / std
-    
-    return frame
-
-
 def generate_video(model, h5_file, output_path, cfg, disp_stats, is_diffusion, 
                    stride=1, max_points=16, device='cuda'):
     """
-    Generate video with model predictions overlaid.
+    Generate video with model predictions overlaid using TrackDataset.
     
     Args:
         model: trained model
@@ -151,22 +118,35 @@ def generate_video(model, h5_file, output_path, cfg, disp_stats, is_diffusion,
         cfg: configuration namespace
         disp_stats: displacement statistics
         is_diffusion: whether model is diffusion-based
-        stride: frame stride for inference
-        max_points: max trajectory points to visualize
+        stride: frame stride for inference (sample every Nth frame)
+        max_points: max trajectory points to visualize (ignored - dataset handles sampling)
         device: torch device
     """
     print(f"\nGenerating video for: {h5_file}")
     print(f"Output: {output_path}")
     
-    # Load H5 file
-    with h5py.File(h5_file, 'r') as f:
-        video = f['root']['video'][:]  # (T, C, H, W)
-        # Transpose to (T, H, W, C) for visualization
-        video = video.transpose(0, 2, 3, 1)  # (T, H, W, C)
-        num_frames = video.shape[0]
-        
-        print(f"Video shape: {video.shape}")
-        print(f"Processing every {stride} frames")
+    # Create dataset for this single H5 file (no augmentation)
+    dataset = TrackDataset(
+        h5_files=[h5_file],
+        img_size=cfg.dataset_cfg.img_size,
+        frame_stack=cfg.dataset_cfg.frame_stack,
+        num_track_ts=cfg.dataset_cfg.num_track_ts,
+        num_track_ids=cfg.dataset_cfg.num_track_ids,
+        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
+        aug_prob=0.0,  # No augmentation for visualization
+        cache_all=cfg.dataset_cfg.cache_all,
+        cache_image=cfg.dataset_cfg.cache_image
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+    
+    print(f"Dataset length: {len(dataset)} frames")
+    print(f"Processing every {stride} frames")
     
     # Prepare video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -181,89 +161,68 @@ def generate_video(model, h5_file, output_path, cfg, disp_stats, is_diffusion,
     mean = np.array(disp_stats['displacement_mean'])
     std = np.array(disp_stats['displacement_std'])
     
-    # Process frames
-    frame_stack = cfg.model.frame_stack
-    num_future_steps = cfg.model.num_future_steps
-    downsample_factor = getattr(cfg.dataset_cfg, 'downsample_factor', 1)
-    
-    # Get available track frame indices from H5 file
-    with h5py.File(h5_file, 'r') as f:
-        available_track_keys = sorted([k for k in f['root']['tracks'].keys() if k.startswith('frame_')])
-        available_frame_indices = [int(k.split('_')[1]) for k in available_track_keys]
-    
-    print(f"Found {len(available_frame_indices)} frames with tracks (downsample_factor={downsample_factor})")
-    
-    for frame_idx in tqdm(available_frame_indices[::stride], desc="Processing frames"):
-        # Skip if we're too close to the end
-        if frame_idx + num_future_steps * downsample_factor >= num_frames:
+    # Iterate through dataset with stride using the exact structure from train.py
+    for sample_idx, (imgs, tracks) in enumerate(tqdm(dataloader, desc="Processing frames")):
+        if sample_idx % stride != 0:
             continue
-            
-        # Load frame stack for model
-        start_idx = max(0, frame_idx - (frame_stack - 1))
-        frames_raw = video[start_idx:frame_idx+1]  # (T_obs, H, W, 3)
         
-        # Pad if needed at start of video
-        if len(frames_raw) < frame_stack:
-            padding = [frames_raw[0]] * (frame_stack - len(frames_raw))
-            frames_raw = np.concatenate([np.stack(padding), frames_raw], axis=0)
+        # imgs: (1, frame_stack, 3, H, W), tracks: (1, num_track_ts, N, 2)
+        imgs = imgs.to(device)
+        tracks = tracks.to(device)
         
-        # Normalize frames for model
-        frames_normalized = np.stack([normalize_frame_for_model(f) for f in frames_raw])  # (T_obs, 3, H, W)
-        frames_tensor = torch.from_numpy(frames_normalized).float().unsqueeze(0).to(device)  # (1, T_obs, 3, H, W)
+        # Extract query coords (match train.py validation logic exactly)
+        query_coords = tracks[:, 0, :, :]  # (1, N, 2)
         
-        # Load GT tracks at this frame
-        track_key = f"frame_{frame_idx:04d}"
-        with h5py.File(h5_file, 'r') as f:
-            if track_key not in f['root']['tracks']:
-                continue
-            gt_tracks = f['root']['tracks'][track_key][:]  # (T, N, 2) in [0, 1]
-        
-        # Sample points (uniformly or randomly)
-        num_points = gt_tracks.shape[1]
-        if num_points > max_points:
-            indices = np.linspace(0, num_points - 1, max_points, dtype=int)
-            gt_tracks = gt_tracks[:, indices, :]
-        
-        # Extract query coordinates (initial positions)
-        query_coords = gt_tracks[0:1, :, :]  # (1, N, 2) in [0, 1]
-        query_tensor = torch.from_numpy(query_coords).float().to(device)
-        
-        # GT displacements
-        gt_disp = gt_tracks - query_coords  # (T, N, 2)
-        gt_disp = gt_disp.transpose(1, 0, 2)  # (N, T, 2)
-        
-        # Run model prediction
+        # Run model prediction (exactly like train.py)
         with torch.no_grad():
             if is_diffusion:
                 num_inference_steps = getattr(cfg.model, 'num_inference_steps', 10)
-                pred_disp = model.predict(frames_tensor, query_tensor, num_inference_steps=num_inference_steps)
+                pred_disp = model.predict(imgs, query_coords, num_inference_steps=num_inference_steps)
             else:
-                pred_disp = model.predict(frames_tensor, query_tensor)
+                pred_disp = model.predict(imgs, query_coords)
         
-        pred_disp = pred_disp[0].cpu().numpy()  # (N, T_pred, 2) normalized
+        # Use last frame for visualization (match train.py)
+        frame = imgs[0, -1]  # (3, H, W) tensor
+        gt_tracks_data = tracks[0]  # (T, N, 2) - positions
+        pred_disp_single = pred_disp[0]  # (N, T, 2) - displacements (normalized)
+        query_coords_single = query_coords[0]  # (N, 2)
         
-        # Truncate GT to match prediction length
-        T_pred = pred_disp.shape[1]
-        gt_disp = gt_disp[:, :T_pred, :]  # (N, T_pred, 2)
+        # GT tracks are already positions in [0, 1] (match visualization.py)
+        gt_tracks_viz = gt_tracks_data.permute(1, 0, 2)  # (N, T, 2)
         
-        # Denormalize predictions
-        pred_disp_denorm = pred_disp * std + mean  # (N, T_pred, 2) in [0, 1] space
-        gt_disp_denorm = gt_disp * std + mean  # (N, T_pred, 2) in [0, 1] space
+        # Denormalize predicted displacements (match visualization.py)
+        pred_disp_denorm = denormalize_displacements(pred_disp_single, mean, std)
         
-        # Compute error
-        error = np.linalg.norm(pred_disp_denorm - gt_disp_denorm, axis=-1).mean()
-        errors.append(error)
+        # Convert displacements to positions (match visualization.py)
+        pred_tracks_viz = query_coords_single.unsqueeze(1) + pred_disp_denorm  # (N, T, 2)
         
-        # Visualize
-        vis_frame = visualize_trajectories(
-            frames_raw[-1],  # Current frame (last in stack)
-            query_coords[0],  # (N, 2)
-            pred_disp_denorm,  # (N, T, 2)
-            gt_disp_denorm,    # (N, T, 2)
-            frame_idx,
-            error,
-            frame_size
+        # Create visualization using SAME function as training
+        fig = visualize_tracks_on_frame(
+            frame=frame,
+            query_coords=query_coords_single,
+            gt_tracks=gt_tracks_viz,
+            pred_tracks=pred_tracks_viz,
+            title=f"Frame {sample_idx}"
         )
+        
+        # Convert matplotlib figure to OpenCV frame
+        fig.canvas.draw()
+        # Get the RGBA buffer from the figure
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        # Convert RGBA to RGB
+        vis_img = buf[:, :, :3]
+        plt.close(fig)
+        
+        # Resize to output size and convert RGB to BGR for OpenCV
+        vis_frame = cv2.resize(vis_img, frame_size)
+        vis_frame = cv2.cvtColor(vis_frame, cv2.COLOR_RGB2BGR)
+        
+        # Compute error for logging
+        gt_disp = gt_tracks_data - query_coords_single.unsqueeze(0)  # (T, N, 2)
+        gt_disp = gt_disp.permute(1, 0, 2)  # (N, T, 2)
+        error = torch.norm(pred_disp_denorm - gt_disp, dim=-1).mean().item()
+        errors.append(error)
         
         # Write frame
         out.write(vis_frame)
@@ -277,124 +236,13 @@ def generate_video(model, h5_file, output_path, cfg, disp_stats, is_diffusion,
     return avg_error
 
 
-def _draw_gradient_trajectory(ax, traj_x, traj_y, cmap, linewidth=3, alpha=0.85):
-    """
-    Draw a single trajectory with proper gradient coloring using LineCollection.
-    
-    Args:
-        ax: matplotlib axis
-        traj_x: x coordinates array
-        traj_y: y coordinates array
-        cmap: colormap to use
-        linewidth: line width
-        alpha: transparency
-    """
-    # Create line segments
-    points = np.array([traj_x, traj_y]).T.reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    
-    # Create LineCollection with gradient colors
-    T = len(traj_x)
-    colors = np.linspace(0, 1, T-1)  # Color values from 0 (light) to 1 (dark)
-    
-    lc = LineCollection(segments, cmap=cmap, alpha=alpha, linewidth=linewidth, capstyle='round')
-    lc.set_array(colors)
-    ax.add_collection(lc)
-
-
-def visualize_trajectories(frame, query_coords, pred_disp, gt_disp, frame_idx, error, output_size=(512, 512)):
-    """
-    Visualize trajectories on frame.
-    
-    Args:
-        frame: (H, W, 3) RGB frame in [0, 255]
-        query_coords: (N, 2) query positions in [0, 1]
-        pred_disp: (N, T, 2) predicted displacements in [0, 1] space
-        gt_disp: (N, T, 2) GT displacements in [0, 1] space
-        frame_idx: current frame index
-        error: current error metric
-        output_size: output frame size (H, W)
-    
-    Returns:
-        vis_frame: (H, W, 3) RGB visualization in [0, 255]
-    """
-    # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8), dpi=64)
-    
-    # Show frame
-    ax.imshow(frame)
-    ax.axis('off')
-    
-    H, W = frame.shape[:2]
-    N, T, _ = pred_disp.shape
-    
-    # Create custom colormaps (light to dark for time progression)
-    # GT: Light green → Dark green
-    gt_cmap = LinearSegmentedColormap.from_list(
-        'gt_gradient', 
-        ['#90EE90', '#7FD87F', '#50C850', '#228B22', '#006400']  # light green → dark green
-    )
-    
-    # Pred: Light cyan → Dark blue
-    pred_cmap = LinearSegmentedColormap.from_list(
-        'pred_gradient',
-        ['#B0E0E6', '#87CEEB', '#00BFFF', '#1E90FF', '#0000CD']  # light cyan → dark blue
-    )
-    
-    # Draw trajectories
-    for i in range(N):
-        # Query point
-        qx, qy = query_coords[i] * np.array([W, H])
-        ax.plot(qx, qy, 'go', markersize=8, markeredgecolor='white', markeredgewidth=1.5)
-        
-        # GT trajectory with gradient
-        gt_positions = query_coords[i:i+1] + gt_disp[i]  # (T, 2)
-        gt_px = gt_positions[:, 0] * W
-        gt_py = gt_positions[:, 1] * H
-        _draw_gradient_trajectory(ax, gt_px, gt_py, gt_cmap, linewidth=3, alpha=0.85)
-        
-        # Predicted trajectory with gradient
-        pred_positions = query_coords[i:i+1] + pred_disp[i]  # (T, 2)
-        pred_px = pred_positions[:, 0] * W
-        pred_py = pred_positions[:, 1] * H
-        _draw_gradient_trajectory(ax, pred_px, pred_py, pred_cmap, linewidth=3, alpha=0.85)
-    
-    # Add legend
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], color='#50C850', linewidth=3, alpha=0.85, label='GT'),
-        Line2D([0], [0], color='#00BFFF', linewidth=3, alpha=0.85, label='Pred'),
-    ]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=12, framealpha=0.9)
-    
-    # Add text overlay
-    text_str = f"Frame: {frame_idx}\nError: {error:.4f}"
-    ax.text(10, 20, text_str, color='white', fontsize=12, 
-           bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
-    
-    # Convert to image
-    canvas = FigureCanvasAgg(fig)
-    canvas.draw()
-    buf = canvas.buffer_rgba()
-    vis_img = np.asarray(buf)[:, :, :3]  # Drop alpha
-    plt.close(fig)
-    
-    # Resize to output size
-    vis_img = cv2.resize(vis_img, output_size)
-    
-    # Convert RGB to BGR for OpenCV
-    vis_frame = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
-    
-    return vis_frame
-
-
 def main():
     parser = argparse.ArgumentParser(description="Generate video visualizations of model predictions")
     parser.add_argument('--config', type=str, required=True,
                        help='Path to training config YAML')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
-    parser.add_argument('--output_dir', type=str, default='./validation_videos',
+    parser.add_argument('--output_dir', type=str, default='./data/validation_videos',
                        help='Directory to save output videos')
     parser.add_argument('--num_train_videos', type=int, default=2,
                        help='Number of train set videos to visualize')
@@ -438,6 +286,15 @@ def main():
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Delete previous visualization videos in output directory
+    print(f"\nCleaning output directory: {args.output_dir}")
+    for file in Path(args.output_dir).glob('*.mp4'):
+        try:
+            file.unlink()
+            print(f"  Deleted: {file.name}")
+        except Exception as e:
+            print(f"  Warning: Could not delete {file.name}: {e}")
     
     # Create train/val split
     train_files, val_files = create_train_val_split(
