@@ -24,8 +24,15 @@ visualization:
   show_fps: true
   trail_history_sec: 0.25  # Duration (seconds) of trajectory history to keep
   trail_alpha_floor: 0.2   # Minimum opacity for the oldest trail samples
-  trajectory_near_color: [255, 255, 255]  # BGR format - near future (white)
-  trajectory_far_color: [255, 100, 100]   # BGR format - far future (light blue)
+  trajectory_color_stops:
+    - [135, 8, 13]     # 0.00: dark purple
+    - [162, 11, 72]    # 0.15: deep purple
+    - [163, 28, 120]   # 0.30: purple-pink
+    - [145, 46, 156]   # 0.45: magenta
+    - [117, 69, 190]   # 0.60: red-pink
+    - [84, 97, 219]    # 0.75: orange-red
+    - [50, 135, 241]   # 0.90: orange
+    - [33, 249, 240]   # 1.00: yellow
   trajectory_line_thickness: 2
 
 # Perception node settings
@@ -34,7 +41,7 @@ perception:
   device: "cuda"
   
   # Detection model (runs once on first frame)
-  detection_model: "florence-2"  # or "grounding-dino"
+  detection_model: "grounding-dino"  # "florence-2" or "grounding-dino"
   text_prompt: "small red t-shaped block."  # Object to track
   
   # Query point sampling

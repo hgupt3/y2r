@@ -71,9 +71,35 @@ def generate_launch_description():
         shell=False
     )
     
-    # Visualization Node  
+    # Visualization Node
+    # trajectory_color_stops is a nested list which ROS2 command line can't handle,
+    # so we create a temporary params file with proper ROS2 YAML format
+    import tempfile
+    import yaml as yaml_module
+    
+    # Flatten the color stops for ROS2 parameter format
+    color_stops_flat = []
+    for color in config["visualization"]["trajectory_color_stops"]:
+        color_stops_flat.extend(color)
+    
+    viz_params = {
+        'visualization_node': {
+            'ros__parameters': {
+                'window_name': config["visualization"]["window_name"],
+                'display_scale': config["visualization"]["display_scale"],
+                'trail_history_sec': config["visualization"]["trail_history_sec"],
+                'trail_alpha_floor': config["visualization"]["trail_alpha_floor"],
+                'trajectory_color_stops': color_stops_flat,  # Flattened: [B,G,R,B,G,R,...]
+                'trajectory_line_thickness': config["visualization"]["trajectory_line_thickness"],
+            }
+        }
+    }
+    viz_params_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
+    yaml_module.dump(viz_params, viz_params_file)
+    viz_params_file.close()
+    
     visualization_node = ExecuteProcess(
-        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {visualization_script} --ros-args -p "window_name:={config["visualization"]["window_name"]}" -p display_scale:={config["visualization"]["display_scale"]} -p trail_history_sec:={config["visualization"]["trail_history_sec"]} -p trail_alpha_floor:={config["visualization"]["trail_alpha_floor"]} -p "trajectory_near_color:={config["visualization"]["trajectory_near_color"]}" -p "trajectory_far_color:={config["visualization"]["trajectory_far_color"]}" -p trajectory_line_thickness:={config["visualization"]["trajectory_line_thickness"]}'],
+        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {visualization_script} --ros-args --params-file {viz_params_file.name}'],
         name='visualization_node',
         output='screen',
         shell=False

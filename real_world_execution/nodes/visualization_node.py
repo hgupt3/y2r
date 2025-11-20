@@ -37,8 +37,13 @@ class VisualizationNode(Node):
         self.declare_parameter('display_scale', 2)  # Upscale for visibility
         self.declare_parameter('trail_history_sec', 0.25)
         self.declare_parameter('trail_alpha_floor', 0.2)
-        self.declare_parameter('trajectory_near_color', [255, 255, 255])
-        self.declare_parameter('trajectory_far_color', [255, 100, 100])
+        # Use dynamic typing to accept any array type (byte/int) for color stops
+        from rcl_interfaces.msg import ParameterDescriptor
+        self.declare_parameter(
+            'trajectory_color_stops',
+            [],
+            ParameterDescriptor(dynamic_typing=True)
+        )
         self.declare_parameter('trajectory_line_thickness', 2)
         
         self.window_name = self.get_parameter('window_name').value
@@ -47,13 +52,11 @@ class VisualizationNode(Node):
         self.trail_alpha_floor = float(min(1.0, max(0.0, self.get_parameter('trail_alpha_floor').value)))
         
         # Trajectory visualization parameters
-        near_color = self.get_parameter('trajectory_near_color').value
-        far_color = self.get_parameter('trajectory_far_color').value
+        color_stops_param = self.get_parameter('trajectory_color_stops').value
         self.traj_line_thickness = self.get_parameter('trajectory_line_thickness').value
         
-        # Convert from list to tuple (BGR for OpenCV)
-        self.traj_near_color = tuple(near_color) if isinstance(near_color, list) else near_color
-        self.traj_far_color = tuple(far_color) if isinstance(far_color, list) else far_color
+        self.traj_color_stops = self._load_color_stops(color_stops_param)
+        self._ensure_color_stops()
         
         # FPS tracking
         self.frame_count = 0
@@ -65,7 +68,7 @@ class VisualizationNode(Node):
         
         # Latest predicted trajectories from predictor node
         self.latest_trajectories = None  # Dict entry containing latest data
-        self.trail_history = deque()
+        self.trail_history = deque(maxlen=50)  # Prevent infinite growth
         
         # Subscribe to preprocessed image
         self.subscription = self.create_subscription(
@@ -167,35 +170,118 @@ class VisualizationNode(Node):
     
     def draw_gradient_trajectory(self, img, traj_x, traj_y, thickness=2, alpha=1.0):
         """
-        Draw a single trajectory with gradient color.
+        Draw a single trajectory with smooth gradient color and proper alpha blending.
         
         Args:
-            img: image to draw on
+            img: image to draw on (will be modified in-place with alpha blending)
             traj_x: x coordinates in pixel space
             traj_y: y coordinates in pixel space
             thickness: line thickness
-            alpha: transparency scale applied to the colors
+            alpha: transparency (0=invisible, 1=fully opaque)
         """
         T = len(traj_x)
         if T < 2:
             return
         
-        alpha_scale = float(max(0.0, min(1.0, alpha)))
+        alpha_blend = float(max(0.0, min(1.0, alpha)))
         
-        # Draw line segments with interpolated colors
-        for t in range(T - 1):
-            # Interpolate color from near to far
-            segment_ratio = t / (T - 1)  # 0 to 1
-            base_color = [
-                self.traj_near_color[i] * (1 - segment_ratio) + self.traj_far_color[i] * segment_ratio
-                for i in range(3)
-            ]
-            color = tuple(int(c * alpha_scale) for c in base_color)
+        # Create overlay for alpha blending
+        overlay = img.copy()
+        
+        # Parameterize trajectory for smooth interpolation (distance-based)
+        if T > 2:
+            deltas_x = np.diff(traj_x)
+            deltas_y = np.diff(traj_y)
+            segment_distances = np.sqrt(np.square(deltas_x) + np.square(deltas_y))
+            cumulative_distance = np.concatenate(([0.0], np.cumsum(segment_distances)))
+            total_distance = cumulative_distance[-1]
+            if total_distance > 1e-6:
+                base_param = cumulative_distance / total_distance
+            else:
+                base_param = np.linspace(0.0, 1.0, T)
+        else:
+            base_param = np.linspace(0.0, 1.0, T)
+        
+        num_interp_points = max(16, T * 4)  # ensure smooth gradient even with small T
+        interp_param = np.linspace(0.0, 1.0, num_interp_points)
+        
+        traj_x_smooth = np.interp(interp_param, base_param, traj_x)
+        traj_y_smooth = np.interp(interp_param, base_param, traj_y)
+        
+        # Draw many short segments with gradually changing colors
+        for i in range(num_interp_points - 1):
+            segment_ratio = i / (num_interp_points - 1)
+            color = self._color_from_stops(segment_ratio)
             
-            pt1 = (int(traj_x[t]), int(traj_y[t]))
-            pt2 = (int(traj_x[t+1]), int(traj_y[t+1]))
+            pt1 = (int(traj_x_smooth[i]), int(traj_y_smooth[i]))
+            pt2 = (int(traj_x_smooth[i + 1]), int(traj_y_smooth[i + 1]))
             
-            cv2.line(img, pt1, pt2, color, thickness, cv2.LINE_AA)
+            cv2.line(overlay, pt1, pt2, color, thickness, cv2.LINE_AA)
+        
+        # Blend overlay with original image using alpha
+        cv2.addWeighted(overlay, alpha_blend, img, 1 - alpha_blend, 0, img)
+
+    def _parse_color(self, color_value):
+        """Convert color specification to BGR tuple."""
+        if isinstance(color_value, (list, tuple)) and len(color_value) >= 3:
+            return tuple(int(max(0, min(255, c))) for c in color_value[:3])
+        return None
+
+    def _load_color_stops(self, stops_param):
+        """
+        Parse color stops from parameter.
+        Handles both nested [[B,G,R], [B,G,R], ...] and flattened [B,G,R,B,G,R,...] formats.
+        """
+        stops = []
+        if not isinstance(stops_param, (list, tuple)) or len(stops_param) == 0:
+            return stops
+        
+        # Check if it's already nested (first element is a list/tuple)
+        if isinstance(stops_param[0], (list, tuple)):
+            for color in stops_param:
+                parsed = self._parse_color(color)
+                if parsed is not None:
+                    stops.append(parsed)
+        else:
+            # Flattened format: [B,G,R,B,G,R,...] - reshape into [[B,G,R], ...]
+            if len(stops_param) % 3 == 0:
+                for i in range(0, len(stops_param), 3):
+                    color = (int(stops_param[i]), int(stops_param[i+1]), int(stops_param[i+2]))
+                    stops.append(color)
+            else:
+                self.get_logger().warn(f'Invalid color stops length: {len(stops_param)} (must be multiple of 3)')
+        
+        return stops
+
+    def _color_from_stops(self, ratio):
+        """Interpolate color from multiple stops."""
+        if not self.traj_color_stops:
+            return (255, 255, 255)
+        if ratio <= 0:
+            return self.traj_color_stops[0]
+        if ratio >= 1:
+            return self.traj_color_stops[-1]
+        total_segments = len(self.traj_color_stops) - 1
+        if total_segments <= 0:
+            return self.traj_color_stops[0]
+        scaled = ratio * total_segments
+        idx = int(np.floor(scaled))
+        frac = scaled - idx
+        idx = min(idx, total_segments - 1)
+        c0 = self.traj_color_stops[idx]
+        c1 = self.traj_color_stops[idx + 1]
+        return tuple(int(c0[i] * (1 - frac) + c1[i] * frac) for i in range(3))
+
+    def _ensure_color_stops(self):
+        """Validate color stops list and apply fallbacks."""
+        if len(self.traj_color_stops) >= 2:
+            return
+        if len(self.traj_color_stops) == 1:
+            self.get_logger().warn('Only one trajectory color provided; duplicating to create a valid gradient.')
+            self.traj_color_stops.append(self.traj_color_stops[0])
+            return
+        self.get_logger().warn('No trajectory_color_stops provided; defaulting to simple white gradient.')
+        self.traj_color_stops = [(255, 255, 255), (0, 0, 0)]
     
     def image_callback(self, msg):
         """Display preprocessed image with FPS overlay."""

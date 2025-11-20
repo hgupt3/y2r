@@ -98,7 +98,8 @@ class PredictorNode(Node):
         
         # Frame buffer: store (timestamp, frame_array) tuples
         self.buffer_duration = (self.frame_stack - 1) * self.frame_dt
-        self.frame_buffer = deque()
+        # Worst case: 60 FPS * 0.083s buffer = ~5 frames needed, use 100 as safety cap
+        self.frame_buffer = deque(maxlen=100)
         self.get_logger().info(f'  Frame buffer duration: {self.buffer_duration:.3f}s')
         
         # Latest query points
