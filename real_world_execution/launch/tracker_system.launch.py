@@ -73,7 +73,7 @@ def generate_launch_description():
     
     # Visualization Node  
     visualization_node = ExecuteProcess(
-        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {visualization_script} --ros-args -p "window_name:={config["visualization"]["window_name"]}" -p display_scale:={config["visualization"]["display_scale"]} -p trail_history_sec:={config["visualization"]["trail_history_sec"]} -p trail_alpha_floor:={config["visualization"]["trail_alpha_floor"]}'],
+        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {visualization_script} --ros-args -p "window_name:={config["visualization"]["window_name"]}" -p display_scale:={config["visualization"]["display_scale"]} -p trail_history_sec:={config["visualization"]["trail_history_sec"]} -p trail_alpha_floor:={config["visualization"]["trail_alpha_floor"]} -p "trajectory_near_color:={config["visualization"]["trajectory_near_color"]}" -p "trajectory_far_color:={config["visualization"]["trajectory_far_color"]}" -p trajectory_line_thickness:={config["visualization"]["trajectory_line_thickness"]}'],
         name='visualization_node',
         output='screen',
         shell=False
