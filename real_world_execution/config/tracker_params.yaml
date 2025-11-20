@@ -24,6 +24,9 @@ visualization:
   show_fps: true
   trail_history_sec: 0.25  # Duration (seconds) of trajectory history to keep
   trail_alpha_floor: 0.2   # Minimum opacity for the oldest trail samples
+  trajectory_near_color: [255, 255, 255]  # BGR format - near future (white)
+  trajectory_far_color: [255, 100, 100]   # BGR format - far future (light blue)
+  trajectory_line_thickness: 2
 
 # Perception node settings
 perception:
@@ -47,12 +50,6 @@ predictor:
   enabled: true
   train_config_path: "/home/harsh/sam/configs/train_direct.yaml"  # Path to training config YAML (contains model+dataset params)
   checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-11-19_00-08-37/latest.pth"    # Path to model checkpoint (.pth file)
-  device: "cuda"
-  
-  # Visualization settings for predicted trajectories
-  trajectory_near_color: [255, 255, 255]  
-  trajectory_far_color: [255, 100, 100]   
-  trajectory_line_thickness: 2
-  show_query_points: false 
+  device: "cuda" 
 
 

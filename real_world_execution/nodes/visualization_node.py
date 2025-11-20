@@ -37,11 +37,23 @@ class VisualizationNode(Node):
         self.declare_parameter('display_scale', 2)  # Upscale for visibility
         self.declare_parameter('trail_history_sec', 0.25)
         self.declare_parameter('trail_alpha_floor', 0.2)
+        self.declare_parameter('trajectory_near_color', [255, 255, 255])
+        self.declare_parameter('trajectory_far_color', [255, 100, 100])
+        self.declare_parameter('trajectory_line_thickness', 2)
         
         self.window_name = self.get_parameter('window_name').value
         self.display_scale = self.get_parameter('display_scale').value
         self.trail_history_sec = float(max(0.0, self.get_parameter('trail_history_sec').value))
         self.trail_alpha_floor = float(min(1.0, max(0.0, self.get_parameter('trail_alpha_floor').value)))
+        
+        # Trajectory visualization parameters
+        near_color = self.get_parameter('trajectory_near_color').value
+        far_color = self.get_parameter('trajectory_far_color').value
+        self.traj_line_thickness = self.get_parameter('trajectory_line_thickness').value
+        
+        # Convert from list to tuple (BGR for OpenCV)
+        self.traj_near_color = tuple(near_color) if isinstance(near_color, list) else near_color
+        self.traj_far_color = tuple(far_color) if isinstance(far_color, list) else far_color
         
         # FPS tracking
         self.frame_count = 0
@@ -54,10 +66,6 @@ class VisualizationNode(Node):
         # Latest predicted trajectories from predictor node
         self.latest_trajectories = None  # Dict entry containing latest data
         self.trail_history = deque()
-        
-        # Trajectory visualization colors (BGR for OpenCV)
-        self.traj_near_color = (255, 255, 0)  # Bright cyan
-        self.traj_far_color = (128, 0, 0)     # Dark blue
         
         # Subscribe to preprocessed image
         self.subscription = self.create_subscription(
@@ -155,11 +163,11 @@ class VisualizationNode(Node):
         for i in range(num_tracks):
             traj_x = pred_tracks[i, :, 0] * display_width
             traj_y = pred_tracks[i, :, 1] * display_height
-            self.draw_gradient_trajectory(img, traj_x, traj_y, thickness=2, alpha=alpha)
+            self.draw_gradient_trajectory(img, traj_x, traj_y, thickness=self.traj_line_thickness, alpha=alpha)
     
     def draw_gradient_trajectory(self, img, traj_x, traj_y, thickness=2, alpha=1.0):
         """
-        Draw a single trajectory with gradient color (cyan to dark blue).
+        Draw a single trajectory with gradient color.
         
         Args:
             img: image to draw on
@@ -176,7 +184,7 @@ class VisualizationNode(Node):
         
         # Draw line segments with interpolated colors
         for t in range(T - 1):
-            # Interpolate color from near (cyan) to far (dark blue)
+            # Interpolate color from near to far
             segment_ratio = t / (T - 1)  # 0 to 1
             base_color = [
                 self.traj_near_color[i] * (1 - segment_ratio) + self.traj_far_color[i] * segment_ratio
@@ -188,11 +196,6 @@ class VisualizationNode(Node):
             pt2 = (int(traj_x[t+1]), int(traj_y[t+1]))
             
             cv2.line(img, pt1, pt2, color, thickness, cv2.LINE_AA)
-        
-        # Draw small circle at starting point
-        start_pt = (int(traj_x[0]), int(traj_y[0]))
-        circle_color = tuple(int(c * alpha_scale) for c in self.traj_near_color)
-        cv2.circle(img, start_pt, 3, circle_color, -1, cv2.LINE_AA)
     
     def image_callback(self, msg):
         """Display preprocessed image with FPS overlay."""
