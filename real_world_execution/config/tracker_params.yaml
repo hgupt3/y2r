@@ -1,0 +1,58 @@
+# Configuration for Real-Time Tracker System
+
+# Camera settings (passed to RealSense launch)
+camera:
+  # Color camera (RGB)
+  fps: 60
+  width: 424
+  height: 240
+  
+  # Depth camera (separate settings - depth sensor has different supported resolutions)
+  depth_fps: 90
+  depth_width: 256
+  depth_height: 144
+
+# Preprocessor settings
+preprocessor:
+  crop_size: 224      # Final output resolution (224x224)
+  target_fps: 0.0     # 0.0 or null = full throughput, or set to number to throttle
+
+# Visualization settings
+visualization:
+  window_name: "Real-Time Tracker"
+  display_scale: 3  # Upscale 224x224 to 448x448 for visibility
+  show_fps: true
+  trail_history_sec: 0.25  # Duration (seconds) of trajectory history to keep
+  trail_alpha_floor: 0.2   # Minimum opacity for the oldest trail samples
+
+# Perception node settings
+perception:
+  enabled: true
+  device: "cuda"
+  
+  # Detection model (runs once on first frame)
+  detection_model: "florence-2"  # or "grounding-dino"
+  text_prompt: "small red t-shaped block."  # Object to track
+  
+  # Query point sampling
+  num_query_points: 16  # Number of points to sample per frame
+  mask_erosion_pixels: 3  # Erode mask by X pixels before sampling query points (avoid edge instability)
+  sampling_strategy: "random"  # Options: "random", "fps" (farthest point sampling)
+  
+  # Performance
+  target_fps: 0.0  # 0.0 or null = full throughput, or set to number to throttle
+
+# Predictor node settings
+predictor:
+  enabled: true
+  train_config_path: "/home/harsh/sam/configs/train_direct.yaml"  # Path to training config YAML (contains model+dataset params)
+  checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-11-19_00-08-37/latest.pth"    # Path to model checkpoint (.pth file)
+  device: "cuda"
+  
+  # Visualization settings for predicted trajectories
+  trajectory_near_color: [255, 255, 255]  
+  trajectory_far_color: [255, 100, 100]   
+  trajectory_line_thickness: 2
+  show_query_points: false 
+
+

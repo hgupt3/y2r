@@ -377,8 +377,8 @@ def gsam(
     sam2_checkpoint="sam2/checkpoints/sam2.1_hiera_large.pt",
     model_cfg="configs/sam2.1/sam2.1_hiera_l.yaml",
     grounding_model_id="IDEA-Research/grounding-dino-base",
-    box_threshold=0.3,
-    text_threshold=0.3
+    box_threshold=0.5,
+    text_threshold=0.5
     ):
     """
     Processes a single frame from a video to detect and segment objects based on a text prompt.

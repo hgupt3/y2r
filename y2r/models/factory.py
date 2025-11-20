@@ -11,7 +11,7 @@ from y2r.models.diffusion_model import DiffusionIntentTracker
 from y2r.models.autoreg_model import AutoregressiveIntentTracker
 
 
-def create_model(cfg, disp_stats=None, device='cuda'):
+def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
     """
     Factory function to create models based on configuration.
     
@@ -28,6 +28,8 @@ def create_model(cfg, disp_stats=None, device='cuda'):
             - 'displacement_std': list/array of length 2
             Required for 'diffusion' model type.
         device: str or torch.device, device to place model on (default: 'cuda')
+        from_pretrained: bool, if True loads ViT from torch.hub, if False skips
+            (for loading from checkpoint). Default: True for backward compatibility.
     
     Returns:
         model: Instantiated model moved to specified device.
@@ -55,6 +57,7 @@ def create_model(cfg, disp_stats=None, device='cuda'):
         'mlp_ratio': cfg.model.mlp_ratio,
         'p_drop_attn': cfg.model.p_drop_attn,
         'frame_stack': cfg.model.frame_stack,
+        'from_pretrained': from_pretrained,
     }
     
     # Instantiate model based on type

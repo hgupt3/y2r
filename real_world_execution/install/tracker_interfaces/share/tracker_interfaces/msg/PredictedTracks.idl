@@ -1,0 +1,34 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from tracker_interfaces/msg/PredictedTracks.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Point.idl"
+#include "std_msgs/msg/Header.idl"
+
+module tracker_interfaces {
+  module msg {
+    struct PredictedTracks {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "(N, 2) starting positions")
+      sequence<geometry_msgs::msg::Point> query_points;
+
+      @verbatim (language="comment", text=
+        "Flattened (N*T,) x-coordinates")
+      sequence<float> trajectory_x;
+
+      @verbatim (language="comment", text=
+        "Flattened (N*T,) y-coordinates")
+      sequence<float> trajectory_y;
+
+      @verbatim (language="comment", text=
+        "N")
+      int32 num_points;
+
+      @verbatim (language="comment", text=
+        "T")
+      int32 num_timesteps;
+    };
+  };
+};

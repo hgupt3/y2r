@@ -21,6 +21,7 @@ class IntentTracker(nn.Module):
         p_drop_attn=0.0,
         frame_stack=1,
         cache_quantized_position_encoding=False,
+        from_pretrained=True,
     ):
         super(IntentTracker, self).__init__()
         self.num_future_steps = num_future_steps
@@ -30,7 +31,39 @@ class IntentTracker(nn.Module):
         self.cache_quantized_position_encoding = cache_quantized_position_encoding
 
         # ViT encoder (provides all visual context)
-        self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
+        if from_pretrained:
+            # Load pretrained weights from torch.hub (for training)
+            self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
+        else:
+            # Create model architecture without pretrained weights (for inference from checkpoint)
+            # Import from vendored dinov2 in thirdparty/ to avoid network dependency
+            import sys
+            from pathlib import Path
+            # Add vendored dinov2 to path
+            project_root = Path(__file__).parent.parent.parent
+            dinov2_path = project_root / 'thirdparty' / 'dinov2'
+            if str(dinov2_path) not in sys.path:
+                sys.path.insert(0, str(dinov2_path))
+            from dinov2.hub.backbones import (
+                dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14,
+                dinov2_vits14_reg, dinov2_vitb14_reg, dinov2_vitl14_reg, dinov2_vitg14_reg
+            )
+            # Map model name to function
+            model_map = {
+                'dinov2_vits14': dinov2_vits14,
+                'dinov2_vitb14': dinov2_vitb14,
+                'dinov2_vitl14': dinov2_vitl14,
+                'dinov2_vitg14': dinov2_vitg14,
+                'dinov2_vits14_reg': dinov2_vits14_reg,
+                'dinov2_vitb14_reg': dinov2_vitb14_reg,
+                'dinov2_vitl14_reg': dinov2_vitl14_reg,
+                'dinov2_vitg14_reg': dinov2_vitg14_reg,
+            }
+            if vit_model_name not in model_map:
+                raise ValueError(f"Unknown ViT model: {vit_model_name}")
+            # Create model without pretrained weights (pretrained=False)
+            self.vit = model_map[vit_model_name](pretrained=False)
+        
         self.vit.requires_grad_(not vit_frozen)
         
         # Embedding dimensions (following modern diffusion literature like DiT)
