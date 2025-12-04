@@ -13,18 +13,22 @@ common:
   clean_frames_dir: &clean_frames_dir "/home/harsh/sam/data/clean_frames"  # Output: diffueraser -> Input: gsam, cotracker
   masks_dir: &masks_dir "/home/harsh/sam/data/masks"  # Output: gsam -> Input: cotracker
   tracks_dir: &tracks_dir "/home/harsh/sam/data/tracks"  # Output: cotracker
-  
+  tracks_3d_dir: &tracks_3d_dir "/home/harsh/sam/data/tracks_3d"  # Output: spatracker
+  vipe_dir: &vipe_dir "/home/harsh/sam/data/vipe"
+
   # Visualization paths
   human_vis_dir: &human_vis_dir "/home/harsh/sam/data/human_vis"
   gsam_vis_dir: &gsam_vis_dir "/home/harsh/sam/data/gsam_vis"
   cotracker_vis_dir: &cotracker_vis_dir "/home/harsh/sam/data/cotracker_vis"
+  spatracker_vis_dir: &spatracker_vis_dir "/home/harsh/sam/data/spatracker_vis"
+  vipe_vis_dir: &vipe_vis_dir "/home/harsh/sam/data/vipe_vis"
   
   # Common parameters
   detection_model: &detection_model "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
-  device: &device "cuda:0"  # CUDA device to use across all stages
+  device: &device "cuda:1"  # CUDA device to use across all stages
   target_fps: &target_fps 12  # FPS for both extraction and visualization
   window_length: &window_length 16  # Number of frames per sliding window
-  num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
+  num_videos_to_process: &num_videos_to_process 1  # Number of videos to process (null = all)
   continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: &vis_flag true  # Enable/disable visualization videos
   
@@ -98,6 +102,16 @@ cotracker:
   vis_path: *cotracker_vis_dir  # Where to save visualization videos
   vis_fps: *target_fps  # FPS for visualization videos
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+
+vipe:
+  pipeline: "default"  # ViPE pipeline config: "default", "no_vda" (faster/less memory), "wide_angle"
+  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
+  output_dir: *vipe_dir  # Where to save ViPE .pt outputs (depth, pose, intrinsics)
+  device: *device  # CUDA device to use (e.g., "cuda:1")
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  vis_flag: *vis_flag  # Enable ViPE visualization videos
+  vis_path: *vipe_vis_dir  # Where to save ViPE visualization videos
+  continue: *continue  # Whether to continue from previous run
 
 create_h5_dataset:
   target_size: 224  # Target resolution for images (images will be center-cropped to square then resized)
