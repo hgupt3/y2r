@@ -1,0 +1,23 @@
+# Dataset configuration
+# This file defines the dataset structure and is shared across all training runs
+# Model parameters like num_future_steps and frame_stack are derived from this config
+
+dataset_dir: "/home/harsh/sam/data/h5_dataset"
+
+# Dataset loader configuration
+img_size: 224
+frame_stack: 2          # Number of observation frames (model will use this value)
+num_track_ts: 8         # Number of future timesteps to predict (model num_future_steps)
+num_track_ids: 16       # Number of trajectory points per frame
+downsample_factor: 2    # 1=consecutive frames, 2=every 2nd frame, etc.
+cache_all: true         # Cache all data in memory
+cache_image: true       # Images are stored in HDF5 file, not separately on disk
+
+# Data augmentation parameters (applied with prob=training.aug_prob when enabled)
+aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
+aug_translation_px: 16
+aug_rotation_deg: 20
+aug_hflip_prob: 0.5
+aug_vflip_prob: 0.0
+aug_noise_std: 0.02     # Gaussian noise std (0 = disabled)
+

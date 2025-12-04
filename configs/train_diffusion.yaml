@@ -1,0 +1,67 @@
+# Training configuration for diffusion-based IntentTracker model
+# This config references dataset_config.yaml for dataset and derived model parameters
+
+# Dataset configuration
+dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative to this file)
+
+# Model configuration
+model:
+  model_type: 'diffusion'       # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
+  hidden_size: 384
+  model_resolution: [224, 224]
+  add_space_attn: true
+  vit_model_name: 'dinov2_vits14'
+  vit_frozen: false             # Fine-tune ViT
+  num_heads: 6                  # Number of attention heads (384/6=64 per head, standard ViT-S)
+  mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
+  p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
+  
+  # Diffusion-specific parameters
+  num_diffusion_steps: 100      # Number of diffusion training timesteps
+  num_inference_steps: 10       # Number of inference steps (DDIM sampling, faster than training)
+  beta_schedule: 'squaredcos_cap_v2'  # Noise schedule: 'linear', 'squaredcos_cap_v2', etc.
+
+# Training configuration
+training:
+  # Device configuration
+  device: 'cuda'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
+  
+  # Training loop
+  num_epochs: 100
+  batch_size: 32                # Batch size (adjust based on GPU memory)
+  num_workers: 4                # DataLoader workers (adjust based on CPU cores)
+  aug_prob: 0.9                 # Data augmentation probability
+  
+  # Optimizer
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  
+  # Modern optimizations
+  use_amp: true                 # Mixed precision training
+  use_compile: true             # torch.compile for speed
+  ema_decay: 0.999              # Model EMA
+  
+  # Learning rate schedule (cosine with warmup)
+  lr_schedule: "cosine"
+  warmup_epochs: 5              # 5% of total epochs
+  min_lr: 1.0e-6                # Minimum LR for cosine decay
+  
+  # Validation
+  val_every_n_epochs: 5
+  val_split: 0.1                # 10% for validation
+  val_num_demos: null           # Or specify exact number
+  val_vis_samples: 64            # Number of samples to visualize
+  val_seed: 42                  # For consistent val split
+  
+  # Checkpointing
+  checkpoint_dir: "./checkpoints"  # Base directory (timestamped subdirs will be created)
+  
+  # Logging
+  wandb_project: "intent-tracker"
+  wandb_entity: null            # Your W&B username
+  log_every_n_steps: 10
+  log_gradients: true           # Log gradient norms
+  log_params: true              # Log parameter histograms (expensive, maybe every 100 steps)
+
