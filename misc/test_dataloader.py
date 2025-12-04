@@ -1,175 +1,787 @@
 #!/usr/bin/env python3
 """
-Test script to verify HDF5 dataset works with dataloader.
+Test script to verify HDF5 dataset works with the updated dataloader.
+Supports both 2D and 3D track formats with visualization.
+
+Usage:
+    python test_dataloader.py                    # Basic test
+    python test_dataloader.py --visualize        # Test with visualization
+    python test_dataloader.py --visualize --num_samples 10
 """
 import sys
+import os
 from pathlib import Path
 import torch
 import numpy as np
 import cv2
 import random
+import yaml
+import shutil
+import h5py
+import json
+import zlib
+import struct
 
 # Add parent directory to path to import y2r
-sys.path.insert(0, str(Path(__file__).parent.parent))
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from y2r.dataloaders.track_dataloader import TrackDataset
-from y2r.dataloaders.utils import get_dataloader
+from y2r.dataloaders.utils import get_dataloader, NormalizationStats
 
 
-def visualize_sample(imgs, tracks, sample_idx, output_dir, img_size=128, vis_scale=4):
+def load_config():
+    """Load configuration from dataset_config.yaml"""
+    config_path = PROJECT_ROOT / "configs" / "dataset_config.yaml"
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def denormalize_sample(sample, norm_stats, track_type):
     """
-    Visualize a sample with trajectory overlay using CoTracker-style visualization.
-    Upscales the image for better visualization quality.
+    Denormalize a sample back to raw values.
     
     Args:
-        imgs: (frame_stack, C, H, W) - ImageNet normalized image tensor
-        tracks: (num_track_ts, num_points, 2) - normalized track coordinates [0-1]
+        sample: Dict with normalized data
+        norm_stats: NormalizationStats instance
+        track_type: '2d' or '3d'
+    
+    Returns:
+        Dict with denormalized data
+    """
+    result = {}
+    
+    # Images: denormalize from ImageNet normalization
+    imgs = sample['imgs'].clone()
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    result['imgs'] = imgs * std + mean  # Back to [0, 1]
+    
+    # Query coords
+    query_coords = sample['query_coords'].clone()
+    if track_type == '3d' and query_coords.shape[-1] == 3:
+        # Denormalize depth (3rd dimension)
+        query_coords[:, 2] = norm_stats.denormalize_depth(query_coords[:, 2].numpy())
+        query_coords[:, 2] = torch.from_numpy(query_coords[:, 2].numpy())
+    result['query_coords'] = query_coords
+    
+    # Displacements
+    displacements = sample['displacements'].clone().numpy()
+    displacements = norm_stats.denormalize_displacement(displacements)
+    result['displacements'] = torch.from_numpy(displacements)
+    
+    # Poses (3D only)
+    if sample.get('poses') is not None:
+        poses = sample['poses'].clone().numpy()
+        poses = norm_stats.denormalize_pose(poses)
+        result['poses'] = torch.from_numpy(poses)
+    else:
+        result['poses'] = None
+    
+    # Depth maps (3D only)
+    if sample.get('depth') is not None:
+        depth = sample['depth'].clone().numpy()
+        depth = norm_stats.denormalize_depth(depth)
+        result['depth'] = torch.from_numpy(depth)
+    else:
+        result['depth'] = None
+    
+    return result
+
+
+def reconstruct_tracks(query_coords, displacements):
+    """
+    Reconstruct full trajectory from query_coords and displacements.
+    
+    Args:
+        query_coords: (N, coord_dim) - initial positions
+        displacements: (T, N, coord_dim) - motion relative to t=0
+    
+    Returns:
+        tracks: (T, N, coord_dim) - full trajectory
+    """
+    T, N, coord_dim = displacements.shape
+    tracks = query_coords.unsqueeze(0).expand(T, -1, -1) + displacements
+    return tracks
+
+
+def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=None, vis_scale=2):
+    """
+    Visualize a sample with 2D trajectory overlay.
+    
+    Args:
+        sample: Dict with 'imgs', 'query_coords', 'displacements'
         sample_idx: Sample index for filename
         output_dir: Directory to save visualization
         img_size: Image size
-        vis_scale: Scale factor for visualization (default 4x = 512x512 from 128x128)
+        norm_stats: NormalizationStats for denormalizing displacements
+        vis_scale: Scale factor for visualization
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Import CoTracker visualizer
-    import sys
-    from pathlib import Path as P
-    sys.path.insert(0, str(P(__file__).parent.parent / "thirdparty"))
+    sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
     from cotracker3.cotracker.utils.visualizer import Visualizer
     import torch.nn.functional as F
     
-    # Get the last frame (most recent observation)
-    frame = imgs[-1]  # (C, H, W), ImageNet normalized
+    imgs = sample['imgs']
+    query_coords = sample['query_coords'].clone()
+    displacements = sample['displacements'].clone()
     
-    # Denormalize from ImageNet normalization to [0, 1]
+    # Denormalize displacements before reconstruction
+    if norm_stats is not None:
+        disp_np = displacements.numpy()
+        disp_np = norm_stats.denormalize_displacement(disp_np)
+        displacements = torch.from_numpy(disp_np.astype(np.float32))
+    
+    # Reconstruct tracks
+    tracks = reconstruct_tracks(query_coords, displacements)  # (T, N, coord_dim)
+    
+    # Get last frame (most recent observation)
+    frame = imgs[-1].clone()  # (C, H, W), ImageNet normalized
+    
+    # Denormalize from ImageNet
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     frame = frame * std + mean
-    frame = torch.clamp(frame, 0, 1) * 255  # Convert to [0, 255]
+    frame = torch.clamp(frame, 0, 1) * 255
     
-    # Upscale frame for better visualization
+    # Upscale frame
     vis_size = img_size * vis_scale
     frame_upscaled = F.interpolate(
-        frame.unsqueeze(0),  # Add batch: (1, C, H, W)
+        frame.unsqueeze(0),
         size=(vis_size, vis_size),
         mode='bilinear',
         align_corners=False
-    ).squeeze(0)  # Remove batch: (C, H, W)
+    ).squeeze(0)
     
-    # Darken frame for better trajectory visibility (like CoTracker does)
+    # Darken for visibility
     frame_darkened = frame_upscaled * 0.5
     
-    # Convert tracks to pixel coordinates at upscaled resolution
-    tracks_px = tracks.clone()
-    tracks_px = tracks_px * vis_size  # Denormalize to upscaled pixel space
+    # Convert tracks to pixel coords (only use u, v)
+    tracks_2d = tracks[..., :2].clone()  # (T, N, 2)
+    tracks_2d = tracks_2d * vis_size  # Denormalize to pixel space
     
-    # Add batch dimension: (num_track_ts, num_points, 2) -> (1, num_track_ts, num_points, 2)
-    tracks_batch = tracks_px.unsqueeze(0)
+    # Add batch dimension for visualizer
+    tracks_batch = tracks_2d.unsqueeze(0)  # (1, T, N, 2)
     
-    # Create visualizer with thin lines (circle radius = linewidth * 2)
-    # At 4x upscale, linewidth=1 gives nice thin lines and small circles
+    # Create visualizer
     vis = Visualizer(save_dir=str(output_dir), pad_value=0, linewidth=1)
     
-    # Render trajectory on frame
+    # Render
     rendered_frame = vis.visualize_trajectory_on_frame(
         frame=frame_darkened,
-        tracks=tracks_batch,  # (1, num_track_ts, num_points, 2)
+        tracks=tracks_batch,
         visibility=None,
         segm_mask=None,
         query_frame=0,
         opacity=1.0,
     )
     
-    # Save visualization
-    output_path = output_dir / f"sample_{sample_idx:03d}_trajectories.png"
+    # Save
+    output_path = output_dir / f"sample_{sample_idx:03d}_2d.png"
     cv2.imwrite(str(output_path), cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR))
     
     return output_path
 
 
-def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_track_ids=32, 
-                   downsample_factor=1, visualize=False, vis_dir="test_visualizations", 
-                   num_vis_samples=5, vis_scale=4, test_augmentations=False, aug_prob=0.9, aug_config=None):
+def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, norm_stats=None):
+    """
+    Create 3D visualization using the same system as process_tapip3d.py.
+    
+    Args:
+        sample: Dict with 'imgs', 'query_coords', 'displacements', 'poses'
+        sample_idx: Sample index for filename
+        output_dir: Directory to save visualization
+        intrinsics: (3, 3) camera intrinsics matrix
+        img_size: Image size for coordinate unprojection
+        norm_stats: NormalizationStats for denormalizing data
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    imgs = sample['imgs']
+    query_coords = sample['query_coords'].clone()  # (N, 3) - (u, v, d)
+    displacements = sample['displacements'].clone()  # (T, N, 3) - (du, dv, dd)
+    
+    # Denormalize before reconstruction
+    if norm_stats is not None:
+        # Denormalize depth in query_coords (3rd dimension)
+        query_coords[:, 2] = torch.from_numpy(
+            norm_stats.denormalize_depth(query_coords[:, 2].numpy()).astype(np.float32)
+        )
+        # Denormalize displacements
+        disp_np = displacements.numpy()
+        disp_np = norm_stats.denormalize_displacement(disp_np)
+        displacements = torch.from_numpy(disp_np.astype(np.float32))
+    
+    # Reconstruct full tracks in (u, v, d) space
+    tracks = reconstruct_tracks(query_coords, displacements)  # (T, N, 3)
+    T, N, _ = tracks.shape
+    
+    # Unproject (u, v, d) to 3D camera coords
+    u = tracks[..., 0].numpy() * img_size  # pixel x
+    v = tracks[..., 1].numpy() * img_size  # pixel y
+    d = tracks[..., 2].numpy()  # depth
+    
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    
+    # Unproject to 3D camera coords
+    x_3d = (u - cx) * d / fx
+    y_3d = (v - cy) * d / fy
+    z_3d = d
+    
+    points_3d = np.stack([x_3d, y_3d, z_3d], axis=-1)  # (T, N, 3)
+    
+    # Get RGB frame (denormalize from ImageNet)
+    frame = imgs[-1].clone()
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    frame = (frame * std + mean).clamp(0, 1)
+    frame_np = (frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    
+    # Get depth frame if available (use last frame corresponding to imgs[-1])
+    depth_frame = None
+    if sample['depth'] is not None:
+        # sample['depth'] is (T_all_frames, H, W) - use last frame
+        # Depth is normalized by dataloader, so denormalize it
+        depth_tensor = sample['depth'][-1]
+        if norm_stats is not None:
+            depth_frame = norm_stats.denormalize_depth(depth_tensor.numpy())
+        else:
+            depth_frame = depth_tensor.numpy()
+    
+    # Create visualization using TAPIP3D format
+    create_3d_viz_data(
+        points_3d, frame_np, intrinsics, img_size,
+        output_dir, sample_idx, depth_frame=depth_frame
+    )
+    
+    return output_dir / f"sample_{sample_idx:03d}_3d.html"
+
+
+def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None):
+    """
+    Create visualization data using the same format as process_tapip3d.py.
+    
+    Args:
+        points_3d: (T, N, 3) 3D points in camera coords
+        frame_rgb: (H, W, 3) RGB frame as uint8
+        intrinsics: (3, 3) camera intrinsics
+        img_size: Image size
+        output_dir: Output directory
+        sample_idx: Sample index
+        depth_frame: (H, W) optional depth frame in meters
+    """
+    T, N, _ = points_3d.shape
+    H, W = frame_rgb.shape[:2]
+    
+    # Fixed visualization size
+    fixed_size = (256, 192)  # (width, height)
+    
+    # Resize frame
+    rgb_resized = cv2.resize(frame_rgb, fixed_size, interpolation=cv2.INTER_AREA)
+    rgb_video = rgb_resized[np.newaxis, ...]  # (1, H, W, 3)
+    
+    # Process depth frame
+    if depth_frame is not None:
+        # Resize actual depth
+        depth_resized = cv2.resize(depth_frame, fixed_size, interpolation=cv2.INTER_NEAREST)
+        valid_depths = depth_resized[depth_resized > 0]
+        if len(valid_depths) > 0:
+            min_depth = float(valid_depths.min()) * 0.8
+            max_depth = float(valid_depths.max()) * 1.5
+        else:
+            min_depth, max_depth = 0.1, 10.0
+    else:
+        # Fallback: use trajectory depths
+        avg_depth = np.mean(points_3d[..., 2])
+        min_depth = max(0.1, float(np.min(points_3d[..., 2])) * 0.8)
+        max_depth = float(np.max(points_3d[..., 2])) * 1.5
+        depth_resized = np.full((fixed_size[1], fixed_size[0]), avg_depth, dtype=np.float32)
+    
+    depth_normalized = np.clip((depth_resized - min_depth) / (max_depth - min_depth), 0, 1)
+    depth_int = (depth_normalized * ((1 << 16) - 1)).astype(np.uint16)
+    
+    depths_rgb = np.zeros((1, fixed_size[1], fixed_size[0], 3), dtype=np.uint8)
+    depths_rgb[0, :, :, 0] = (depth_int & 0xFF).astype(np.uint8)
+    depths_rgb[0, :, :, 1] = ((depth_int >> 8) & 0xFF).astype(np.uint8)
+    
+    # Scale intrinsics for visualization size
+    scale_x = fixed_size[0] / W
+    scale_y = fixed_size[1] / H
+    intrinsics_scaled = intrinsics.copy()
+    intrinsics_scaled[0, :] *= scale_x
+    intrinsics_scaled[1, :] *= scale_y
+    intrinsics_arr = intrinsics_scaled[np.newaxis, ...].astype(np.float32)  # (1, 3, 3)
+    
+    # Compute FOV
+    fx, fy = intrinsics_scaled[0, 0], intrinsics_scaled[1, 1]
+    fov_y = 2 * np.arctan(fixed_size[1] / (2 * fy)) * (180 / np.pi)
+    fov_x = 2 * np.arctan(fixed_size[0] / (2 * fx)) * (180 / np.pi)
+    
+    # Identity extrinsics (camera-0 frame is world frame)
+    extrinsics = np.eye(4, dtype=np.float32)[np.newaxis, ...]  # (1, 4, 4)
+    inv_extrinsics = np.eye(4, dtype=np.float32)[np.newaxis, ...]  # (1, 4, 4)
+    
+    # Trajectories: (1, T, N, 3) - single "window" with T timesteps
+    trajectories = points_3d[np.newaxis, ...].astype(np.float32)  # (1, T, N, 3)
+    
+    # Build binary data
+    arrays = {
+        "rgb_video": rgb_video,
+        "depths_rgb": depths_rgb,
+        "intrinsics": intrinsics_arr,
+        "extrinsics": extrinsics,
+        "inv_extrinsics": inv_extrinsics,
+        "trajectories": trajectories,
+        "cameraZ": np.float64(0.0),
+    }
+    
+    header = {}
+    blob_parts = []
+    offset = 0
+    
+    for key, arr in arrays.items():
+        arr = np.ascontiguousarray(arr)
+        arr_bytes = arr.tobytes()
+        header[key] = {"dtype": str(arr.dtype), "shape": list(arr.shape), "offset": offset, "length": len(arr_bytes)}
+        blob_parts.append(arr_bytes)
+        offset += len(arr_bytes)
+    
+    compressed_blob = zlib.compress(b"".join(blob_parts), level=9)
+    
+    header["meta"] = {
+        "depthRange": [float(min_depth), float(max_depth)],
+        "totalFrames": 1,
+        "resolution": list(fixed_size),
+        "baseFrameRate": 1,
+        "numTrajectoryPoints": N,
+        "fov": float(fov_y),
+        "fov_x": float(fov_x),
+        "windowLength": T,
+        "stride": 1,
+        "windowedMode": True,
+    }
+    
+    # Write binary data file
+    bin_path = output_dir / f"sample_{sample_idx:03d}_data.bin"
+    header_bytes = json.dumps(header).encode("utf-8")
+    header_len = struct.pack("<I", len(header_bytes))
+    with open(bin_path, "wb") as f:
+        f.write(header_len)
+        f.write(header_bytes)
+        f.write(compressed_blob)
+    
+    # Create HTML that uses this data file
+    create_sample_viz_html(output_dir, sample_idx, N, T)
+
+
+def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
+    """
+    Create HTML visualization using the TAPIP3D viz.html as template.
+    This reuses the exact same viewer as process_tapip3d.py.
+    """
+    # Path to the TAPIP3D viz.html template
+    viz_template = PROJECT_ROOT / "thirdparty" / "TAPIP3D" / "utils" / "viz.html"
+    
+    if not viz_template.exists():
+        print(f"    Warning: viz.html template not found at {viz_template}")
+        return
+    
+    with open(viz_template, 'r') as f:
+        html = f.read()
+    
+    # Apply the same modifications as create_windowed_viz_html in process_tapip3d.py
+    # Detect windowed mode by checking for 4D trajectory shape
+    html = html.replace(
+        '''const shape = this.data.trajectories.shape;
+        if (!shape || shape.length < 2) return;
+        
+        const [totalFrames, numTrajectories] = shape;''',
+        '''const shape = this.data.trajectories.shape;
+        if (!shape || shape.length < 2) return;
+        
+        // Windowed mode: shape is (num_windows, T_window, N, 3)
+        const isWindowedMode = shape.length === 4;
+        let totalFrames, numTrajectories, windowLength;
+        if (isWindowedMode) {
+          [totalFrames, windowLength, numTrajectories] = shape;
+        } else {
+          [totalFrames, numTrajectories] = shape;
+          windowLength = 1;
+        }
+        
+        this.isWindowedMode = isWindowedMode;
+        this.windowLength = windowLength;'''
+    )
+    
+    # Add end marker creation for windowed mode
+    html = html.replace(
+        '''trajectoryGroup.userData = {
+            marker: positionMarker,
+            line: trajectoryLine,
+            color: colors[i]
+          };''',
+        '''let endMarker = null;
+          if (this.isWindowedMode) {
+            const endSphereGeometry = new THREE.SphereGeometry(ballSize * 1.5, 16, 16);
+            const endSphereMaterial = new THREE.MeshBasicMaterial({ 
+              color: colors[i],
+              transparent: true,
+              opacity: 1.0
+            });
+            endMarker = new THREE.Mesh(endSphereGeometry, endSphereMaterial);
+            trajectoryGroup.add(endMarker);
+          }
+          
+          trajectoryGroup.userData = {
+            marker: positionMarker,
+            line: trajectoryLine,
+            endMarker: endMarker,
+            color: colors[i]
+          };'''
+    )
+    
+    # Replace updateTrajectories function
+    old_update = '''updateTrajectories(frameIndex) {
+        if (!this.data.trajectories || this.trajectories.length === 0) return;
+        
+        const trajectoryData = this.data.trajectories.data;
+        const [totalFrames, numTrajectories] = this.data.trajectories.shape;
+        const historyFramesSetting = parseInt(this.ui.trajectoryHistory.value);
+        const historyFrames = Math.min(historyFramesSetting, this.config.totalFrames);
+        
+        for (let i = 0; i < numTrajectories; i++) {
+          const trajectoryGroup = this.trajectories[i];
+          const { marker, line } = trajectoryGroup.userData;
+          
+          const currentPos = new THREE.Vector3();
+          const currentOffset = (frameIndex * numTrajectories + i) * 3;
+          
+          currentPos.x = trajectoryData[currentOffset];
+          currentPos.y = -trajectoryData[currentOffset + 1];
+          currentPos.z = -trajectoryData[currentOffset + 2];
+          
+          marker.position.copy(currentPos);
+          
+          const positions = [];
+          const historyToShow = Math.min(historyFrames, frameIndex + 1);
+          
+          for (let j = 0; j < historyToShow; j++) {
+            const historyFrame = Math.max(0, frameIndex - j);
+            const historyOffset = (historyFrame * numTrajectories + i) * 3;
+            
+            positions.push(
+              trajectoryData[historyOffset],
+              -trajectoryData[historyOffset + 1],
+              -trajectoryData[historyOffset + 2]
+            );
+          }
+          
+          for (let j = historyToShow; j < historyFrames; j++) {
+            positions.push(currentPos.x, currentPos.y, currentPos.z);
+          }
+          
+          line.geometry.setPositions(positions);
+          
+          line.visible = frameIndex > 0;
+        }
+      }'''
+    
+    new_update = '''updateTrajectories(frameIndex) {
+        if (!this.data.trajectories || this.trajectories.length === 0) return;
+        
+        const trajectoryData = this.data.trajectories.data;
+        const shape = this.data.trajectories.shape;
+        
+        if (this.isWindowedMode) {
+          const [numWindows, windowLength, numTrajectories] = shape;
+          
+          for (let i = 0; i < numTrajectories; i++) {
+            const trajectoryGroup = this.trajectories[i];
+            const { marker, line, endMarker } = trajectoryGroup.userData;
+            
+            const positions = [];
+            for (let t = 0; t < windowLength; t++) {
+              const offset = ((frameIndex * windowLength + t) * numTrajectories + i) * 3;
+              positions.push(
+                trajectoryData[offset],
+                -trajectoryData[offset + 1],
+                -trajectoryData[offset + 2]
+              );
+            }
+            
+            const startOffset = (frameIndex * windowLength * numTrajectories + i) * 3;
+            marker.position.set(
+              trajectoryData[startOffset],
+              -trajectoryData[startOffset + 1],
+              -trajectoryData[startOffset + 2]
+            );
+            
+            if (endMarker) {
+              const endOffset = ((frameIndex * windowLength + windowLength - 1) * numTrajectories + i) * 3;
+              endMarker.position.set(
+                trajectoryData[endOffset],
+                -trajectoryData[endOffset + 1],
+                -trajectoryData[endOffset + 2]
+              );
+            }
+            
+            line.geometry.setPositions(positions);
+            line.visible = true;
+          }
+        } else {
+          const [totalFrames, numTrajectories] = shape;
+          const historyFramesSetting = parseInt(this.ui.trajectoryHistory.value);
+          const historyFrames = Math.min(historyFramesSetting, this.config.totalFrames);
+          
+          for (let i = 0; i < numTrajectories; i++) {
+            const trajectoryGroup = this.trajectories[i];
+            const { marker, line } = trajectoryGroup.userData;
+            
+            const currentPos = new THREE.Vector3();
+            const currentOffset = (frameIndex * numTrajectories + i) * 3;
+            
+            currentPos.x = trajectoryData[currentOffset];
+            currentPos.y = -trajectoryData[currentOffset + 1];
+            currentPos.z = -trajectoryData[currentOffset + 2];
+            
+            marker.position.copy(currentPos);
+            
+            const positions = [];
+            const historyToShow = Math.min(historyFrames, frameIndex + 1);
+            
+            for (let j = 0; j < historyToShow; j++) {
+              const historyFrame = Math.max(0, frameIndex - j);
+              const historyOffset = (historyFrame * numTrajectories + i) * 3;
+              
+              positions.push(
+                trajectoryData[historyOffset],
+                -trajectoryData[historyOffset + 1],
+                -trajectoryData[historyOffset + 2]
+              );
+            }
+            
+            for (let j = historyToShow; j < historyFrames; j++) {
+              positions.push(currentPos.x, currentPos.y, currentPos.z);
+            }
+            
+            line.geometry.setPositions(positions);
+            line.visible = frameIndex > 0;
+          }
+        }
+      }'''
+    
+    html = html.replace(old_update, new_update)
+    
+    # Fix FPS bug
+    html = html.replace(
+        'this.playbackSpeed = this.config.baseFrameRate;',
+        'this.playbackSpeed = 1;'
+    )
+    html = html.replace(
+        'const speedRates = speeds.map(s => s * this.config.baseFrameRate);',
+        'const speedRates = speeds;'
+    )
+    html = html.replace(
+        'const normalizedSpeed = this.playbackSpeed / this.config.baseFrameRate;',
+        'const normalizedSpeed = this.playbackSpeed;'
+    )
+    html = html.replace(
+        'this.playbackSpeed = speedRates[nextIndex];',
+        'this.playbackSpeed = speeds[nextIndex];'
+    )
+    
+    # Point to the sample's data.bin file
+    html = html.replace('data.bin', f'sample_{sample_idx:03d}_data.bin')
+    
+    # Add info overlay
+    info_html = f'''<div style="position:fixed;top:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:10px;border-radius:8px;font-family:system-ui;color:#eee;">
+        <b>Sample {sample_idx}</b><br>
+        Points: {num_points} | Timesteps: {num_timesteps}
+    </div>'''
+    html = html.replace('<body>', '<body>' + info_html)
+    
+    # Write HTML file
+    html_path = output_dir / f"sample_{sample_idx:03d}_3d.html"
+    with open(html_path, 'w') as f:
+        f.write(html)
+
+
+def create_vis_index_html(vis_dir, sample_indices, track_type):
+    """Create an index.html for easy navigation of visualizations."""
+    html = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Dataloader Test Visualizations</title>
+    <style>
+        body { 
+            margin: 0; padding: 20px; 
+            font-family: system-ui, -apple-system, sans-serif; 
+            background: #1a1a2e; color: #eee; 
+        }
+        h1 { color: #a78bfa; margin-bottom: 10px; }
+        .info { color: #888; margin-bottom: 20px; }
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); 
+            gap: 16px; 
+        }
+        .card { 
+            background: #16213e; 
+            border-radius: 12px; 
+            padding: 16px; 
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover { 
+            transform: translateY(-4px); 
+            box-shadow: 0 8px 24px rgba(167, 139, 250, 0.2);
+        }
+        .card h3 { margin: 0 0 12px 0; color: #a78bfa; }
+        .card a { 
+            display: inline-block;
+            padding: 8px 16px; 
+            margin: 4px 4px 4px 0;
+            background: #0f3460; 
+            color: #eee; 
+            text-decoration: none; 
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .card a:hover { background: #1a4b8c; }
+        .card a.vis-3d { background: #4a1d6e; }
+        .card a.vis-3d:hover { background: #6b2d9e; }
+        .card img { 
+            width: 100%; 
+            border-radius: 8px; 
+            margin-bottom: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Dataloader Test Visualizations</h1>
+    <p class="info">Track type: ''' + track_type.upper() + f''' | Samples: {len(sample_indices)}</p>
+    <div class="grid">
+'''
+    
+    for idx in sorted(sample_indices):
+        html += f'''        <div class="card">
+            <h3>Sample {idx}</h3>
+            <img src="sample_{idx:03d}_2d.png" alt="2D visualization">
+            <div>
+                <a href="sample_{idx:03d}_2d.png" target="_blank">2D Image</a>
+'''
+        if track_type == '3d':
+            html += f'''                <a href="sample_{idx:03d}_3d.html" target="_blank" class="vis-3d">3D Viewer</a>
+'''
+        html += '''            </div>
+        </div>
+'''
+    
+    html += '''    </div>
+</body>
+</html>'''
+    
+    with open(vis_dir / "index.html", 'w') as f:
+        f.write(html)
+
+
+def load_intrinsics_from_h5(h5_path):
+    """Load intrinsics from HDF5 file if available."""
+    with h5py.File(h5_path, 'r') as f:
+        if 'root/intrinsics' in f:
+            return np.array(f['root/intrinsics'])
+    return None
+
+
+def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=False, aug_prob=0.9):
     """
     Test loading data from HDF5 files.
     
     Args:
-        h5_dir: Directory containing .hdf5 files
-        img_size: Image size (default 128)
-        frame_stack: Number of frames to stack (default 1)
-        num_track_ts: Number of future track timesteps (default 16)
-        num_track_ids: Minimum number of tracks required per frame (default 32)
-        downsample_factor: Temporal downsampling factor (default 1)
-        visualize: Whether to create visualizations (default False)
-        vis_dir: Directory to save visualizations (default "test_visualizations")
-        num_vis_samples: Number of samples to visualize (default 5)
-        vis_scale: Upscaling factor for visualization quality (default 4x)
-        test_augmentations: Whether to enable augmentations (default False)
-        aug_prob: Augmentation probability when test_augmentations=True (default 0.9)
-        aug_config: Dictionary with augmentation config from train_cfg.yaml (optional)
+        config: Configuration dict from dataset_config.yaml
+        visualize: Whether to create visualizations
+        num_samples: Number of samples to visualize
+        test_augmentations: Whether to enable augmentations
+        aug_prob: Augmentation probability
     """
+    dataset_dir = config['dataset_dir']
+    img_size = config['img_size']
+    frame_stack = config['frame_stack']
+    num_track_ts = config['num_track_ts']
+    num_track_ids = config['num_track_ids']
+    downsample_factor = config['downsample_factor']
+    track_type = config.get('track_type', '2d')
+    
     print(f"\n{'='*70}")
     print("TESTING DATALOADER WITH H5 DATASET")
     print(f"{'='*70}")
-    print(f"Dataset directory: {h5_dir}")
+    print(f"Dataset directory: {dataset_dir}")
+    print(f"Track type: {track_type}")
     print(f"Image size: {img_size}x{img_size}")
     print(f"Frame stack: {frame_stack}")
     print(f"Downsample factor: {downsample_factor}x")
     print(f"Future track timesteps: {num_track_ts}")
     print(f"Minimum tracks per frame: {num_track_ids}")
+    
     if test_augmentations:
         print(f"Augmentations: ENABLED (prob={aug_prob})")
-        if aug_config:
-            enabled_augs = []
-            if aug_config.get('aug_color_jitter'):
-                enabled_augs.append('color_jitter')
-            if aug_config.get('aug_translation_px', 0) > 0:
-                enabled_augs.append(f"translation({aug_config.get('aug_translation_px')}px)")
-            if aug_config.get('aug_rotation_deg', 0) > 0:
-                enabled_augs.append(f"rotate(±{aug_config.get('aug_rotation_deg')}°)")
-            if aug_config.get('aug_hflip_prob', 0) > 0:
-                enabled_augs.append(f"hflip({aug_config.get('aug_hflip_prob')})")
-            if aug_config.get('aug_vflip_prob', 0) > 0:
-                enabled_augs.append(f"vflip({aug_config.get('aug_vflip_prob')})")
-            if aug_config.get('aug_noise_std', 0) > 0:
-                enabled_augs.append(f"noise(std={aug_config.get('aug_noise_std')})")
-            print(f"  Enabled: {', '.join(enabled_augs) if enabled_augs else 'none'}")
     else:
         print(f"Augmentations: DISABLED")
     print(f"{'='*70}\n")
     
+    # Prepare dataset kwargs
+    dataset_kwargs = {
+        'dataset_dir': dataset_dir,
+        'img_size': img_size,
+        'num_track_ts': num_track_ts,
+        'num_track_ids': num_track_ids,
+        'frame_stack': frame_stack,
+        'downsample_factor': downsample_factor,
+        'track_type': track_type,
+        'cache_all': config.get('cache_all', True),
+        'cache_image': config.get('cache_image', True),
+        'num_demos': None,
+        'aug_prob': aug_prob if test_augmentations else 0.0,
+    }
+    
+    # Add augmentation config if enabled
+    if test_augmentations:
+        dataset_kwargs.update({
+            'aug_color_jitter': config.get('aug_color_jitter'),
+            'aug_translation_px': config.get('aug_translation_px', 0),
+            'aug_rotation_deg': config.get('aug_rotation_deg', 0),
+            'aug_hflip_prob': config.get('aug_hflip_prob', 0.0),
+            'aug_vflip_prob': config.get('aug_vflip_prob', 0.0),
+            'aug_noise_std': config.get('aug_noise_std', 0.0),
+            'aug_depth_noise_std': config.get('aug_depth_noise_std', 0.0),
+        })
+    
     # Create dataset
     print("Creating dataset...")
     try:
-        # Prepare dataset kwargs
-        dataset_kwargs = {
-            'dataset_dir': h5_dir,
-            'img_size': img_size,
-            'num_track_ts': num_track_ts,
-            'num_track_ids': num_track_ids,
-            'frame_stack': frame_stack,
-            'downsample_factor': downsample_factor,
-            'cache_all': True,
-            'cache_image': True,  # Images are stored in HDF5, keep them in cache
-            'num_demos': None,
-            'aug_prob': aug_prob if test_augmentations else 0.0
-        }
-        
-        # Add augmentation config if provided (compact format)
-        if aug_config and test_augmentations:
-            dataset_kwargs.update({
-                'aug_color_jitter': aug_config.get('aug_color_jitter'),
-                'aug_translation_px': aug_config.get('aug_translation_px', 0),
-                'aug_rotation_deg': aug_config.get('aug_rotation_deg', 0),
-                'aug_hflip_prob': aug_config.get('aug_hflip_prob', 0.0),
-                'aug_vflip_prob': aug_config.get('aug_vflip_prob', 0.0),
-                'aug_noise_std': aug_config.get('aug_noise_std', 0.0)
-            })
-        
         dataset = TrackDataset(**dataset_kwargs)
         print(f"✓ Dataset created successfully")
         print(f"  Total samples: {len(dataset)}")
+        
+        # Check normalization stats
+        if dataset.norm_stats is not None:
+            print(f"  Normalization stats loaded: ✓")
+            print(f"    Track type: {dataset.norm_stats.track_type}")
+            print(f"    Displacement mean: {dataset.norm_stats.disp_mean}")
+            print(f"    Displacement std: {dataset.norm_stats.disp_std}")
+            if track_type == '3d':
+                print(f"    Depth mean: {dataset.norm_stats.depth_mean:.4f}")
+                print(f"    Depth std: {dataset.norm_stats.depth_std:.4f}")
+        else:
+            print(f"  Warning: No normalization stats loaded")
+            
     except Exception as e:
         print(f"✗ Failed to create dataset: {e}")
         import traceback
@@ -180,36 +792,39 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
         print("✗ Dataset is empty (no valid samples)")
         return False
     
-    # Test loading a few samples
+    # Test loading samples
     print(f"\nTesting sample loading...")
     num_samples_to_test = min(5, len(dataset))
+    coord_dim = 3 if track_type == '3d' else 2
     
     for i in range(num_samples_to_test):
         try:
-            imgs, tracks = dataset[i]
+            sample = dataset[i]
             
             print(f"\nSample {i}:")
-            print(f"  Images shape: {imgs.shape}")
-            print(f"  Tracks shape: {tracks.shape}")
-            print(f"  Images dtype: {imgs.dtype}, range: [{imgs.min():.2f}, {imgs.max():.2f}]")
-            print(f"  Tracks dtype: {tracks.dtype}, range: [{tracks.min():.4f}, {tracks.max():.4f}]")
+            print(f"  imgs: {sample['imgs'].shape}, dtype={sample['imgs'].dtype}")
+            print(f"  query_coords: {sample['query_coords'].shape}")
+            print(f"  displacements: {sample['displacements'].shape}")
+            
+            if sample['poses'] is not None:
+                print(f"  poses: {sample['poses'].shape}")
+            if sample['depth'] is not None:
+                print(f"  depth: {sample['depth'].shape}")
             
             # Validate shapes
-            assert imgs.shape == (frame_stack, 3, img_size, img_size), \
-                f"Expected images shape ({frame_stack}, 3, {img_size}, {img_size}), got {imgs.shape}"
-            assert tracks.shape[0] == num_track_ts, \
-                f"Expected tracks timesteps {num_track_ts}, got {tracks.shape[0]}"
-            assert tracks.shape[1] <= num_track_ids, \
-                f"Expected tracks to have at most {num_track_ids} points, got {tracks.shape[1]}"
-            assert tracks.shape[2] == 2, \
-                f"Expected tracks to have 2 coordinates, got {tracks.shape[2]}"
+            assert sample['imgs'].shape == (frame_stack, 3, img_size, img_size), \
+                f"Expected imgs shape ({frame_stack}, 3, {img_size}, {img_size})"
+            assert sample['query_coords'].shape[1] == coord_dim, \
+                f"Expected query_coords dim {coord_dim}, got {sample['query_coords'].shape[1]}"
+            assert sample['displacements'].shape[0] == num_track_ts, \
+                f"Expected {num_track_ts} timesteps"
+            assert sample['displacements'].shape[2] == coord_dim, \
+                f"Expected displacement dim {coord_dim}"
             
-            # Validate ranges
-            # Images are ImageNet normalized, so range is roughly [-2, 2]
-            assert -5 <= imgs.min() <= 5 and -5 <= imgs.max() <= 5, \
-                f"Images should be normalized (roughly [-2, 2]), got [{imgs.min()}, {imgs.max()}]"
-            assert 0 <= tracks.min() <= 1 and 0 <= tracks.max() <= 1, \
-                f"Tracks should be normalized to [0, 1], got [{tracks.min()}, {tracks.max()}]"
+            if track_type == '3d':
+                assert sample['poses'] is not None, "3D mode should have poses"
+                assert sample['poses'].shape == (num_track_ts, 9), \
+                    f"Expected poses shape ({num_track_ts}, 9)"
             
             print(f"  ✓ Sample {i} validated")
             
@@ -222,23 +837,15 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
     # Test dataloader with batching
     print(f"\nTesting dataloader with batching...")
     try:
-        dataloader = get_dataloader(
-            dataset,
-            mode="train",
-            num_workers=0,  # Use 0 for testing to avoid multiprocessing issues
-            batch_size=2
-        )
-        
+        dataloader = get_dataloader(dataset, mode="train", num_workers=0, batch_size=2)
         batch = next(iter(dataloader))
-        imgs_batch, tracks_batch = batch
         
-        print(f"  Batch images shape: {imgs_batch.shape}")
-        print(f"  Batch tracks shape: {tracks_batch.shape}")
+        print(f"  Batch keys: {batch.keys()}")
+        print(f"  imgs: {batch['imgs'].shape}")
+        print(f"  query_coords: {batch['query_coords'].shape}")
+        print(f"  displacements: {batch['displacements'].shape}")
         
-        assert imgs_batch.shape[0] == 2, f"Expected batch size 2, got {imgs_batch.shape[0]}"
-        assert imgs_batch.shape[1:] == (frame_stack, 3, img_size, img_size), \
-            f"Expected batch shape (2, {frame_stack}, 3, {img_size}, {img_size}), got {imgs_batch.shape}"
-        
+        assert batch['imgs'].shape[0] == 2, "Expected batch size 2"
         print(f"  ✓ Dataloader batching works correctly")
         
     except Exception as e:
@@ -247,37 +854,60 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
         traceback.print_exc()
         return False
     
-    # Visualize random samples if requested
+    # Visualization
     if visualize:
         print(f"\nCreating visualizations...")
-        if test_augmentations:
-            print(f"  NOTE: Augmentations are ENABLED - you'll see augmented samples")
-        vis_output_dir = Path(vis_dir)
+        vis_dir = PROJECT_ROOT / "misc" / "test_visualizations"
         
-        # Delete previous visualizations
-        if vis_output_dir.exists():
-            import shutil
-            print(f"  Deleting previous visualizations in {vis_output_dir}...")
-            shutil.rmtree(vis_output_dir)
+        if vis_dir.exists():
+            print(f"  Deleting previous visualizations...")
+            shutil.rmtree(vis_dir)
+        vis_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create fresh output directory
-        vis_output_dir.mkdir(parents=True, exist_ok=True)
+        # Try to load intrinsics for 3D visualization
+        intrinsics = None
+        if track_type == '3d':
+            h5_files = list(Path(dataset_dir).glob("*.hdf5"))
+            if h5_files:
+                intrinsics = load_intrinsics_from_h5(h5_files[0])
+                if intrinsics is not None:
+                    print(f"  Loaded intrinsics from {h5_files[0].name}")
         
-        # Select random samples to visualize
-        num_to_vis = min(num_vis_samples, len(dataset))
+        # Select random samples
+        num_to_vis = min(num_samples, len(dataset))
         sample_indices = random.sample(range(len(dataset)), num_to_vis)
         
+        visualized_samples = []
         for i, idx in enumerate(sample_indices):
             try:
-                imgs, tracks = dataset[idx]
-                output_path = visualize_sample(imgs, tracks, idx, vis_output_dir, img_size, vis_scale=vis_scale)
-                print(f"  ✓ Saved visualization {i+1}/{num_to_vis}: {output_path}")
+                sample = dataset[idx]
+                
+                # 2D visualization (pass norm_stats for denormalization)
+                path_2d = visualize_sample_2d(sample, idx, vis_dir, img_size, 
+                                               norm_stats=dataset.norm_stats, vis_scale=2)
+                print(f"  ✓ Sample {idx}: 2D saved to {path_2d.name}")
+                
+                # 3D visualization (if 3D mode and intrinsics available)
+                if track_type == '3d' and intrinsics is not None:
+                    path_3d = visualize_sample_3d(sample, idx, vis_dir, intrinsics, img_size,
+                                                   norm_stats=dataset.norm_stats)
+                    print(f"           3D saved to {path_3d.name}")
+                
+                visualized_samples.append(idx)
+                    
             except Exception as e:
                 print(f"  ✗ Failed to visualize sample {idx}: {e}")
                 import traceback
                 traceback.print_exc()
         
-        print(f"\n  Visualizations saved to: {vis_output_dir}")
+        # Create index.html for easy navigation
+        create_vis_index_html(vis_dir, visualized_samples, track_type)
+        
+        print(f"\n  Visualizations saved to: {vis_dir}")
+        print(f"\n  To view visualizations:")
+        print(f"    cd {vis_dir}")
+        print(f"    python -m http.server 8001")
+        print(f"    Then open: http://localhost:8001")
     
     print(f"\n{'='*70}")
     print("✅ ALL TESTS PASSED!")
@@ -286,78 +916,68 @@ def test_dataloader(h5_dir, img_size=128, frame_stack=1, num_track_ts=16, num_tr
     return True
 
 
-if __name__ == "__main__":
-    import argparse
-    import yaml
+def serve_visualizations():
+    """Start a simple HTTP server to view visualizations."""
+    import http.server
+    import socketserver
     
-    # Load defaults from train_cfg.yaml
-    train_cfg_path = Path(__file__).parent.parent / "train_cfg.yaml"
-    if train_cfg_path.exists():
-        with open(train_cfg_path, 'r') as f:
-            train_cfg = yaml.safe_load(f)
-        default_h5_dir = train_cfg.get('dataset_dir', '/home/harsh/sam/data/h5_dataset')
-        dataset_cfg = train_cfg.get('dataset_cfg', {})
-        default_img_size = dataset_cfg.get('img_size', 128)
-        default_frame_stack = dataset_cfg.get('frame_stack', 1)
-        default_num_track_ts = dataset_cfg.get('num_track_ts', 16)
-        default_num_track_ids = dataset_cfg.get('num_track_ids', 32)
-        default_downsample_factor = dataset_cfg.get('downsample_factor', 1)
-        default_aug_prob = train_cfg.get('training', {}).get('aug_prob', 0.9)
-        
-        # Extract augmentation config (compact format)
-        aug_config = {
-            'aug_color_jitter': dataset_cfg.get('aug_color_jitter'),
-            'aug_translation_px': dataset_cfg.get('aug_translation_px', 0),
-            'aug_rotation_deg': dataset_cfg.get('aug_rotation_deg', 0),
-            'aug_hflip_prob': dataset_cfg.get('aug_hflip_prob', 0.0),
-            'aug_vflip_prob': dataset_cfg.get('aug_vflip_prob', 0.0),
-            'aug_noise_std': dataset_cfg.get('aug_noise_std', 0.0)
-        }
-    else:
-        raise ValueError(f"train_cfg.yaml not found at {train_cfg_path}")
+    vis_dir = PROJECT_ROOT / "misc" / "test_visualizations"
+    
+    if not vis_dir.exists() or not (vis_dir / "index.html").exists():
+        print(f"Error: No visualizations found in {vis_dir}")
+        print("Run with --visualize first to generate visualizations")
+        return
+    
+    os.chdir(vis_dir)
+    PORT = 8001
+    
+    Handler = http.server.SimpleHTTPRequestHandler
+    
+    print(f"\n{'='*60}")
+    print("SERVING DATALOADER TEST VISUALIZATIONS")
+    print(f"{'='*60}")
+    print(f"Directory: {vis_dir}")
+    print(f"URL: http://localhost:{PORT}")
+    print(f"Press Ctrl+C to stop")
+    print(f"{'='*60}\n")
+    
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped")
+
+
+def main():
+    import argparse
     
     parser = argparse.ArgumentParser(description="Test HDF5 dataset with dataloader")
-    parser.add_argument("--h5_dir", type=str, default=default_h5_dir,
-                        help=f"Directory containing .hdf5 files (default: from train_cfg.yaml)")
-    parser.add_argument("--img_size", type=int, default=default_img_size,
-                        help=f"Image size (default: {default_img_size} from train_cfg.yaml)")
-    parser.add_argument("--frame_stack", type=int, default=default_frame_stack,
-                        help=f"Number of frames to stack (default: {default_frame_stack} from train_cfg.yaml)")
-    parser.add_argument("--num_track_ts", type=int, default=default_num_track_ts,
-                        help=f"Number of future track timesteps (default: {default_num_track_ts} from train_cfg.yaml)")
-    parser.add_argument("--num_track_ids", type=int, default=default_num_track_ids,
-                        help=f"Minimum number of tracks per frame (default: {default_num_track_ids} from train_cfg.yaml)")
-    parser.add_argument("--downsample_factor", type=int, default=default_downsample_factor,
-                        help=f"Temporal downsampling factor (default: {default_downsample_factor} from train_cfg.yaml)")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Create visualizations of samples")
-    parser.add_argument("--vis_dir", type=str, default="test_visualizations",
-                        help="Directory to save visualizations")
-    parser.add_argument("--num_vis_samples", type=int, default=20,
-                        help="Number of samples to visualize")
-    parser.add_argument("--vis_scale", type=int, default=2,
-                        help="Upscaling factor for visualization (e.g., 4 = 512x512 from 128x128)")
-    parser.add_argument("--test_augmentations", action="store_true",
-                        help="Enable data augmentations for testing (see augmented samples)")
-    parser.add_argument("--aug_prob", type=float, default=default_aug_prob,
-                        help=f"Augmentation probability when test_augmentations is enabled (default: {default_aug_prob} from train_cfg.yaml)")
+    parser.add_argument("--visualize", action="store_true", help="Create visualizations")
+    parser.add_argument("--serve", action="store_true", help="Start HTTP server to view visualizations")
+    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
+    parser.add_argument("--test_augmentations", action="store_true", help="Enable augmentations for testing")
+    parser.add_argument("--aug_prob", type=float, default=0.0, help="Augmentation probability")
     
     args = parser.parse_args()
     
+    # If --serve, just start the server
+    if args.serve:
+        serve_visualizations()
+        return
+    
+    # Load config from dataset_config.yaml
+    config = load_config()
+    
     success = test_dataloader(
-        h5_dir=args.h5_dir,
-        img_size=args.img_size,
-        frame_stack=args.frame_stack,
-        num_track_ts=args.num_track_ts,
-        num_track_ids=args.num_track_ids,
-        downsample_factor=args.downsample_factor,
+        config=config,
         visualize=args.visualize,
-        vis_dir=args.vis_dir,
-        num_vis_samples=args.num_vis_samples,
-        vis_scale=args.vis_scale,
+        num_samples=args.num_samples,
         test_augmentations=args.test_augmentations,
         aug_prob=args.aug_prob,
-        aug_config=aug_config
     )
     
     sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()

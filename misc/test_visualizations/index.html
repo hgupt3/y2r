@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Dataloader Test Visualizations</title>
+    <style>
+        body { 
+            margin: 0; padding: 20px; 
+            font-family: system-ui, -apple-system, sans-serif; 
+            background: #1a1a2e; color: #eee; 
+        }
+        h1 { color: #a78bfa; margin-bottom: 10px; }
+        .info { color: #888; margin-bottom: 20px; }
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); 
+            gap: 16px; 
+        }
+        .card { 
+            background: #16213e; 
+            border-radius: 12px; 
+            padding: 16px; 
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover { 
+            transform: translateY(-4px); 
+            box-shadow: 0 8px 24px rgba(167, 139, 250, 0.2);
+        }
+        .card h3 { margin: 0 0 12px 0; color: #a78bfa; }
+        .card a { 
+            display: inline-block;
+            padding: 8px 16px; 
+            margin: 4px 4px 4px 0;
+            background: #0f3460; 
+            color: #eee; 
+            text-decoration: none; 
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .card a:hover { background: #1a4b8c; }
+        .card a.vis-3d { background: #4a1d6e; }
+        .card a.vis-3d:hover { background: #6b2d9e; }
+        .card img { 
+            width: 100%; 
+            border-radius: 8px; 
+            margin-bottom: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Dataloader Test Visualizations</h1>
+    <p class="info">Track type: 3D | Samples: 1</p>
+    <div class="grid">
+        <div class="card">
+            <h3>Sample 188</h3>
+            <img src="sample_188_2d.png" alt="2D visualization">
+            <div>
+                <a href="sample_188_2d.png" target="_blank">2D Image</a>
+                <a href="sample_188_3d.html" target="_blank" class="vis-3d">3D Viewer</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
