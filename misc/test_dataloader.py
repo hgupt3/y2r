@@ -9,7 +9,6 @@ Usage:
     python test_dataloader.py --visualize --num_samples 10
 """
 import sys
-import os
 from pathlib import Path
 import torch
 import numpy as np
@@ -105,6 +104,54 @@ def reconstruct_tracks(query_coords, displacements):
     T, N, coord_dim = displacements.shape
     tracks = query_coords.unsqueeze(0).expand(T, -1, -1) + displacements
     return tracks
+
+
+def pose_9d_to_4x4(pose_9d):
+    """
+    Convert 9D pose (6D rotation + 3D translation) back to 4x4 matrix.
+    
+    Args:
+        pose_9d: (9,) array - first 6 are rotation (first 2 columns of R), last 3 are translation
+    
+    Returns:
+        (4, 4) transformation matrix
+    """
+    # Extract rotation columns and translation
+    r1 = pose_9d[:3]  # First column of R
+    r2 = pose_9d[3:6]  # Second column of R
+    t = pose_9d[6:9]   # Translation
+    
+    # Reconstruct rotation matrix using Gram-Schmidt
+    r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+    r2 = r2 - np.dot(r1, r2) * r1
+    r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+    r3 = np.cross(r1, r2)
+    
+    # Build 4x4 matrix
+    pose_4x4 = np.eye(4, dtype=np.float32)
+    pose_4x4[:3, 0] = r1
+    pose_4x4[:3, 1] = r2
+    pose_4x4[:3, 2] = r3
+    pose_4x4[:3, 3] = t
+    
+    return pose_4x4
+
+
+def poses_9d_to_4x4(poses_9d):
+    """
+    Convert batch of 9D poses to 4x4 matrices.
+    
+    Args:
+        poses_9d: (T, 9) array
+    
+    Returns:
+        (T, 4, 4) transformation matrices
+    """
+    T = poses_9d.shape[0]
+    poses_4x4 = np.zeros((T, 4, 4), dtype=np.float32)
+    for t in range(T):
+        poses_4x4[t] = pose_9d_to_4x4(poses_9d[t])
+    return poses_4x4
 
 
 def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=None, vis_scale=2):
@@ -244,27 +291,74 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
     frame = (frame * std + mean).clamp(0, 1)
     frame_np = (frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     
-    # Get depth frame if available (use last frame corresponding to imgs[-1])
+    # Get depth frame if available (use first frame corresponding to query/observation time)
     depth_frame = None
     if sample['depth'] is not None:
-        # sample['depth'] is (T_all_frames, H, W) - use last frame
+        # sample['depth'] is (num_track_ts, H, W) - use first frame (observation time)
         # Depth is normalized by dataloader, so denormalize it
-        depth_tensor = sample['depth'][-1]
+        depth_tensor = sample['depth'][0]
         if norm_stats is not None:
             depth_frame = norm_stats.denormalize_depth(depth_tensor.numpy())
         else:
             depth_frame = depth_tensor.numpy()
     
+    # Get camera poses if available
+    camera_poses = None
+    if sample['poses'] is not None:
+        poses_9d = sample['poses'].clone()  # (T, 9)
+        # Denormalize poses
+        if norm_stats is not None:
+            poses_9d = torch.from_numpy(
+                norm_stats.denormalize_pose(poses_9d.numpy()).astype(np.float32)
+            )
+        # Convert 9D to 4x4 matrices
+        camera_poses = poses_9d_to_4x4(poses_9d.numpy())  # (T, 4, 4)
+    
     # Create visualization using TAPIP3D format
     create_3d_viz_data(
         points_3d, frame_np, intrinsics, img_size,
-        output_dir, sample_idx, depth_frame=depth_frame
+        output_dir, sample_idx, depth_frame=depth_frame, camera_poses=camera_poses
     )
     
     return output_dir / f"sample_{sample_idx:03d}_3d.html"
 
 
-def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None):
+def add_navigation_to_3d_html(output_dir, all_sample_indices):
+    """Add navigation links to all 3D HTML files after they're created."""
+    sorted_indices = sorted(all_sample_indices)
+    
+    for i, sample_idx in enumerate(sorted_indices):
+        html_path = output_dir / f"sample_{sample_idx:03d}_3d.html"
+        if not html_path.exists():
+            continue
+        
+        with open(html_path, 'r') as f:
+            html = f.read()
+        
+        # Build prev/next links
+        prev_idx = sorted_indices[i - 1] if i > 0 else None
+        next_idx = sorted_indices[i + 1] if i < len(sorted_indices) - 1 else None
+        
+        prev_link = f"<a href='sample_{prev_idx:03d}_3d.html' style='color:#a78bfa;'>← Prev</a>" if prev_idx is not None else "<span style='color:#666;'>← Prev</span>"
+        next_link = f"<a href='sample_{next_idx:03d}_3d.html' style='color:#a78bfa;'>Next →</a>" if next_idx is not None else "<span style='color:#666;'>Next →</span>"
+        
+        nav_html = f'''<div style="position:fixed;top:10px;right:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;display:flex;gap:10px;font-family:system-ui;color:#eee;">
+<a href="index.html" style="color:#a78bfa;">Index</a>
+<span>|</span>
+{prev_link}
+<span style="font-weight:600;">Sample {sample_idx}</span>
+<span style="color:#888;">({i+1}/{len(sorted_indices)})</span>
+{next_link}
+</div>'''
+        
+        # Insert navigation after body tag (will appear alongside existing info overlay)
+        html = html.replace('<body>', '<body>' + nav_html)
+        
+        with open(html_path, 'w') as f:
+            f.write(html)
+
+
+def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None, camera_poses=None):
     """
     Create visualization data using the same format as process_tapip3d.py.
     
@@ -276,6 +370,7 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         output_dir: Output directory
         sample_idx: Sample index
         depth_frame: (H, W) optional depth frame in meters
+        camera_poses: (T, 4, 4) optional camera poses for each timestep
     """
     T, N, _ = points_3d.shape
     H, W = frame_rgb.shape[:2]
@@ -342,6 +437,20 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         "cameraZ": np.float64(0.0),
     }
     
+    # Add camera poses if available
+    has_camera_poses = camera_poses is not None
+    if has_camera_poses:
+        # camera_poses: (T, 4, 4) -> extract positions and forward directions
+        # Position is the translation (4th column)
+        # Forward direction is the negative Z axis of the camera
+        camera_positions = camera_poses[:, :3, 3].astype(np.float32)  # (T, 3)
+        camera_forwards = -camera_poses[:, :3, 2].astype(np.float32)  # (T, 3) - negative Z is forward
+        camera_ups = camera_poses[:, :3, 1].astype(np.float32)  # (T, 3) - Y is up
+        
+        arrays["camera_positions"] = camera_positions
+        arrays["camera_forwards"] = camera_forwards
+        arrays["camera_ups"] = camera_ups
+    
     header = {}
     blob_parts = []
     offset = 0
@@ -366,6 +475,8 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         "windowLength": T,
         "stride": 1,
         "windowedMode": True,
+        "hasCameraPoses": has_camera_poses,
+        "numCameraPoses": T if has_camera_poses else 0,
     }
     
     # Write binary data file
@@ -600,11 +711,107 @@ def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
     # Point to the sample's data.bin file
     html = html.replace('data.bin', f'sample_{sample_idx:03d}_data.bin')
     
-    # Add info overlay
-    info_html = f'''<div style="position:fixed;top:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:10px;border-radius:8px;font-family:system-ui;color:#eee;">
-        <b>Sample {sample_idx}</b><br>
-        Points: {num_points} | Timesteps: {num_timesteps}
-    </div>'''
+    # Add camera path visualization JavaScript
+    camera_viz_js = '''
+    // Camera path visualization
+    setupCameraPath() {
+      if (!this.data.camera_positions || !this.config.hasCameraPoses) return;
+      
+      const positions = this.data.camera_positions.data;
+      const forwards = this.data.camera_forwards.data;
+      const ups = this.data.camera_ups.data;
+      const numPoses = this.config.numCameraPoses;
+      
+      // Create camera path line
+      const pathPositions = [];
+      for (let i = 0; i < numPoses; i++) {
+        const x = positions[i * 3];
+        const y = -positions[i * 3 + 1];  // Flip Y
+        const z = -positions[i * 3 + 2];  // Flip Z
+        pathPositions.push(x, y, z);
+      }
+      
+      const pathGeometry = new LineGeometry();
+      pathGeometry.setPositions(pathPositions);
+      const pathMaterial = new LineMaterial({
+        color: 0x00ffff,
+        linewidth: 3,
+        resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+      });
+      const cameraPath = new Line2(pathGeometry, pathMaterial);
+      this.scene.add(cameraPath);
+      
+      // Create small camera frustums at each position
+      const frustumSize = 0.02;  // Small frustums
+      const frustumGroup = new THREE.Group();
+      
+      for (let i = 0; i < numPoses; i++) {
+        const x = positions[i * 3];
+        const y = -positions[i * 3 + 1];
+        const z = -positions[i * 3 + 2];
+        
+        const fx = forwards[i * 3];
+        const fy = -forwards[i * 3 + 1];
+        const fz = -forwards[i * 3 + 2];
+        
+        const ux = ups[i * 3];
+        const uy = -ups[i * 3 + 1];
+        const uz = -ups[i * 3 + 2];
+        
+        // Create frustum as a small pyramid
+        const frustumGeometry = new THREE.ConeGeometry(frustumSize * 0.6, frustumSize, 4);
+        
+        // Color gradient: cyan at start, magenta at end
+        const t = i / Math.max(1, numPoses - 1);
+        const color = new THREE.Color().setHSL(0.5 - t * 0.3, 1, 0.5);
+        
+        const frustumMaterial = new THREE.MeshBasicMaterial({
+          color: color,
+          transparent: true,
+          opacity: 0.8,
+        });
+        
+        const frustum = new THREE.Mesh(frustumGeometry, frustumMaterial);
+        frustum.position.set(x, y, z);
+        
+        // Orient frustum to point in forward direction
+        const forward = new THREE.Vector3(fx, fy, fz).normalize();
+        const up = new THREE.Vector3(ux, uy, uz).normalize();
+        
+        // Create rotation matrix from forward and up vectors
+        const right = new THREE.Vector3().crossVectors(up, forward).normalize();
+        const correctedUp = new THREE.Vector3().crossVectors(forward, right).normalize();
+        
+        const rotMatrix = new THREE.Matrix4();
+        rotMatrix.makeBasis(right, correctedUp, forward);
+        frustum.rotation.setFromRotationMatrix(rotMatrix);
+        frustum.rotateX(Math.PI / 2);  // Cone points along Y by default, rotate to Z
+        
+        frustumGroup.add(frustum);
+      }
+      
+      this.scene.add(frustumGroup);
+      this.cameraPath = cameraPath;
+      this.cameraFrustums = frustumGroup;
+    }
+'''
+    
+    # Insert camera path setup call after trajectory setup
+    html = html.replace(
+        'this.setupTrajectories();',
+        'this.setupTrajectories();\n      this.setupCameraPath();'
+    )
+    
+    # Insert the camera path function before the closing of the class
+    html = html.replace(
+        'updateTrajectories(frameIndex) {',
+        camera_viz_js + '\n    updateTrajectories(frameIndex) {'
+    )
+    
+    # Add info overlay (bottom-left, navigation will be added top-right later)
+    info_html = f'''<div style="position:fixed;bottom:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;font-family:system-ui;color:#eee;font-size:12px;">
+Points: {num_points} | Timesteps: {num_timesteps}
+</div>'''
     html = html.replace('<body>', '<body>' + info_html)
     
     # Write HTML file
@@ -903,10 +1110,13 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         # Create index.html for easy navigation
         create_vis_index_html(vis_dir, visualized_samples, track_type)
         
+        # Add navigation to 3D HTML files
+        if track_type == '3d' and visualized_samples:
+            add_navigation_to_3d_html(vis_dir, visualized_samples)
+        
         print(f"\n  Visualizations saved to: {vis_dir}")
         print(f"\n  To view visualizations:")
-        print(f"    cd {vis_dir}")
-        print(f"    python -m http.server 8001")
+        print(f"    python misc/serve_test_vis.py")
         print(f"    Then open: http://localhost:8001")
     
     print(f"\n{'='*70}")
@@ -916,54 +1126,16 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     return True
 
 
-def serve_visualizations():
-    """Start a simple HTTP server to view visualizations."""
-    import http.server
-    import socketserver
-    
-    vis_dir = PROJECT_ROOT / "misc" / "test_visualizations"
-    
-    if not vis_dir.exists() or not (vis_dir / "index.html").exists():
-        print(f"Error: No visualizations found in {vis_dir}")
-        print("Run with --visualize first to generate visualizations")
-        return
-    
-    os.chdir(vis_dir)
-    PORT = 8001
-    
-    Handler = http.server.SimpleHTTPRequestHandler
-    
-    print(f"\n{'='*60}")
-    print("SERVING DATALOADER TEST VISUALIZATIONS")
-    print(f"{'='*60}")
-    print(f"Directory: {vis_dir}")
-    print(f"URL: http://localhost:{PORT}")
-    print(f"Press Ctrl+C to stop")
-    print(f"{'='*60}\n")
-    
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nServer stopped")
-
-
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Test HDF5 dataset with dataloader")
     parser.add_argument("--visualize", action="store_true", help="Create visualizations")
-    parser.add_argument("--serve", action="store_true", help="Start HTTP server to view visualizations")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
     parser.add_argument("--test_augmentations", action="store_true", help="Enable augmentations for testing")
-    parser.add_argument("--aug_prob", type=float, default=0.0, help="Augmentation probability")
+    parser.add_argument("--aug_prob", type=float, default=0.5, help="Augmentation probability")
     
     args = parser.parse_args()
-    
-    # If --serve, just start the server
-    if args.serve:
-        serve_visualizations()
-        return
     
     # Load config from dataset_config.yaml
     config = load_config()

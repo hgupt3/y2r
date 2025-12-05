@@ -13,8 +13,9 @@ common:
   clean_frames_dir: &clean_frames_dir "/home/harsh/sam/data/clean_frames"  # Output: diffueraser -> Input: gsam, cotracker
   masks_dir: &masks_dir "/home/harsh/sam/data/masks"  # Output: gsam -> Input: cotracker
   tracks_dir: &tracks_dir "/home/harsh/sam/data/tracks"  # Output: cotracker
-  tracks_3d_dir: &tracks_3d_dir "/home/harsh/sam/data/tracks_3d"  # Output: spatracker
-  vipe_dir: &vipe_dir "/home/harsh/sam/data/vipe"
+  tracks_3d_dir: &tracks_3d_dir "/home/harsh/sam/data/tracks_3d"  # Output: tapip3d
+  vipe_dir: &vipe_dir "/home/harsh/sam/data/vipe" # Output: vipe depth maps
+  save_h5_dir: &save_h5_dir "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
 
   # Visualization paths
   human_vis_dir: &human_vis_dir "/home/harsh/sam/data/human_vis"
@@ -22,13 +23,14 @@ common:
   cotracker_vis_dir: &cotracker_vis_dir "/home/harsh/sam/data/cotracker_vis"
   spatracker_vis_dir: &spatracker_vis_dir "/home/harsh/sam/data/spatracker_vis"
   vipe_vis_dir: &vipe_vis_dir "/home/harsh/sam/data/vipe_vis"
+  tapip3d_vis_dir: &tapip3d_vis_dir "/home/harsh/sam/data/tapip3d_vis"
   
   # Common parameters
   detection_model: &detection_model "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
-  device: &device "cuda:1"  # CUDA device to use across all stages
+  device: &device "cuda:0"  # CUDA device to use across all stages
   target_fps: &target_fps 12  # FPS for both extraction and visualization
   window_length: &window_length 16  # Number of frames per sliding window
-  num_videos_to_process: &num_videos_to_process 1  # Number of videos to process (null = all)
+  num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
   continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: &vis_flag true  # Enable/disable visualization videos
   
@@ -87,7 +89,7 @@ gsam:
 cotracker:
   window_length: *window_length  # Number of frames per sliding window
   stride: 1  # Step size between window starts
-  grid_size: 100  # Grid density for point tracking
+  grid_size: 64  # Grid density for point tracking
   visibility_threshold: 0.95  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   mask_erosion_pixels: 2  # Number of pixels to erode object mask (shrink) to avoid unreliable edge points
   subtract_human_masks: false  # Whether to subtract human masks from object masks (set to false to disable)
@@ -104,21 +106,51 @@ cotracker:
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 vipe:
-  pipeline: "default"  # ViPE pipeline config: "default", "no_vda" (faster/less memory), "wide_angle"
+  pipeline: "lyra"  # ViPE pipeline config: "default", "no_vda" (faster/less memory), "wide_angle", "lyra"
+  # FOV options (vertical FOV in degrees):
+  #   - fixed_fov_degrees: Bypass GeoCalib entirely with a fixed value (e.g., 60)
+  #   - fov_min/max_degrees: Let GeoCalib estimate, but clamp to this range (e.g., 40-90)
+  fixed_fov_degrees: null
+  fov_min_degrees: 40
+  fov_max_degrees: 90
+  optimize_intrinsics: true  # SLAM can refine intrinsics, but stays within FOV bounds above
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
-  output_dir: *vipe_dir  # Where to save ViPE .pt outputs (depth, pose, intrinsics)
-  device: *device  # CUDA device to use (e.g., "cuda:1")
+  output_dir: *vipe_dir  # Where to save TAPIP3D-ready .npz files (video, depths, intrinsics, extrinsics)
+  device: *device  # CUDA device to use (e.g., "cuda:0")
   num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
   vis_flag: *vis_flag  # Enable ViPE visualization videos
   vis_path: *vipe_vis_dir  # Where to save ViPE visualization videos
   continue: *continue  # Whether to continue from previous run
 
+tapip3d:
+  window_length: *window_length  # Number of frames per sliding window
+  stride: 1  # Step size between window starts
+  grid_size: 100  # Grid density for query points (NxN grid). Set to 0 to use mask only
+  use_masks: true  # Whether to use masks for query points (if true, points sampled from mask)
+  mask_erosion_pixels: 2  # Number of pixels to erode mask (shrink) to avoid unreliable edge points
+  visibility_threshold: 0.9  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
+  resolution_factor: 1  # TAPIP3D inference resolution factor (1=base, 2=1.41x, 4=2x resolution)
+  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (.npz files with video, depths, intrinsics, extrinsics)
+  input_masks_dir: *masks_dir  # <- Optional: Input from gsam output (object masks)
+  output_tracks_dir: *tracks_3d_dir  # Where to save 3D track .pt files
+  device: *device  # CUDA device to use
+  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  continue: *continue  # Whether to continue from previous run
+  vis_flag: *vis_flag  # Enable 3D trajectory visualization
+  vis_path: *tapip3d_vis_dir  # Where to save visualization outputs
+  vis_fps: *target_fps  # FPS for visualization
+
 create_h5_dataset:
   target_size: 224  # Target resolution for images (images will be center-cropped to square then resized)
   num_track_ts: *window_length  # Number of future timesteps for tracks (should match cotracker window_length)
+  track_type: "3d"  # "2d" for CoTracker, "3d" for TAPIP3D
   input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
-  input_tracks_dir: *tracks_dir  # <- Input from cotracker output (track .pt files)
-  output_h5_dir: "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
-  num_videos_to_process: null # *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  input_tracks_dir: *tracks_dir  # <- Input from cotracker output (2D track .pt files)
+  input_tracks_3d_dir: *tracks_3d_dir  # <- Input from TAPIP3D output (3D track .pt files)
+  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (.npz files with depth maps)
+  depth_min: 0.1  # Min valid depth in meters (null = no lower clip)
+  depth_max: 2.5  # Max valid depth in meters (null = no upper clip)
+  output_h5_dir: *save_h5_dir  # Where to save HDF5 dataset files
+  num_videos_to_process: *num_videos_to_process # *num_videos_to_process  # Number of video folders to process (set to null to process all)
   continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 

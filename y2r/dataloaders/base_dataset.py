@@ -2,14 +2,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from torchvision import transforms
 from einops import rearrange
 import os
 from glob import glob
 from natsort import natsorted
 import h5py
 
-from .utils import load_rgb, ImgTrackColorJitter, ImgViewDiffTranslationAug
+from .utils import load_rgb
 
 
 class SimpleBaseDataset(Dataset):
@@ -80,12 +79,9 @@ class SimpleBaseDataset(Dataset):
         self._index_to_local_frame = {}
         
         self.load_demo_info()
-
-        # Setup augmentation
-        self.augmentor = transforms.Compose([
-            ImgTrackColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.3),
-            ImgViewDiffTranslationAug(input_shape=img_size, translation=8, augment_track=True),
-        ])
+        
+        # Augmentor should be set up by subclass with config params
+        self.augmentor = None
 
     def load_demo_info(self):
         """Load metadata for all demos and create index mappings, filtering by track availability."""
@@ -99,12 +95,10 @@ class SimpleBaseDataset(Dataset):
             # Determine valid frame indices based on track availability
             valid_frame_indices = []
             for t in range(demo_len):
-                # Load tracks for this frame
                 track_key = f"frame_{t:04d}"
                 if track_key in demo["root"]["tracks"]:
-                    tracks_t = demo["root"]["tracks"][track_key]  # (num_track_ts, N, 2)
-                    num_points = tracks_t.shape[1]
-                    # Only include if sufficient tracks exist
+                    frame_data = demo["root"]["tracks"][track_key]
+                    num_points = frame_data['query_coords'].shape[0]
                     if num_points >= self.num_track_ids:
                         valid_frame_indices.append(t)
             
@@ -113,15 +107,12 @@ class SimpleBaseDataset(Dataset):
             if self.cache_all:
                 demo = self.process_demo(demo)
                 if not self.cache_image:
-                    # Remove video from cache to save memory
                     del demo["root"]["video"]
-                # Store valid indices with demo
                 demo["_valid_frame_indices"] = valid_frame_indices
                 self._cache.append(demo)
             
             self._demo_id_to_path[demo_idx] = fn
             self._demo_id_to_valid_indices[demo_idx] = valid_frame_indices
-            # Map global indices to (demo_id, local_frame_idx) pairs
             for local_idx in valid_frame_indices:
                 self._index_to_demo_id[start_idx] = demo_idx
                 self._index_to_local_frame[start_idx] = local_idx

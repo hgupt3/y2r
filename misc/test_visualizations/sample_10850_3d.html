@@ -535,10 +535,16 @@
     }
   </style>
 </head>
-<body><div style="position:fixed;top:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:10px;border-radius:8px;font-family:system-ui;color:#eee;">
-        <b>Sample 188</b><br>
-        Points: 16 | Timesteps: 8
-    </div>
+<body><div style="position:fixed;top:10px;right:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;display:flex;gap:10px;font-family:system-ui;color:#eee;">
+<a href="index.html" style="color:#a78bfa;">Index</a>
+<span>|</span>
+<a href='sample_10655_3d.html' style='color:#a78bfa;'>← Prev</a>
+<span style="font-weight:600;">Sample 10850</span>
+<span style="color:#888;">(26/30)</span>
+<a href='sample_11501_3d.html' style='color:#a78bfa;'>Next →</a>
+</div><div style="position:fixed;bottom:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;font-family:system-ui;color:#eee;font-size:12px;">
+Points: 16 | Timesteps: 8
+</div>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -970,7 +976,7 @@
           this.ui.loadingText.textContent = "Loading binary data...";
           
           const urlParams = new URLSearchParams(window.location.search);
-          const dataPath = urlParams.get('data') || 'sample_188_data.bin'; 
+          const dataPath = urlParams.get('data') || 'sample_10850_data.bin'; 
           
           const response = await fetch(dataPath);
           if (!response.ok) throw new Error(`Failed to load ${dataPath}`);
@@ -1256,7 +1262,90 @@
         this.updateCameraFrustum(frameIndex);
       }
       
-      updateTrajectories(frameIndex) {
+      
+    // Camera path visualization
+    setupCameraPath() {
+      if (!this.data.camera_positions || !this.config.hasCameraPoses) return;
+      
+      const positions = this.data.camera_positions.data;
+      const forwards = this.data.camera_forwards.data;
+      const ups = this.data.camera_ups.data;
+      const numPoses = this.config.numCameraPoses;
+      
+      // Create camera path line
+      const pathPositions = [];
+      for (let i = 0; i < numPoses; i++) {
+        const x = positions[i * 3];
+        const y = -positions[i * 3 + 1];  // Flip Y
+        const z = -positions[i * 3 + 2];  // Flip Z
+        pathPositions.push(x, y, z);
+      }
+      
+      const pathGeometry = new LineGeometry();
+      pathGeometry.setPositions(pathPositions);
+      const pathMaterial = new LineMaterial({
+        color: 0x00ffff,
+        linewidth: 3,
+        resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+      });
+      const cameraPath = new Line2(pathGeometry, pathMaterial);
+      this.scene.add(cameraPath);
+      
+      // Create small camera frustums at each position
+      const frustumSize = 0.02;  // Small frustums
+      const frustumGroup = new THREE.Group();
+      
+      for (let i = 0; i < numPoses; i++) {
+        const x = positions[i * 3];
+        const y = -positions[i * 3 + 1];
+        const z = -positions[i * 3 + 2];
+        
+        const fx = forwards[i * 3];
+        const fy = -forwards[i * 3 + 1];
+        const fz = -forwards[i * 3 + 2];
+        
+        const ux = ups[i * 3];
+        const uy = -ups[i * 3 + 1];
+        const uz = -ups[i * 3 + 2];
+        
+        // Create frustum as a small pyramid
+        const frustumGeometry = new THREE.ConeGeometry(frustumSize * 0.6, frustumSize, 4);
+        
+        // Color gradient: cyan at start, magenta at end
+        const t = i / Math.max(1, numPoses - 1);
+        const color = new THREE.Color().setHSL(0.5 - t * 0.3, 1, 0.5);
+        
+        const frustumMaterial = new THREE.MeshBasicMaterial({
+          color: color,
+          transparent: true,
+          opacity: 0.8,
+        });
+        
+        const frustum = new THREE.Mesh(frustumGeometry, frustumMaterial);
+        frustum.position.set(x, y, z);
+        
+        // Orient frustum to point in forward direction
+        const forward = new THREE.Vector3(fx, fy, fz).normalize();
+        const up = new THREE.Vector3(ux, uy, uz).normalize();
+        
+        // Create rotation matrix from forward and up vectors
+        const right = new THREE.Vector3().crossVectors(up, forward).normalize();
+        const correctedUp = new THREE.Vector3().crossVectors(forward, right).normalize();
+        
+        const rotMatrix = new THREE.Matrix4();
+        rotMatrix.makeBasis(right, correctedUp, forward);
+        frustum.rotation.setFromRotationMatrix(rotMatrix);
+        frustum.rotateX(Math.PI / 2);  // Cone points along Y by default, rotate to Z
+        
+        frustumGroup.add(frustum);
+      }
+      
+      this.scene.add(frustumGroup);
+      this.cameraPath = cameraPath;
+      this.cameraFrustums = frustumGroup;
+    }
+
+    updateTrajectories(frameIndex) {
         if (!this.data.trajectories || this.trajectories.length === 0) return;
         
         const trajectoryData = this.data.trajectories.data;

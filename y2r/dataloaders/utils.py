@@ -5,10 +5,99 @@ import torchvision
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
+import yaml
+from pathlib import Path
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.models.obs_core import CropRandomizer
+
+
+# ==============================================================================
+# NORMALIZATION UTILITIES
+# ==============================================================================
+
+class NormalizationStats:
+    """Load and apply normalization from stats file."""
+    
+    def __init__(self, stats_path):
+        """
+        Load normalization statistics from YAML file.
+        
+        Args:
+            stats_path: Path to normalization_stats.yaml
+        """
+        with open(stats_path, 'r') as f:
+            self.stats = yaml.safe_load(f)
+        
+        # Extract stats - no defaults, must be present in stats file
+        self.imagenet_mean = np.array(self.stats['imagenet_mean'])
+        self.imagenet_std = np.array(self.stats['imagenet_std'])
+        self.track_type = self.stats['track_type']
+        self.track_dim = self.stats['track_dim']
+        
+        self.disp_mean = np.array(self.stats['displacement_mean'])
+        self.disp_std = np.array(self.stats['displacement_std'])
+        
+        # 3D-specific stats (only required for 3D)
+        if self.track_type == '3d':
+            self.depth_mean = self.stats['depth_mean']
+            self.depth_std = self.stats['depth_std']
+            self.pose_mean = np.array(self.stats['pose_mean'])
+            self.pose_std = np.array(self.stats['pose_std'])
+    
+    # Depth normalization
+    def normalize_depth(self, d):
+        """Normalize depth values."""
+        return (d - self.depth_mean) / (self.depth_std + 1e-8)
+    
+    def denormalize_depth(self, d):
+        """Denormalize depth values."""
+        return d * self.depth_std + self.depth_mean
+    
+    # Displacement normalization
+    def normalize_displacement(self, disp):
+        """Normalize displacement values."""
+        mean = self.disp_mean.astype(np.float32)
+        std = self.disp_std.astype(np.float32) + 1e-8
+        return (disp - mean) / std
+    
+    def denormalize_displacement(self, disp):
+        """Denormalize displacement values."""
+        mean = self.disp_mean.astype(np.float32)
+        std = self.disp_std.astype(np.float32)
+        return disp * std + mean
+    
+    # Pose normalization
+    def normalize_pose(self, pose):
+        """Normalize 9D pose values."""
+        mean = self.pose_mean.astype(np.float32)
+        std = self.pose_std.astype(np.float32) + 1e-8
+        return (pose - mean) / std
+    
+    def denormalize_pose(self, pose):
+        """Denormalize 9D pose values."""
+        mean = self.pose_mean.astype(np.float32)
+        std = self.pose_std.astype(np.float32)
+        return pose * std + mean
+    
+    # Torch versions for use in forward pass
+    def normalize_depth_torch(self, d):
+        """Normalize depth values (torch tensor)."""
+        return (d - self.depth_mean) / (self.depth_std + 1e-8)
+    
+    def normalize_displacement_torch(self, disp):
+        """Normalize displacement values (torch tensor)."""
+        mean = torch.tensor(self.disp_mean, dtype=disp.dtype, device=disp.device)
+        std = torch.tensor(self.disp_std, dtype=disp.dtype, device=disp.device) + 1e-8
+        return (disp - mean) / std
+    
+    def normalize_pose_torch(self, pose):
+        """Normalize 9D pose values (torch tensor)."""
+        mean = torch.tensor(self.pose_mean, dtype=pose.dtype, device=pose.device)
+        std = torch.tensor(self.pose_std, dtype=pose.dtype, device=pose.device) + 1e-8
+        return (pose - mean) / std
 
 
 def get_dataloader(replay, mode, num_workers, batch_size):
@@ -27,23 +116,35 @@ def load_rgb(file_name):
     return np.array(Image.open(file_name))
 
 
-class ImgTrackColorJitter(torchvision.transforms.ColorJitter):
+# ==============================================================================
+# AUGMENTATION CLASSES (Dict-based for unified 2D/3D format)
+# ==============================================================================
+# Input format: dict with keys:
+#   - imgs: (b, t, C, H, W)
+#   - query_coords: (b, N, 2) or (b, N, 3) - (u, v) or (u, v, d)
+#   - displacements: (b, T, N, 2) or (b, T, N, 3) - (du, dv) or (du, dv, dd)
+#   - depth: (b, T, H, W) or None
+#   - poses: (b, T, 9) or None
+
+import torchvision.transforms.functional as TF
+import math
+
+
+class DictColorJitter(torchvision.transforms.ColorJitter):
+    """Color jitter augmentation - only affects images."""
+    
     def __init__(self, brightness=0, contrast=0, saturation=0, hue=0):
         super().__init__(brightness=brightness, contrast=contrast, saturation=saturation, hue=hue)
 
-    def forward(self, inputs):
-        img, tracks = inputs
-        img = super().forward(img)
-        return img, tracks
+    def forward(self, data):
+        data = data.copy()
+        data['imgs'] = super().forward(data['imgs'])
+        return data
 
 
 class CropRandomizerReturnCoords(CropRandomizer):
     def _forward_in(self, inputs, return_crop_inds=False):
-        """
-        Samples N random crops for each input in the batch, and then reshapes
-        inputs to [B * N, ...].
-        """
-        assert len(inputs.shape) >= 3 # must have at least (C, H, W) dimensions
+        assert len(inputs.shape) >= 3
         out, crop_inds = ObsUtils.sample_random_image_crops(
             images=inputs,
             crop_height=self.crop_height,
@@ -54,237 +155,249 @@ class CropRandomizerReturnCoords(CropRandomizer):
         if return_crop_inds:
             return TensorUtils.join_dimensions(out, 0, 1), crop_inds
         else:
-            # [B, N, ...] -> [B * N, ...]
             return TensorUtils.join_dimensions(out, 0, 1)
 
 
-class ImgViewDiffTranslationAug(nn.Module):
+class DictTranslationAug(nn.Module):
     """
-    Utilize the random crop from robomimic. Take the same translation for a batch of images.
+    Translation augmentation.
+    - Shifts images spatially
+    - Shifts query_coords (u, v)
+    - Displacements unchanged (relative motion stays the same)
+    - Shifts depth spatially
+    - Poses unchanged
     """
 
-    def __init__(
-        self,
-        input_shape,
-        translation,
-        augment_track=True,
-    ):
+    def __init__(self, input_shape, translation):
         super().__init__()
-
         self.pad_translation = translation // 2
-        pad_output_shape = (
-            3,
-            input_shape[0] + translation,
-            input_shape[1] + translation,
-        )
-
+        self.input_shape = input_shape
+        pad_output_shape = (3, input_shape[0] + translation, input_shape[1] + translation)
         self.crop_randomizer = CropRandomizerReturnCoords(
             input_shape=pad_output_shape,
             crop_height=input_shape[0],
             crop_width=input_shape[1],
         )
-        self.augment_track = augment_track
 
-    def forward(self, inputs):
-        """
-        Args:
-            img: [b, t, C, H, W]
-            tracks: [b, t, track_len, n, 2]
-        """
-        img, tracks = inputs
+    def forward(self, data):
+        data = data.copy()
+        imgs = data['imgs']
+        
+        batch_size, temporal_len, img_c, img_h, img_w = imgs.shape
+        imgs_flat = imgs.reshape(batch_size, temporal_len * img_c, img_h, img_w)
+        imgs_padded = F.pad(imgs_flat, pad=(self.pad_translation,) * 4, mode="replicate")
+        imgs_cropped, crop_inds = self.crop_randomizer._forward_in(imgs_padded, return_crop_inds=True)
+        data['imgs'] = imgs_cropped.reshape(batch_size, temporal_len, img_c, img_h, img_w)
+        
+        # Compute translation in normalized coords
+        translate_h = (crop_inds[:, 0, 0] - self.pad_translation) / img_h  # (b,)
+        translate_w = (crop_inds[:, 0, 1] - self.pad_translation) / img_w
+        
+        # Shift query_coords (u, v) - only first 2 dimensions
+        if data.get('query_coords') is not None:
+            query_coords = data['query_coords'].clone()
+            query_coords[..., 0] -= translate_w.unsqueeze(-1)  # u
+            query_coords[..., 1] -= translate_h.unsqueeze(-1)  # v
+            data['query_coords'] = query_coords
+        
+        # Displacements unchanged - relative motion stays the same
+        
+        # Shift depth spatially if present
+        if data.get('depth') is not None:
+            depth = data['depth']
+            b, t, h, w = depth.shape
+            depth_flat = depth.reshape(b, t, 1, h, w).reshape(b * t, 1, h, w)
+            depth_padded = F.pad(depth_flat, pad=(self.pad_translation,) * 4, mode="replicate")
+            # Apply same crop
+            depth_cropped = []
+            for i in range(b):
+                crop_h, crop_w = crop_inds[i, 0, 0].item(), crop_inds[i, 0, 1].item()
+                depth_cropped.append(depth_padded[i*t:(i+1)*t, :, crop_h:crop_h+h, crop_w:crop_w+w])
+            data['depth'] = torch.cat(depth_cropped, dim=0).reshape(b, t, h, w)
+        
+        return data
 
-        batch_size, temporal_len, img_c, img_h, img_w = img.shape
-        img = img.reshape(batch_size, temporal_len * img_c, img_h, img_w)
-        out = F.pad(img, pad=(self.pad_translation,) * 4, mode="replicate")
-        out, crop_inds = self.crop_randomizer._forward_in(out, return_crop_inds=True)  # crop_inds: (b, num_crops, 2), where we already set num_crops=1
-        out = out.reshape(batch_size, temporal_len, img_c, img_h, img_w)
 
-        if self.augment_track:
-            translate_h = (crop_inds[:, 0, 0] - self.pad_translation) / img_h  # (b,)
-            translate_w = (crop_inds[:, 0, 1] - self.pad_translation) / img_w
-            translate_h = repeat(translate_h, "b -> b 1 1 1")  # (b, 1, 1, 1)
-            translate_w = repeat(translate_w, "b -> b 1 1 1")
-
-            # tracks[..., 0] is x (width), tracks[..., 1] is y (height)
-            # When cropping, points move in the OPPOSITE direction of crop offset
-            tracks[..., 0] -= translate_w  # x gets negative width translation
-            tracks[..., 1] -= translate_h  # y gets negative height translation
-
-        return out, tracks
-
-
-class ImgTrackRandomRotate(nn.Module):
+class DictRandomRotate(nn.Module):
     """
-    Random rotation augmentation for images and tracks.
-    Rotates image and applies corresponding 2D rotation to track coordinates.
+    Rotation augmentation.
+    - Rotates images
+    - Rotates query_coords (u, v) around center
+    - Rotates displacements (du, dv) - direction changes
+    - Rotates depth spatially
+    - Poses unchanged
     """
 
     def __init__(self, degrees=30):
-        """
-        Args:
-            degrees: rotation range will be [-degrees, +degrees]
-        """
         super().__init__()
         self.degrees = degrees
 
-    def forward(self, inputs):
-        """
-        Args:
-            img: [b, t, C, H, W]
-            tracks: [b, t, track_len, n, 2] where [..., 0] is x, [..., 1] is y
-        """
-        import torch
-        import torchvision.transforms.functional as TF
-        import math
+    def forward(self, data):
+        data = data.copy()
         
-        img, tracks = inputs
-        
-        # Sample random rotation angle (same for entire batch)
+        # Sample random angle
         angle = torch.rand(1).item() * 2 * self.degrees - self.degrees
-        
-        # Rotate image
-        batch_size, temporal_len, img_c, img_h, img_w = img.shape
-        img_flat = img.reshape(batch_size * temporal_len, img_c, img_h, img_w)
-        img_rotated = TF.rotate(img_flat, angle, interpolation=TF.InterpolationMode.BILINEAR)
-        img_rotated = img_rotated.reshape(batch_size, temporal_len, img_c, img_h, img_w)
-        
-        # Rotate tracks around center (0.5, 0.5)
-        # Note: torchvision rotate uses counter-clockwise rotation in standard coords
-        # But in image coords where y increases downward, we need to negate the angle
         angle_rad = math.radians(-angle)  # Negate for image coordinates
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         
-        # Extract coordinates (tracks stored as [x, y])
-        x_centered = tracks[..., 0] - 0.5
-        y_centered = tracks[..., 1] - 0.5
+        # Rotate images
+        imgs = data['imgs']
+        b, t, c, h, w = imgs.shape
+        imgs_flat = imgs.reshape(b * t, c, h, w)
+        imgs_rotated = TF.rotate(imgs_flat, angle, interpolation=TF.InterpolationMode.BILINEAR)
+        data['imgs'] = imgs_rotated.reshape(b, t, c, h, w)
         
-        # Apply 2D rotation matrix: [x', y'] = R * [x, y]
-        # x' = x*cos(θ) - y*sin(θ)
-        # y' = x*sin(θ) + y*cos(θ)
-        x_new = x_centered * cos_a - y_centered * sin_a + 0.5
-        y_new = x_centered * sin_a + y_centered * cos_a + 0.5
+        # Rotate query_coords (u, v) around center (0.5, 0.5)
+        if data.get('query_coords') is not None:
+            qc = data['query_coords'].clone()
+            u_centered = qc[..., 0] - 0.5
+            v_centered = qc[..., 1] - 0.5
+            qc[..., 0] = u_centered * cos_a - v_centered * sin_a + 0.5
+            qc[..., 1] = u_centered * sin_a + v_centered * cos_a + 0.5
+            data['query_coords'] = qc
         
-        tracks_rotated = tracks.clone()
-        tracks_rotated[..., 0] = x_new
-        tracks_rotated[..., 1] = y_new
+        # Rotate displacements (du, dv) - these are vectors, rotate without centering
+        if data.get('displacements') is not None:
+            disp = data['displacements'].clone()
+            du = disp[..., 0]
+            dv = disp[..., 1]
+            disp[..., 0] = du * cos_a - dv * sin_a
+            disp[..., 1] = du * sin_a + dv * cos_a
+            data['displacements'] = disp
         
-        return img_rotated, tracks_rotated
+        # Rotate depth spatially
+        if data.get('depth') is not None:
+            depth = data['depth']
+            b, t, h, w = depth.shape
+            depth_flat = depth.reshape(b * t, 1, h, w)
+            depth_rotated = TF.rotate(depth_flat, angle, interpolation=TF.InterpolationMode.NEAREST)
+            data['depth'] = depth_rotated.reshape(b, t, h, w)
+        
+        return data
 
 
-class ImgTrackRandomHorizontalFlip(nn.Module):
+class DictRandomHorizontalFlip(nn.Module):
     """
-    Random horizontal flip augmentation for images and tracks.
-    """
-
-    def __init__(self, p=0.5):
-        """
-        Args:
-            p: probability of applying the flip
-        """
-        super().__init__()
-        self.p = p
-
-    def forward(self, inputs):
-        """
-        Args:
-            img: [b, t, C, H, W]
-            tracks: [b, t, track_len, n, 2] where [..., 0] is x, [..., 1] is y
-        """
-        import torch
-        import torchvision.transforms.functional as TF
-        
-        img, tracks = inputs
-        
-        # Decide whether to flip (same for entire batch)
-        if torch.rand(1).item() < self.p:
-            # Flip image
-            batch_size, temporal_len, img_c, img_h, img_w = img.shape
-            img_flat = img.reshape(batch_size * temporal_len, img_c, img_h, img_w)
-            img_flipped = TF.hflip(img_flat)
-            img_flipped = img_flipped.reshape(batch_size, temporal_len, img_c, img_h, img_w)
-            
-            # Flip tracks horizontally (flip x-coordinate)
-            tracks_flipped = tracks.clone()
-            tracks_flipped[..., 0] = 1.0 - tracks[..., 0]
-            
-            return img_flipped, tracks_flipped
-        else:
-            return img, tracks
-
-
-class ImgTrackRandomVerticalFlip(nn.Module):
-    """
-    Random vertical flip augmentation for images and tracks.
+    Horizontal flip augmentation.
+    - Flips images horizontally
+    - Flips query_coords u: u' = 1 - u
+    - Negates displacements du: du' = -du
+    - Flips depth horizontally
+    - Poses unchanged
     """
 
     def __init__(self, p=0.5):
-        """
-        Args:
-            p: probability of applying the flip
-        """
         super().__init__()
         self.p = p
 
-    def forward(self, inputs):
-        """
-        Args:
-            img: [b, t, C, H, W]
-            tracks: [b, t, track_len, n, 2] where [..., 0] is x, [..., 1] is y
-        """
-        import torch
-        import torchvision.transforms.functional as TF
+    def forward(self, data):
+        if torch.rand(1).item() >= self.p:
+            return data
         
-        img, tracks = inputs
+        data = data.copy()
         
-        # Decide whether to flip (same for entire batch)
-        if torch.rand(1).item() < self.p:
-            # Flip image
-            batch_size, temporal_len, img_c, img_h, img_w = img.shape
-            img_flat = img.reshape(batch_size * temporal_len, img_c, img_h, img_w)
-            img_flipped = TF.vflip(img_flat)
-            img_flipped = img_flipped.reshape(batch_size, temporal_len, img_c, img_h, img_w)
-            
-            # Flip tracks vertically (flip y-coordinate)
-            tracks_flipped = tracks.clone()
-            tracks_flipped[..., 1] = 1.0 - tracks[..., 1]
-            
-            return img_flipped, tracks_flipped
-        else:
-            return img, tracks
+        # Flip images
+        imgs = data['imgs']
+        b, t, c, h, w = imgs.shape
+        imgs_flat = imgs.reshape(b * t, c, h, w)
+        data['imgs'] = TF.hflip(imgs_flat).reshape(b, t, c, h, w)
+        
+        # Flip query_coords u
+        if data.get('query_coords') is not None:
+            qc = data['query_coords'].clone()
+            qc[..., 0] = 1.0 - qc[..., 0]
+            data['query_coords'] = qc
+        
+        # Negate displacements du
+        if data.get('displacements') is not None:
+            disp = data['displacements'].clone()
+            disp[..., 0] = -disp[..., 0]
+            data['displacements'] = disp
+        
+        # Flip depth
+        if data.get('depth') is not None:
+            depth = data['depth']
+            b, t, h, w = depth.shape
+            depth_flat = depth.reshape(b * t, 1, h, w)
+            data['depth'] = TF.hflip(depth_flat).reshape(b, t, h, w)
+        
+        return data
 
 
-class ImgTrackGaussianNoise(nn.Module):
+class DictRandomVerticalFlip(nn.Module):
     """
-    Gaussian noise augmentation for images (tracks unchanged).
-    Adds random Gaussian noise to simulate camera sensor noise.
+    Vertical flip augmentation.
+    - Flips images vertically
+    - Flips query_coords v: v' = 1 - v
+    - Negates displacements dv: dv' = -dv
+    - Flips depth vertically
+    - Poses unchanged
     """
 
-    def __init__(self, std=0.02):
-        """
-        Args:
-            std: standard deviation of Gaussian noise (0 = disabled)
-        """
+    def __init__(self, p=0.5):
         super().__init__()
-        self.std = std
+        self.p = p
 
-    def forward(self, inputs):
-        """
-        Args:
-            img: [b, t, C, H, W] - normalized images in [0, 1] range
-            tracks: [b, t, track_len, n, 2]
-        """
-        import torch
+    def forward(self, data):
+        if torch.rand(1).item() >= self.p:
+            return data
         
-        img, tracks = inputs
+        data = data.copy()
         
-        # Only apply if std > 0
-        if self.std > 0:
-            # Add Gaussian noise
-            noise = torch.randn_like(img) * self.std
-            img_noisy = img + noise
-            # Clamp to valid range [0, 1] (before ImageNet normalization)
-            img_noisy = torch.clamp(img_noisy, 0, 1)
-            return img_noisy, tracks
-        else:
-            return img, tracks
+        # Flip images
+        imgs = data['imgs']
+        b, t, c, h, w = imgs.shape
+        imgs_flat = imgs.reshape(b * t, c, h, w)
+        data['imgs'] = TF.vflip(imgs_flat).reshape(b, t, c, h, w)
+        
+        # Flip query_coords v
+        if data.get('query_coords') is not None:
+            qc = data['query_coords'].clone()
+            qc[..., 1] = 1.0 - qc[..., 1]
+            data['query_coords'] = qc
+        
+        # Negate displacements dv
+        if data.get('displacements') is not None:
+            disp = data['displacements'].clone()
+            disp[..., 1] = -disp[..., 1]
+            data['displacements'] = disp
+        
+        # Flip depth
+        if data.get('depth') is not None:
+            depth = data['depth']
+            b, t, h, w = depth.shape
+            depth_flat = depth.reshape(b * t, 1, h, w)
+            data['depth'] = TF.vflip(depth_flat).reshape(b, t, h, w)
+        
+        return data
+
+
+class DictGaussianNoise(nn.Module):
+    """
+    Gaussian noise augmentation for images and depth.
+    """
+
+    def __init__(self, img_std=0.02, depth_std=0.02):
+        super().__init__()
+        self.img_std = img_std
+        self.depth_std = depth_std
+
+    def forward(self, data):
+        data = data.copy()
+        
+        # Add noise to images
+        if self.img_std > 0:
+            imgs = data['imgs']
+            noise = torch.randn_like(imgs) * self.img_std
+            data['imgs'] = torch.clamp(imgs + noise, 0, 1)
+        
+        # Add noise to depth
+        if self.depth_std > 0 and data.get('depth') is not None:
+            depth = data['depth']
+            noise = torch.randn_like(depth) * self.depth_std
+            data['depth'] = depth + noise  # Don't clamp depth
+        
+        return data
+
+
