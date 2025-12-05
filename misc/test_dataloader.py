@@ -4,9 +4,10 @@ Test script to verify HDF5 dataset works with the updated dataloader.
 Supports both 2D and 3D track formats with visualization.
 
 Usage:
-    python test_dataloader.py                    # Basic test
-    python test_dataloader.py --visualize        # Test with visualization
+    python test_dataloader.py                          # Basic test
+    python test_dataloader.py --visualize              # Test with visualization
     python test_dataloader.py --visualize --num_samples 10
+    python test_dataloader.py --visualize --test_augmentations  # Test GPU augmentations
 """
 import sys
 from pathlib import Path
@@ -28,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from y2r.dataloaders.track_dataloader import TrackDataset
 from y2r.dataloaders.utils import get_dataloader, NormalizationStats
+from y2r.dataloaders.gpu_augmentations import GPUAugmentations
 
 
 def load_config():
@@ -291,12 +293,12 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
     frame = (frame * std + mean).clamp(0, 1)
     frame_np = (frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     
-    # Get depth frame if available (use first frame corresponding to query/observation time)
+    # Get depth frame if available (use last frame - most recent observation, matching imgs[-1])
     depth_frame = None
     if sample['depth'] is not None:
-        # sample['depth'] is (num_track_ts, H, W) - use first frame (observation time)
+        # sample['depth'] is (frame_stack, H, W) - use last frame (most recent observation)
         # Depth is normalized by dataloader, so denormalize it
-        depth_tensor = sample['depth'][0]
+        depth_tensor = sample['depth'][-1]
         if norm_stats is not None:
             depth_frame = norm_stats.denormalize_depth(depth_tensor.numpy())
         else:
@@ -907,7 +909,7 @@ def load_intrinsics_from_h5(h5_path):
     return None
 
 
-def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=False, aug_prob=0.9):
+def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=False):
     """
     Test loading data from HDF5 files.
     
@@ -915,8 +917,7 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         config: Configuration dict from dataset_config.yaml
         visualize: Whether to create visualizations
         num_samples: Number of samples to visualize
-        test_augmentations: Whether to enable augmentations
-        aug_prob: Augmentation probability
+        test_augmentations: Whether to test GPU augmentations
     """
     dataset_dir = config['dataset_dir']
     img_size = config['img_size']
@@ -938,62 +939,42 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     print(f"Minimum tracks per frame: {num_track_ids}")
     
     if test_augmentations:
-        print(f"Augmentations: ENABLED (prob={aug_prob})")
+        print(f"GPU Augmentations: ENABLED (applied on GPU after loading)")
     else:
-        print(f"Augmentations: DISABLED")
+        print(f"GPU Augmentations: DISABLED")
     print(f"{'='*70}\n")
     
-    # Prepare dataset kwargs
-    dataset_kwargs = {
+    # Prepare dataset kwargs (no augmentation - augmentations are on GPU now)
+        dataset_kwargs = {
         'dataset_dir': dataset_dir,
-        'img_size': img_size,
-        'num_track_ts': num_track_ts,
-        'num_track_ids': num_track_ids,
-        'frame_stack': frame_stack,
-        'downsample_factor': downsample_factor,
+            'img_size': img_size,
+            'num_track_ts': num_track_ts,
+            'num_track_ids': num_track_ids,
+            'frame_stack': frame_stack,
+            'downsample_factor': downsample_factor,
         'track_type': track_type,
         'cache_all': config.get('cache_all', True),
         'cache_image': config.get('cache_image', True),
-        'num_demos': None,
-        'aug_prob': aug_prob if test_augmentations else 0.0,
+            'num_demos': None,
     }
-    
-    # Add augmentation config if enabled
-    if test_augmentations:
-        dataset_kwargs.update({
-            'aug_color_jitter': config.get('aug_color_jitter'),
-            'aug_translation_px': config.get('aug_translation_px', 0),
-            'aug_rotation_deg': config.get('aug_rotation_deg', 0),
-            'aug_hflip_prob': config.get('aug_hflip_prob', 0.0),
-            'aug_vflip_prob': config.get('aug_vflip_prob', 0.0),
-            'aug_noise_std': config.get('aug_noise_std', 0.0),
-            'aug_depth_noise_std': config.get('aug_depth_noise_std', 0.0),
-        })
     
     # Create dataset
     print("Creating dataset...")
-    try:
         dataset = TrackDataset(**dataset_kwargs)
         print(f"✓ Dataset created successfully")
         print(f"  Total samples: {len(dataset)}")
-        
-        # Check normalization stats
-        if dataset.norm_stats is not None:
-            print(f"  Normalization stats loaded: ✓")
-            print(f"    Track type: {dataset.norm_stats.track_type}")
-            print(f"    Displacement mean: {dataset.norm_stats.disp_mean}")
-            print(f"    Displacement std: {dataset.norm_stats.disp_std}")
-            if track_type == '3d':
-                print(f"    Depth mean: {dataset.norm_stats.depth_mean:.4f}")
-                print(f"    Depth std: {dataset.norm_stats.depth_std:.4f}")
-        else:
-            print(f"  Warning: No normalization stats loaded")
-            
-    except Exception as e:
-        print(f"✗ Failed to create dataset: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    
+    # Check normalization stats
+    if dataset.norm_stats is not None:
+        print(f"  Normalization stats loaded: ✓")
+        print(f"    Track type: {dataset.norm_stats.track_type}")
+        print(f"    Displacement mean: {dataset.norm_stats.disp_mean}")
+        print(f"    Displacement std: {dataset.norm_stats.disp_std}")
+        if track_type == '3d':
+            print(f"    Depth mean: {dataset.norm_stats.depth_mean:.4f}")
+            print(f"    Depth std: {dataset.norm_stats.depth_std:.4f}")
+    else:
+        print(f"  Warning: No normalization stats loaded")
     
     if len(dataset) == 0:
         print("✗ Dataset is empty (no valid samples)")
@@ -1005,61 +986,50 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     coord_dim = 3 if track_type == '3d' else 2
     
     for i in range(num_samples_to_test):
-        try:
-            sample = dataset[i]
+        sample = dataset[i]
             
             print(f"\nSample {i}:")
-            print(f"  imgs: {sample['imgs'].shape}, dtype={sample['imgs'].dtype}")
-            print(f"  query_coords: {sample['query_coords'].shape}")
-            print(f"  displacements: {sample['displacements'].shape}")
-            
-            if sample['poses'] is not None:
-                print(f"  poses: {sample['poses'].shape}")
-            if sample['depth'] is not None:
-                print(f"  depth: {sample['depth'].shape}")
+        print(f"  imgs: {sample['imgs'].shape}")
+        print(f"  query_coords: {sample['query_coords'].shape}")
+        print(f"  displacements: {sample['displacements'].shape}")
+        if sample['depth'] is not None:
+            print(f"  depth: {sample['depth'].shape}")
+        if sample['poses'] is not None:
+            print(f"  poses: {sample['poses'].shape}")
             
             # Validate shapes
-            assert sample['imgs'].shape == (frame_stack, 3, img_size, img_size), \
-                f"Expected imgs shape ({frame_stack}, 3, {img_size}, {img_size})"
-            assert sample['query_coords'].shape[1] == coord_dim, \
-                f"Expected query_coords dim {coord_dim}, got {sample['query_coords'].shape[1]}"
-            assert sample['displacements'].shape[0] == num_track_ts, \
-                f"Expected {num_track_ts} timesteps"
-            assert sample['displacements'].shape[2] == coord_dim, \
-                f"Expected displacement dim {coord_dim}"
-            
-            if track_type == '3d':
-                assert sample['poses'] is not None, "3D mode should have poses"
-                assert sample['poses'].shape == (num_track_ts, 9), \
-                    f"Expected poses shape ({num_track_ts}, 9)"
+        assert sample['imgs'].shape == (frame_stack, 3, img_size, img_size), \
+            f"Expected imgs shape ({frame_stack}, 3, {img_size}, {img_size})"
+        assert sample['query_coords'].shape[1] == coord_dim, \
+            f"Expected query_coords dim {coord_dim}, got {sample['query_coords'].shape[1]}"
+        assert sample['displacements'].shape[0] == num_track_ts, \
+            f"Expected {num_track_ts} timesteps"
+        assert sample['displacements'].shape[2] == coord_dim, \
+            f"Expected displacement dim {coord_dim}"
+        
+        # Validate depth shape for 3D mode
+        if track_type == '3d':
+            assert sample['depth'] is not None, "3D mode should have depth"
+            assert sample['depth'].shape == (frame_stack, img_size, img_size), \
+                f"Expected depth shape ({frame_stack}, {img_size}, {img_size}), got {sample['depth'].shape}"
+            assert sample['poses'] is not None, "3D mode should have poses"
+            assert sample['poses'].shape == (num_track_ts, 9), \
+                f"Expected poses shape ({num_track_ts}, 9)"
             
             print(f"  ✓ Sample {i} validated")
-            
-        except Exception as e:
-            print(f"  ✗ Failed to load sample {i}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
     
     # Test dataloader with batching
     print(f"\nTesting dataloader with batching...")
-    try:
-        dataloader = get_dataloader(dataset, mode="train", num_workers=0, batch_size=2)
+    dataloader = get_dataloader(dataset, mode="train", num_workers=0, batch_size=2)
         batch = next(iter(dataloader))
-        
-        print(f"  Batch keys: {batch.keys()}")
-        print(f"  imgs: {batch['imgs'].shape}")
-        print(f"  query_coords: {batch['query_coords'].shape}")
-        print(f"  displacements: {batch['displacements'].shape}")
-        
-        assert batch['imgs'].shape[0] == 2, "Expected batch size 2"
+    
+    print(f"  Batch keys: {batch.keys()}")
+    print(f"  imgs: {batch['imgs'].shape}")
+    print(f"  query_coords: {batch['query_coords'].shape}")
+    print(f"  displacements: {batch['displacements'].shape}")
+    
+    assert batch['imgs'].shape[0] == 2, "Expected batch size 2"
         print(f"  ✓ Dataloader batching works correctly")
-        
-    except Exception as e:
-        print(f"  ✗ Failed to test dataloader: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
     
     # Visualization
     if visualize:
@@ -1070,6 +1040,36 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
             print(f"  Deleting previous visualizations...")
             shutil.rmtree(vis_dir)
         vis_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create GPU augmenter if testing augmentations
+        gpu_augmenter = None
+        if test_augmentations and torch.cuda.is_available():
+            # Extract color jitter params
+            color_jitter = config.get('aug_color_jitter', {})
+            if color_jitter:
+                brightness = color_jitter.get('brightness', 0)
+                contrast = color_jitter.get('contrast', 0)
+                saturation = color_jitter.get('saturation', 0)
+                hue = color_jitter.get('hue', 0)
+            else:
+                brightness = contrast = saturation = hue = 0
+            
+            gpu_augmenter = GPUAugmentations(
+                img_size=img_size,
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                hue=hue,
+                translation_px=config.get('aug_translation_px', 0),
+                rotation_deg=config.get('aug_rotation_deg', 0),
+                hflip_prob=config.get('aug_hflip_prob', 0.0),
+                vflip_prob=config.get('aug_vflip_prob', 0.0),
+                img_noise_std=config.get('aug_noise_std', 0.0),
+                depth_noise_std=config.get('aug_depth_noise_std', 0.0),
+            ).cuda()
+            print(f"  Created GPU augmenter on CUDA")
+        elif test_augmentations:
+            print(f"  Warning: GPU augmentations requested but CUDA not available")
         
         # Try to load intrinsics for 3D visualization
         intrinsics = None
@@ -1086,26 +1086,38 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         
         visualized_samples = []
         for i, idx in enumerate(sample_indices):
-            try:
-                sample = dataset[idx]
-                
-                # 2D visualization (pass norm_stats for denormalization)
-                path_2d = visualize_sample_2d(sample, idx, vis_dir, img_size, 
-                                               norm_stats=dataset.norm_stats, vis_scale=2)
-                print(f"  ✓ Sample {idx}: 2D saved to {path_2d.name}")
-                
-                # 3D visualization (if 3D mode and intrinsics available)
-                if track_type == '3d' and intrinsics is not None:
-                    path_3d = visualize_sample_3d(sample, idx, vis_dir, intrinsics, img_size,
-                                                   norm_stats=dataset.norm_stats)
-                    print(f"           3D saved to {path_3d.name}")
-                
-                visualized_samples.append(idx)
-                    
-            except Exception as e:
-                print(f"  ✗ Failed to visualize sample {idx}: {e}")
-                import traceback
-                traceback.print_exc()
+            sample = dataset[idx]
+            
+            # Apply GPU augmentations if enabled
+            if gpu_augmenter is not None:
+                # Move to GPU, add batch dim, augment, remove batch dim
+                batch_gpu = {
+                    'imgs': sample['imgs'].unsqueeze(0).cuda(),
+                    'query_coords': sample['query_coords'].unsqueeze(0).cuda(),
+                    'displacements': sample['displacements'].unsqueeze(0).cuda(),
+                    'depth': sample['depth'].unsqueeze(0).cuda() if sample['depth'] is not None else None,
+                }
+                batch_gpu = gpu_augmenter(batch_gpu)
+                sample = {
+                    'imgs': batch_gpu['imgs'][0].cpu(),
+                    'query_coords': batch_gpu['query_coords'][0].cpu(),
+                    'displacements': batch_gpu['displacements'][0].cpu(),
+                    'depth': batch_gpu['depth'][0].cpu() if batch_gpu['depth'] is not None else None,
+                    'poses': sample['poses'],  # Poses are not augmented
+                }
+            
+            # 2D visualization (pass norm_stats for denormalization)
+            path_2d = visualize_sample_2d(sample, idx, vis_dir, img_size, 
+                                            norm_stats=dataset.norm_stats, vis_scale=2)
+            print(f"  ✓ Sample {idx}: 2D saved to {path_2d.name}")
+            
+            # 3D visualization (if 3D mode and intrinsics available)
+            if track_type == '3d' and intrinsics is not None:
+                path_3d = visualize_sample_3d(sample, idx, vis_dir, intrinsics, img_size,
+                                                norm_stats=dataset.norm_stats)
+                print(f"           3D saved to {path_3d.name}")
+            
+            visualized_samples.append(idx)
         
         # Create index.html for easy navigation
         create_vis_index_html(vis_dir, visualized_samples, track_type)
@@ -1132,8 +1144,8 @@ def main():
     parser = argparse.ArgumentParser(description="Test HDF5 dataset with dataloader")
     parser.add_argument("--visualize", action="store_true", help="Create visualizations")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
-    parser.add_argument("--test_augmentations", action="store_true", help="Enable augmentations for testing")
-    parser.add_argument("--aug_prob", type=float, default=0.5, help="Augmentation probability")
+    parser.add_argument("--aug", action="store_true", 
+                        help="Test GPU augmentations (applies augmentations on GPU)")
     
     args = parser.parse_args()
     
@@ -1144,8 +1156,7 @@ def main():
         config=config,
         visualize=args.visualize,
         num_samples=args.num_samples,
-        test_augmentations=args.test_augmentations,
-        aug_prob=args.aug_prob,
+        test_augmentations=args.aug,
     )
     
     sys.exit(0 if success else 1)

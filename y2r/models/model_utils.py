@@ -7,10 +7,44 @@
 import numpy as np
 import random
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
 EPS = 1e-6
+
+
+def extend_vit_to_rgbd(vit_model):
+    """
+    Extend DINOv2 patch embedding from RGB (3ch) to RGBD (4ch).
+    Preserves pretrained RGB weights, initializes depth channel with small random values.
+    
+    Args:
+        vit_model: DINOv2 model instance
+    
+    Returns:
+        Modified vit_model (in-place modification)
+    """
+    old_proj = vit_model.patch_embed.proj  # Conv2d(3, embed_dim, kernel_size, stride)
+    
+    new_proj = nn.Conv2d(
+        4, old_proj.out_channels,
+        kernel_size=old_proj.kernel_size,
+        stride=old_proj.stride,
+        padding=old_proj.padding,
+        bias=(old_proj.bias is not None)
+    )
+    
+    with torch.no_grad():
+        # Copy pretrained RGB weights
+        new_proj.weight[:, :3, :, :] = old_proj.weight
+        # Initialize depth channel with small random values
+        nn.init.normal_(new_proj.weight[:, 3:, :, :], std=0.02)
+        if old_proj.bias is not None:
+            new_proj.bias.copy_(old_proj.bias)
+    
+    vit_model.patch_embed.proj = new_proj
+    return vit_model
 
 
 def smart_cat(tensor1, tensor2, dim):

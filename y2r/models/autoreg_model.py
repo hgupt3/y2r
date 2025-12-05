@@ -6,6 +6,7 @@ from y2r.models.embeddings import (
     get_1d_sincos_pos_embed_from_grid,
     get_2d_sincos_pos_embed_from_grid,
 )
+from y2r.models.model_utils import extend_vit_to_rgbd
 
 
 class AutoregressiveIntentTracker(nn.Module):
@@ -29,6 +30,7 @@ class AutoregressiveIntentTracker(nn.Module):
         mlp_ratio=4.0,
         p_drop_attn=0.0,
         frame_stack=1,
+        track_type='2d',
         cache_quantized_position_encoding=False,
         from_pretrained=True,
     ):
@@ -37,6 +39,8 @@ class AutoregressiveIntentTracker(nn.Module):
         self.hidden_size = hidden_size
         self.model_resolution = model_resolution
         self.frame_stack = frame_stack
+        self.track_type = track_type
+        self.coord_dim = 3 if track_type == '3d' else 2
         self.cache_quantized_position_encoding = cache_quantized_position_encoding
 
         # ViT encoder (provides all visual context)
@@ -73,6 +77,10 @@ class AutoregressiveIntentTracker(nn.Module):
             # Create model without pretrained weights (pretrained=False)
             self.vit = model_map[vit_model_name](pretrained=False)
         
+        # Extend ViT to handle RGBD input for 3D mode
+        if track_type == '3d':
+            extend_vit_to_rgbd(self.vit)
+        
         self.vit.requires_grad_(not vit_frozen)
 
         # Token dimensions
@@ -95,26 +103,27 @@ class AutoregressiveIntentTracker(nn.Module):
             "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
         )
 
-        # Transformer that produces Δx, Δy increments
+        # Transformer that produces Δx, Δy (or Δx, Δy, Δz) increments
         self.updateformer = EfficientUpdateFormer(
             depth=time_depth,
             input_dim=hidden_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
-            output_dim=2,
+            output_dim=self.coord_dim,  # 2 for 2D, 3 for 3D
             mlp_ratio=mlp_ratio,
             add_space_attn=add_space_attn,
             p_drop_attn=p_drop_attn,
             linear_layer_for_vis_conf=False,
         )
 
-    def extract_vit_features(self, frame):
+    def extract_vit_features(self, frame, depth=None):
         """
         Extract DINOv2 patch features from frames with temporal encoding.
 
         Args:
             frame: (B, T_obs, 3, 224, 224) - RGB images where T_obs = frame_stack
                    (ImageNet normalized in dataloader)
+            depth: (B, T_obs, 1, 224, 224) - Depth maps for 3D mode, None for 2D
 
         Returns:
             scene_tokens: (B, T_obs*num_patches, feature_dim) - ViT patch embeddings
@@ -123,8 +132,12 @@ class AutoregressiveIntentTracker(nn.Module):
         B, T_obs, C, H, W = frame.shape
         assert T_obs == self.frame_stack, f"Expected {self.frame_stack} frames, got {T_obs}"
 
-        # Flatten temporal dimension: (B, T_obs, 3, H, W) -> (B*T_obs, 3, H, W)
-        frame_flat = frame.view(B * T_obs, C, H, W)
+        # Concatenate RGB + Depth for 3D mode -> RGBD
+        if self.track_type == '3d' and depth is not None:
+            frame = torch.cat([frame, depth], dim=2)  # (B, T_obs, 4, H, W)
+
+        # Flatten temporal dimension: (B, T_obs, C, H, W) -> (B*T_obs, C, H, W)
+        frame_flat = frame.view(B * T_obs, -1, H, W)
 
         # Process all frames through ViT
         vit_output = self.vit.forward_features(frame_flat)
@@ -149,16 +162,19 @@ class AutoregressiveIntentTracker(nn.Module):
         """
         Convert normalized coordinates into 2D sinusoidal embeddings.
         Args:
-            coords: (B, N, 2) - normalized [0, 1] coordinates (x, y)
+            coords: (B, N, 2) or (B, N, 3) - normalized [0, 1] coordinates (x, y) or (x, y, z)
+                    Only (x, y) are used for positional encoding
         Returns:
             (B, N, hidden_size) embeddings.
         """
-        if coords.ndim != 3 or coords.shape[-1] != 2:
-            raise ValueError(f"coords must have shape (B, N, 2), got {coords.shape}")
+        # Only use (x, y) for positional encoding
+        coords_xy = coords[..., :2]  # (B, N, 2)
+        if coords_xy.ndim != 3 or coords_xy.shape[-1] != 2:
+            raise ValueError(f"coords must have shape (B, N, >=2), got {coords.shape}")
 
         height, width = self.model_resolution
-        scale = coords.new_tensor([width, height])
-        coords_pixel = coords * scale  # convert to pixel grid
+        scale = coords_xy.new_tensor([width, height])
+        coords_pixel = coords_xy * scale  # convert to pixel grid
         grid = coords_pixel.permute(2, 0, 1)  # (2, B, N)
         coord_embed = get_2d_sincos_pos_embed_from_grid(self.query_dim, grid)
         coord_embed = coord_embed.squeeze(0).reshape(coords.shape[0], coords.shape[1], self.query_dim)
@@ -191,6 +207,7 @@ class AutoregressiveIntentTracker(nn.Module):
         teacher_forcing_disp=None,
         teacher_forcing_mask=None,
         scene_tokens=None,
+        depth=None,
         num_steps=None,
         return_intermediate=False,
     ):
@@ -199,24 +216,25 @@ class AutoregressiveIntentTracker(nn.Module):
 
         Args:
             frames: (B, frame_stack, 3, 224, 224) - RGB frames (normalized).
-            query_coords: (B, N, 2) - initial positions in normalized coordinates.
-            teacher_forcing_disp: optional (B, N, T, 2) tensor of cumulative GT displacements.
+            query_coords: (B, N, 2) or (B, N, 3) - initial positions in normalized coordinates.
+            teacher_forcing_disp: optional (B, N, T, coord_dim) tensor of cumulative GT displacements.
                                  When provided, the model will use these positions to build
                                  tokens (teacher forcing) before predicting the displacement increment.
             teacher_forcing_mask: optional bool tensor (B, N, T) indicating where to apply
                                   teacher forcing. Defaults to all True if teacher data is provided.
             scene_tokens: optional pre-computed ViT tokens. If None, frames must be provided.
+            depth: (B, frame_stack, 1, 224, 224) - depth maps for 3D mode, None for 2D.
             num_steps: override number of autoregressive steps (<= num_future_steps).
             return_intermediate: if True, also return predicted coordinates per step.
 
         Returns:
-            pred_disp: (B, N, num_steps, 2) cumulative displacement predictions.
-            optional coords: (B, N, num_steps, 2) predicted coordinates when return_intermediate=True.
+            pred_disp: (B, N, num_steps, coord_dim) cumulative displacement predictions.
+            optional coords: (B, N, num_steps, coord_dim) predicted coordinates when return_intermediate=True.
         """
         if scene_tokens is None:
             if frames is None:
                 raise ValueError("Either frames or scene_tokens must be provided.")
-            scene_tokens = self.extract_vit_features(frames)
+            scene_tokens = self.extract_vit_features(frames, depth=depth)
 
         if num_steps is None:
             num_steps = self.num_future_steps
@@ -230,9 +248,10 @@ class AutoregressiveIntentTracker(nn.Module):
         device = query_coords.device
         dtype = query_coords.dtype
 
-        pred_disp = torch.zeros(B, N, num_steps, 2, device=device, dtype=dtype)
-        cumulative_disp = torch.zeros(B, N, 2, device=device, dtype=dtype)
-        current_coords = query_coords
+        pred_disp = torch.zeros(B, N, num_steps, self.coord_dim, device=device, dtype=dtype)
+        cumulative_disp = torch.zeros(B, N, self.coord_dim, device=device, dtype=dtype)
+        # For current_coords, only track (x, y) since that's what _encode_coords uses
+        current_coords = query_coords[..., :2].clone()
 
         if teacher_forcing_disp is not None:
             if teacher_forcing_disp.shape[0] != B or teacher_forcing_disp.shape[1] != N:
@@ -245,9 +264,12 @@ class AutoregressiveIntentTracker(nn.Module):
                     f"but num_steps={num_steps} requested."
                 )
 
+            # For teacher forcing, only use (x, y) for position encoding
             teacher_prefix = torch.zeros_like(teacher_forcing_disp)
             teacher_prefix[:, :, 1:, :] = teacher_forcing_disp[:, :, :-1, :]
-            teacher_coords = query_coords.unsqueeze(2) + teacher_prefix
+            query_coords_xy = query_coords[..., :2]  # (B, N, 2)
+            teacher_prefix_xy = teacher_prefix[..., :2]  # (B, N, T, 2)
+            teacher_coords = query_coords_xy.unsqueeze(2) + teacher_prefix_xy
             teacher_coords = teacher_coords[:, :, :num_steps, :]
 
             if teacher_forcing_mask is None:
@@ -279,14 +301,15 @@ class AutoregressiveIntentTracker(nn.Module):
 
             step_token = self._build_step_token(coords_for_token, step)
             delta = self.updateformer(step_token, scene_tokens, add_space_attn=True)
-            delta = delta.squeeze(2)  # (B, N, 2)
+            delta = delta.squeeze(2)  # (B, N, coord_dim)
 
             cumulative_disp = cumulative_disp + delta
             pred_disp[:, :, step, :] = cumulative_disp
-            current_coords = query_coords + cumulative_disp
+            # Update current_coords using only (x, y) from cumulative_disp
+            current_coords = query_coords[..., :2] + cumulative_disp[..., :2]
 
             if return_intermediate:
-                coord_history.append(current_coords)
+                coord_history.append(current_coords.clone())
 
         if return_intermediate:
             coords = torch.stack(coord_history, dim=2)  # (B, N, steps, 2)
@@ -296,25 +319,29 @@ class AutoregressiveIntentTracker(nn.Module):
     def compute_loss(self, batch):
         """
         Compute supervised loss using teacher forcing for stability.
+        
+        Args:
+            batch: dict with keys:
+                - 'frames': (B, frame_stack, 3, H, W) - RGB frames
+                - 'query_coords': (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+                - 'gt_disp_normalized': (B, N, T, coord_dim) - GT displacements (normalized)
+                - 'depth': (B, frame_stack, 1, H, W) - depth maps (3D mode only)
         """
         frames = batch['frames']
         query_coords = batch['query_coords']
         gt_disp_normalized = batch['gt_disp_normalized']
-        disp_std = batch['disp_std']
+        depth = batch.get('depth', None)
 
         pred_disp = self(
             frames=frames,
             query_coords=query_coords,
             teacher_forcing_disp=gt_disp_normalized,
+            depth=depth,
         )
 
-        device = pred_disp.device
-        std_tensor = torch.tensor(disp_std, device=device, dtype=pred_disp.dtype)
-
-        pred_disp_denorm = pred_disp * std_tensor
-        gt_disp_denorm = gt_disp_normalized[:, :, :pred_disp.shape[2], :] * std_tensor
-
-        error = torch.norm(pred_disp_denorm - gt_disp_denorm, dim=-1)
+        # Compute loss in normalized space (treats all dimensions equally)
+        gt_disp_trimmed = gt_disp_normalized[:, :, :pred_disp.shape[2], :]
+        error = torch.norm(pred_disp - gt_disp_trimmed, dim=-1)
         loss_mask = torch.ones_like(error)
         loss_mask[:, :, 0] = 0.0
 
@@ -323,15 +350,23 @@ class AutoregressiveIntentTracker(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict(self, frames, query_coords, num_steps=None, return_intermediate=False):
+    def predict(self, frames, query_coords, depth=None, num_steps=None, return_intermediate=False):
         """
         Inference-time rollout without teacher forcing.
+        
+        Args:
+            frames: (B, frame_stack, 3, H, W) - RGB frames
+            query_coords: (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+            depth: (B, frame_stack, 1, H, W) - depth maps (3D mode only)
+            num_steps: override number of autoregressive steps
+            return_intermediate: if True, also return predicted coordinates per step
         """
         return self(
             frames=frames,
             query_coords=query_coords,
             teacher_forcing_disp=None,
             scene_tokens=None,
+            depth=depth,
             num_steps=num_steps,
             return_intermediate=return_intermediate,
         )

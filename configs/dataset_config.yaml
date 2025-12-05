@@ -15,12 +15,18 @@ cache_image: true       # Images are stored in HDF5 file, not separately on disk
 track_type: "3d"        # "2d" or "3d" - determines data format and normalization
 # normalization_stats.yaml is auto-detected from dataset_dir
 
-# Data augmentation parameters (applied with prob=training.aug_prob when enabled)
+# Train/validation split configuration
+split_mode: "sample"   # "episode" = split by video files, "sample" = split individual samples
+val_split: 0.1          # Fraction for validation (10%)
+val_seed: 42            # Random seed for reproducibility
+
+# Data augmentation parameters
+aug_prob: 0.9           # Probability of applying augmentations per batch
 aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
 aug_translation_px: 16
 aug_rotation_deg: 20
 aug_hflip_prob: 0.5
 aug_vflip_prob: 0.25
 aug_noise_std: 0.02         # Gaussian noise std for images (0 = disabled)
-aug_depth_noise_std: 0.015   # Gaussian noise std for depth maps (3D only, 0 = disabled)
+aug_depth_noise_std: 0.02   # Gaussian noise std for depth maps (3D only, 0 = disabled)
 

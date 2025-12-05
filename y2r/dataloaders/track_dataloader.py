@@ -1,3 +1,10 @@
+"""
+Track dataset for loading video frames and future track trajectories.
+
+Supports both 2D and 3D track formats with unified dict-based output.
+Augmentations are applied on GPU in the training loop - see gpu_augmentations.py.
+"""
+
 import numpy as np
 import os
 import torch
@@ -42,23 +49,27 @@ class TrackDataset(SimpleBaseDataset):
         query_coords: (N, 2) or (N, 3) - initial positions (u, v) or (u, v, d)
         displacements: (T, N, 2) or (T, N, 3) - future displacements
         poses: (T, 9) or None - camera poses (3D only)
-        depth: (T, H, W) or None - depth maps (3D only, if available)
+        depth: (T, H, W) or None - depth maps (3D only)
     """
     
     def __init__(self, h5_files=None, dataset_dir=None, img_size=224, num_track_ts=16, 
-                 num_track_ids=64, frame_stack=1, downsample_factor=1, cache_all=False, cache_image=False, 
-                 num_demos=None, aug_prob=0., track_type="2d",
-                 aug_color_jitter=None, aug_translation_px=0, aug_rotation_deg=0,
-                 aug_hflip_prob=0.0, aug_vflip_prob=0.0, aug_noise_std=0.0, aug_depth_noise_std=0.0):
+                 num_track_ids=64, frame_stack=1, downsample_factor=1, cache_all=False, 
+                 cache_image=False, num_demos=None, track_type="2d"):
         """
         Initialize TrackDataset.
         
         Args:
             h5_files: Optional list of specific .hdf5 file paths (for train/val split)
             dataset_dir: Optional directory to scan for .hdf5 files (alternative to h5_files)
+            img_size: Image size (int or tuple)
+            num_track_ts: Number of future timesteps to load
+            num_track_ids: Number of track points to sample
+            frame_stack: Number of past frames to load
+            downsample_factor: Temporal downsampling factor
+            cache_all: Whether to cache all data in memory
+            cache_image: Whether to cache images in memory
+            num_demos: Fraction of demos to use (0-1)
             track_type: "2d" or "3d" - determines data format and normalization
-            aug_*: Augmentation configuration parameters
-            Other args: Same as SimpleBaseDataset
         """
         if h5_files is not None and dataset_dir is not None:
             raise ValueError("Provide either h5_files or dataset_dir, not both")
@@ -98,7 +109,6 @@ class TrackDataset(SimpleBaseDataset):
         self.num_demos = num_demos
         self.num_track_ts = num_track_ts
         self.num_track_ids = num_track_ids
-        self.aug_prob = aug_prob
         self.cache_all = cache_all
         self.cache_image = cache_image
         
@@ -142,53 +152,6 @@ class TrackDataset(SimpleBaseDataset):
         
         # Load demo info
         self.load_demo_info()
-        
-        # Setup augmentation with new dict-based augmentors
-        from torchvision import transforms
-        from .utils import (DictColorJitter, DictTranslationAug, DictRandomRotate,
-                           DictRandomHorizontalFlip, DictRandomVerticalFlip, DictGaussianNoise)
-        
-        aug_list = []
-        
-        # Color jitter
-        if aug_color_jitter is not None:
-            if isinstance(aug_color_jitter, dict):
-                brightness = aug_color_jitter.get('brightness', 0)
-                contrast = aug_color_jitter.get('contrast', 0)
-                saturation = aug_color_jitter.get('saturation', 0)
-                hue = aug_color_jitter.get('hue', 0)
-            else:
-                brightness = getattr(aug_color_jitter, 'brightness', 0)
-                contrast = getattr(aug_color_jitter, 'contrast', 0)
-                saturation = getattr(aug_color_jitter, 'saturation', 0)
-                hue = getattr(aug_color_jitter, 'hue', 0)
-            
-            aug_list.append(DictColorJitter(
-                brightness=brightness, contrast=contrast,
-                saturation=saturation, hue=hue
-            ))
-        
-        # Translation
-        if aug_translation_px > 0:
-            aug_list.append(DictTranslationAug(input_shape=img_size, translation=aug_translation_px))
-        
-        # Rotation
-        if aug_rotation_deg > 0:
-            aug_list.append(DictRandomRotate(degrees=aug_rotation_deg))
-        
-        # Horizontal flip
-        if aug_hflip_prob > 0:
-            aug_list.append(DictRandomHorizontalFlip(p=aug_hflip_prob))
-        
-        # Vertical flip
-        if aug_vflip_prob > 0:
-            aug_list.append(DictRandomVerticalFlip(p=aug_vflip_prob))
-        
-        # Gaussian noise
-        if aug_noise_std > 0 or aug_depth_noise_std > 0:
-            aug_list.append(DictGaussianNoise(img_std=aug_noise_std, depth_std=aug_depth_noise_std))
-        
-        self.augmentor = transforms.Compose(aug_list) if aug_list else None
 
     def _load_image_list_from_demo(self, demo, time_offset, num_frames=None, backward=False):
         """Load images from cached demo with temporal downsampling support."""
@@ -304,38 +267,30 @@ class TrackDataset(SimpleBaseDataset):
             if poses is not None:
                 poses = poses[:self.num_track_ts]
         
-        # Load depth (required for 3D) - slice to match track timesteps
+        # Load depth (required for 3D) - load PAST frames matching imgs (for model input)
         depth = None
         if self.track_type == '3d':
             if 'depth' not in demo['root']:
                 raise ValueError(f"3D mode requires depth data but none found in {demo_id}")
             full_depth = demo['root']['depth']  # (T_video, H, W)
-            # Extract frames starting from time_offset, matching the track timesteps
-            depth_indices = time_offset + indices.numpy()
-            depth = torch.Tensor(full_depth[depth_indices])  # (num_track_ts, H, W)
+            demo_length = full_depth.shape[0]
+            
+            # Load depth for the SAME frames as imgs (past frames, backward from time_offset)
+            spacing = self.downsample_factor
+            start_offset = time_offset - (self.frame_stack - 1) * spacing
+            depth_indices = np.arange(start_offset, time_offset + 1, spacing)
+            depth_indices = np.clip(depth_indices, 0, demo_length - 1)
+            depth = torch.Tensor(full_depth[depth_indices])  # (frame_stack, H, W)
+            
+            # Pad if needed (same as _load_image_list_from_demo)
+            if len(depth) < self.frame_stack:
+                first_frame = depth[0:1]
+                num_padding = self.frame_stack - len(depth)
+                padding_frames = first_frame.repeat(num_padding, 1, 1)
+                depth = torch.cat([padding_frames, depth], dim=0)
         
-        # Data augmentation
-        if self.augmentor is not None and np.random.rand() < self.aug_prob:
-            # Create augmentation dict with batch dimension
-            aug_data = {
-                'imgs': (imgs / 255.0)[None],  # (1, T, C, H, W)
-                'query_coords': query_coords[None],  # (1, N, coord_dim)
-                'displacements': displacements[None],  # (1, T, N, coord_dim)
-                'depth': depth[None] if depth is not None else None,  # (1, T, H, W)
-                'poses': poses,  # Not augmented, keep as-is
-            }
-            
-            # Apply augmentation
-            aug_data = self.augmentor(aug_data)
-            
-            # Remove batch dimension
-            imgs = aug_data['imgs'][0]
-            query_coords = aug_data['query_coords'][0]
-            displacements = aug_data['displacements'][0]
-            if depth is not None:
-                depth = aug_data['depth'][0]
-        else:
-            imgs = imgs / 255.0
+        # Normalize images to [0, 1]
+        imgs = imgs / 255.0
         
         # Clip coordinates to valid [0, 1] range
         query_coords[..., :2] = torch.clamp(query_coords[..., :2], 0, 1)
@@ -366,10 +321,15 @@ class TrackDataset(SimpleBaseDataset):
             query_coords, displacements, num_samples=self.num_track_ids
         )
         
-        return {
+        # Build result dict, excluding None values (collate can't handle None)
+        result = {
             'imgs': imgs,
             'query_coords': query_coords,
             'displacements': displacements,
-            'poses': poses,
-            'depth': depth,
         }
+        if poses is not None:
+            result['poses'] = poses
+        if depth is not None:
+            result['depth'] = depth
+        
+        return result

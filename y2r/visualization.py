@@ -212,9 +212,9 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     Args:
         vis_data: List of dicts with keys:
             - 'frame': (1, frame_stack, 3, H, W) tensor
-            - 'gt_tracks': (num_track_ts, N, 2) tensor - GT positions in [0, 1]
-            - 'pred_disp': (1, N, T, 2) tensor - predicted displacements (normalized)
-            - 'query_coords': (N, 2) tensor - initial positions in [0, 1]
+            - 'gt_disp': (N, T, coord_dim) tensor - GT displacements (normalized)
+            - 'pred_disp': (1, N, T, coord_dim) tensor - predicted displacements (normalized)
+            - 'query_coords': (N, coord_dim) tensor - initial positions in [0, 1]
         disp_stats: dict with 'displacement_mean' and 'displacement_std'
         epoch: int - current epoch number
         
@@ -229,23 +229,32 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     for idx, sample in enumerate(vis_data):
         # Use the last (most recent) frame for visualization
         frame = sample['frame'][0, -1]  # (3, H, W)
-        gt_tracks_data = sample['gt_tracks']  # (T, N, 2) - positions
-        pred_disp = sample['pred_disp'][0]  # (N, T, 2) - displacements (normalized)
-        query_coords = sample['query_coords']  # (N, 2)
+        gt_disp = sample['gt_disp']  # (N, T, coord_dim) - normalized displacements
+        pred_disp = sample['pred_disp'][0]  # (N, T, coord_dim) - displacements (normalized)
+        query_coords = sample['query_coords']  # (N, coord_dim)
         
-        # GT tracks are already positions in [0, 1]
-        gt_tracks = gt_tracks_data.permute(1, 0, 2)  # (N, T, 2)
+        # Use only (x, y) for visualization (ignore depth for 3D)
+        coord_dim = min(2, query_coords.shape[-1])
+        query_xy = query_coords[..., :2]  # (N, 2)
+        gt_disp_xy = gt_disp[..., :2]  # (N, T, 2)
+        pred_disp_xy = pred_disp[..., :2]  # (N, T, 2)
         
-        # Denormalize predicted displacements
-        pred_disp_denorm = denormalize_displacements(pred_disp, mean, std)
+        # Use only first 2 components of stats for 2D visualization
+        mean_2d = mean[:2] if len(mean) > 2 else mean
+        std_2d = std[:2] if len(std) > 2 else std
+        
+        # Denormalize displacements
+        gt_disp_denorm = denormalize_displacements(gt_disp_xy, mean_2d, std_2d)
+        pred_disp_denorm = denormalize_displacements(pred_disp_xy, mean_2d, std_2d)
         
         # Convert displacements to positions
-        pred_tracks = query_coords.unsqueeze(1) + pred_disp_denorm  # (N, T, 2)
+        gt_tracks = query_xy.unsqueeze(1) + gt_disp_denorm  # (N, T, 2)
+        pred_tracks = query_xy.unsqueeze(1) + pred_disp_denorm  # (N, T, 2)
         
         # Create visualization
         fig = visualize_tracks_on_frame(
             frame=frame,
-            query_coords=query_coords,
+            query_coords=query_xy,
             gt_tracks=gt_tracks,
             pred_tracks=pred_tracks,
             title=f"Epoch {epoch} - Sample {idx+1}"
@@ -266,10 +275,10 @@ def visualize_diffusion_process(vis_data, disp_stats, epoch):
     Args:
         vis_data: List of dicts with keys:
             - 'frame': (1, frame_stack, 3, H, W) tensor
-            - 'gt_tracks': (num_track_ts, N, 2) tensor - GT positions in [0, 1]
-            - 'pred_disp': (1, N, T, 2) tensor - final predicted displacements (normalized)
-            - 'query_coords': (N, 2) tensor - initial positions in [0, 1]
-            - 'intermediate': list of (1, N, T, 2) tensors - intermediate predictions
+            - 'gt_disp': (N, T, coord_dim) tensor - GT displacements (normalized)
+            - 'pred_disp': (1, N, T, coord_dim) tensor - predicted displacements (normalized)
+            - 'query_coords': (N, coord_dim) tensor - initial positions in [0, 1]
+            - 'intermediate': list of (1, N, T, coord_dim) tensors - intermediate predictions
         disp_stats: dict with 'displacement_mean' and 'displacement_std'
         epoch: int - current epoch number
         
@@ -288,12 +297,21 @@ def visualize_diffusion_process(vis_data, disp_stats, epoch):
         
         # Use the last (most recent) frame for visualization
         frame = sample['frame'][0, -1]  # (3, H, W)
-        gt_tracks_data = sample['gt_tracks']  # (T, N, 2) - positions
-        query_coords = sample['query_coords']  # (N, 2)
-        intermediate = sample['intermediate']  # List of (1, N, T, 2) tensors
+        gt_disp = sample['gt_disp']  # (N, T, coord_dim) - normalized displacements
+        query_coords = sample['query_coords']  # (N, coord_dim)
+        intermediate = sample['intermediate']  # List of (1, N, T, coord_dim) tensors
         
-        # GT tracks are already positions in [0, 1]
-        gt_tracks = gt_tracks_data.permute(1, 0, 2)  # (N, T, 2)
+        # Use only (x, y) for visualization
+        query_xy = query_coords[..., :2]  # (N, 2)
+        gt_disp_xy = gt_disp[..., :2]  # (N, T, 2)
+        
+        # Use only first 2 components of stats for 2D visualization
+        mean_2d = mean[:2] if len(mean) > 2 else mean
+        std_2d = std[:2] if len(std) > 2 else std
+        
+        # Denormalize GT displacements and convert to positions
+        gt_disp_denorm = denormalize_displacements(gt_disp_xy, mean_2d, std_2d)
+        gt_tracks = query_xy.unsqueeze(1) + gt_disp_denorm  # (N, T, 2)
         
         # Select timesteps to visualize (evenly spaced through the denoising process)
         num_steps = len(intermediate)
@@ -317,14 +335,14 @@ def visualize_diffusion_process(vis_data, disp_stats, epoch):
         H, W = img_array.shape[:2]
         
         # Limit points for visualization
-        N = query_coords.shape[0]
+        N = query_xy.shape[0]
         max_points = 32
         if N > max_points:
             indices = np.linspace(0, N-1, max_points, dtype=int)
-            query_coords_viz = query_coords[indices]
+            query_coords_viz = query_xy[indices]
             gt_tracks_viz = gt_tracks[indices]
         else:
-            query_coords_viz = query_coords
+            query_coords_viz = query_xy
             gt_tracks_viz = gt_tracks
             indices = np.arange(N)
         
@@ -354,12 +372,12 @@ def visualize_diffusion_process(vis_data, disp_stats, epoch):
             ax.imshow(img_array)
             ax.axis('off')
             
-            # Get intermediate prediction at this step
-            intermediate_disp = intermediate[step_idx][0]  # (N, T, 2)
+            # Get intermediate prediction at this step (use only x, y)
+            intermediate_disp = intermediate[step_idx][0][..., :2]  # (N, T, 2)
             intermediate_disp = intermediate_disp[indices] if N > max_points else intermediate_disp
             
             # Denormalize displacements
-            intermediate_disp_denorm = denormalize_displacements(intermediate_disp, mean, std)
+            intermediate_disp_denorm = denormalize_displacements(intermediate_disp, mean_2d, std_2d)
             
             # Convert displacements to positions
             pred_tracks = query_coords_viz.unsqueeze(1) + intermediate_disp_denorm  # (N, T, 2)

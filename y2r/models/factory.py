@@ -42,8 +42,9 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
         >>> cfg = load_config('configs/train_direct.yaml')
         >>> model = create_model(cfg, device='cuda:0')
     """
-    # Extract model type
+    # Extract model type and track type
     model_type = getattr(cfg.model, 'model_type', 'direct')
+    track_type = getattr(cfg.model, 'track_type', '2d')
     
     # Common parameters shared across all models
     common_params = {
@@ -57,6 +58,7 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
         'mlp_ratio': cfg.model.mlp_ratio,
         'p_drop_attn': cfg.model.p_drop_attn,
         'frame_stack': cfg.model.frame_stack,
+        'track_type': track_type,
         'from_pretrained': from_pretrained,
     }
     

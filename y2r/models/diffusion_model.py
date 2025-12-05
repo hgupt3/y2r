@@ -12,6 +12,7 @@ from diffusers.schedulers import DDIMScheduler, DDPMScheduler
 
 from y2r.models.blocks import EfficientUpdateFormer, Mlp
 from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
+from y2r.models.model_utils import extend_vit_to_rgbd
 
 
 class DiffusionIntentTracker(nn.Module):
@@ -29,11 +30,12 @@ class DiffusionIntentTracker(nn.Module):
         mlp_ratio=4.0,
         p_drop_attn=0.0,
         frame_stack=1,
+        track_type='2d',
         num_diffusion_steps=100,
         beta_schedule='squaredcos_cap_v2',
         cache_quantized_position_encoding=False,
-        disp_mean=None,  # (2,) displacement mean for normalization
-        disp_std=None,   # (2,) displacement std for normalization
+        disp_mean=None,  # (2,) or (3,) displacement mean for normalization
+        disp_std=None,   # (2,) or (3,) displacement std for normalization
         from_pretrained=True,
     ):
         super(DiffusionIntentTracker, self).__init__()
@@ -42,6 +44,8 @@ class DiffusionIntentTracker(nn.Module):
         self.hidden_size = hidden_size
         self.model_resolution = model_resolution
         self.frame_stack = frame_stack
+        self.track_type = track_type
+        self.coord_dim = 3 if track_type == '3d' else 2
         self.num_diffusion_steps = num_diffusion_steps
         self.cache_quantized_position_encoding = cache_quantized_position_encoding
         
@@ -51,8 +55,8 @@ class DiffusionIntentTracker(nn.Module):
             self.register_buffer('disp_std', torch.tensor(disp_std, dtype=torch.float32))
         else:
             # Default values if not provided (will be set later)
-            self.register_buffer('disp_mean', torch.zeros(2))
-            self.register_buffer('disp_std', torch.ones(2))
+            self.register_buffer('disp_mean', torch.zeros(self.coord_dim))
+            self.register_buffer('disp_std', torch.ones(self.coord_dim))
 
         # ViT encoder (provides all visual context)
         if from_pretrained:
@@ -87,6 +91,10 @@ class DiffusionIntentTracker(nn.Module):
                 raise ValueError(f"Unknown ViT model: {vit_model_name}")
             # Create model without pretrained weights (pretrained=False)
             self.vit = model_map[vit_model_name](pretrained=False)
+        
+        # Extend ViT to handle RGBD input for 3D mode
+        if track_type == '3d':
+            extend_vit_to_rgbd(self.vit)
         
         self.vit.requires_grad_(not vit_frozen)
         
@@ -123,7 +131,7 @@ class DiffusionIntentTracker(nn.Module):
         )
         
         # Trajectory embedding: project normalized noisy displacement
-        self.traj_embed = nn.Linear(2, self.traj_dim)
+        self.traj_embed = nn.Linear(self.coord_dim, self.traj_dim)
         
         # MLP to combine position, trajectory, temporal, and diffusion timestep encodings
         # Input: position_dim + traj_dim + temporal_dim + diffusion_timestep_dim
@@ -141,7 +149,7 @@ class DiffusionIntentTracker(nn.Module):
             input_dim=hidden_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
-            output_dim=2,                # Predict noise (Δx, Δy)
+            output_dim=self.coord_dim,   # Predict noise (2D or 3D)
             mlp_ratio=mlp_ratio,
             add_space_attn=add_space_attn,
             p_drop_attn=p_drop_attn,
@@ -164,13 +172,14 @@ class DiffusionIntentTracker(nn.Module):
             prediction_type='epsilon',
         )
     
-    def extract_vit_features(self, frame):
+    def extract_vit_features(self, frame, depth=None):
         """
         Extract DINOv2 patch features from frames with temporal encoding.
         
         Args:
             frame: (B, T_obs, 3, 224, 224) - RGB images where T_obs = frame_stack
                    (ImageNet normalized in dataloader)
+            depth: (B, T_obs, 1, 224, 224) - Depth maps for 3D mode, None for 2D
             
         Returns:
             scene_tokens: (B, T_obs*num_patches, feature_dim) - ViT patch embeddings 
@@ -179,8 +188,12 @@ class DiffusionIntentTracker(nn.Module):
         B, T_obs, C, H, W = frame.shape
         assert T_obs == self.frame_stack, f"Expected {self.frame_stack} frames, got {T_obs}"
         
-        # Flatten temporal dimension: (B, T_obs, 3, H, W) -> (B*T_obs, 3, H, W)
-        frame_flat = frame.view(B * T_obs, C, H, W)
+        # Concatenate RGB + Depth for 3D mode -> RGBD
+        if self.track_type == '3d' and depth is not None:
+            frame = torch.cat([frame, depth], dim=2)  # (B, T_obs, 4, H, W)
+        
+        # Flatten temporal dimension: (B, T_obs, C, H, W) -> (B*T_obs, C, H, W)
+        frame_flat = frame.view(B * T_obs, -1, H, W)
         
         # Process all frames through ViT
         vit_output = self.vit.forward_features(frame_flat)
@@ -204,7 +217,7 @@ class DiffusionIntentTracker(nn.Module):
         
         return scene_tokens
     
-    def forward(self, frames, query_coords, noisy_traj, timestep, scene_tokens=None):
+    def forward(self, frames, query_coords, noisy_traj, timestep, scene_tokens=None, depth=None):
         """
         Forward pass: predict noise in noisy trajectory tokens (conditioned slot + future steps).
         OPTIMIZED: Supports cached vision features for efficiency.
@@ -212,14 +225,15 @@ class DiffusionIntentTracker(nn.Module):
         Args:
             frames: (B, frame_stack, 3, 224, 224) - RGB frames (ImageNet normalized)
                    Can be None if scene_tokens is provided.
-            query_coords: (B, N, 2) - Initial (x, y) positions in [0, 1]
-            noisy_traj: (B, N, T+1, 2) - Noisy tokens (t=0 conditioned slot + T future steps)
+            query_coords: (B, N, 2) or (B, N, 3) - Initial positions in [0, 1]
+            noisy_traj: (B, N, T+1, coord_dim) - Noisy tokens (t=0 conditioned slot + T future steps)
             timestep: (B,) - Diffusion timestep for each sample in batch
             scene_tokens: (B, T_obs*num_patches, H) - Optional pre-computed ViT features.
                          If provided, frames can be None. If not provided, computed from frames.
+            depth: (B, frame_stack, 1, 224, 224) - Depth maps for 3D mode, None for 2D
             
         Returns:
-            predicted_noise: (B, N, T+1, 2) - Predicted noise for each token
+            predicted_noise: (B, N, T+1, coord_dim) - Predicted noise for each token
         """
         B = noisy_traj.shape[0]
         N = noisy_traj.shape[1]
@@ -227,13 +241,16 @@ class DiffusionIntentTracker(nn.Module):
         
         # 1. Extract or use cached ViT scene features
         if scene_tokens is None:
-            scene_tokens = self.extract_vit_features(frames)  # (B, frame_stack*256, H)
+            scene_tokens = self.extract_vit_features(frames, depth=depth)  # (B, frame_stack*256, H)
         
         # 2. Encode absolute positions with high-frequency sin/cos
+        # Only use (x, y) for positional encoding, even in 3D mode
         disp_mean = self.disp_mean.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
         disp_std = self.disp_std.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
-        noisy_disp_denorm = noisy_traj * disp_std + disp_mean  # (B, N, T+1, 2)
-        current_pos = (query_coords.unsqueeze(2) + noisy_disp_denorm).clamp(0.0, 1.0)
+        noisy_disp_denorm = noisy_traj * disp_std + disp_mean  # (B, N, T+1, coord_dim)
+        query_coords_xy = query_coords[..., :2]  # (B, N, 2)
+        noisy_disp_xy = noisy_disp_denorm[..., :2]  # (B, N, T+1, 2)
+        current_pos = (query_coords_xy.unsqueeze(2) + noisy_disp_xy).clamp(0.0, 1.0)
         pos_grid = current_pos.reshape(B * N * T_tokens, 2).permute(1, 0)  # (2, B*N*T_tokens)
         pos_encoding = get_2d_sincos_pos_embed_from_grid(self.position_dim, pos_grid)
         pos_encoding = pos_encoding.squeeze(0).reshape(B, N, T_tokens, self.position_dim)
@@ -262,7 +279,7 @@ class DiffusionIntentTracker(nn.Module):
             scene_tokens, 
             add_space_attn=True
         )
-        # Shape: (B, N, T+1, 2) - noise prediction
+        # Shape: (B, N, T+1, coord_dim) - noise prediction
         
         return predicted_noise
     
@@ -273,9 +290,9 @@ class DiffusionIntentTracker(nn.Module):
         Args:
             batch: dict with keys:
                 - 'frames': (B, frame_stack, 3, H, W) - RGB frames
-                - 'query_coords': (B, N, 2) - initial positions in [0, 1]
-                - 'gt_disp_normalized': (B, N, T, 2) - GT displacements (normalized)
-                - 'disp_std': (2,) - not used in diffusion loss
+                - 'query_coords': (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+                - 'gt_disp_normalized': (B, N, T, coord_dim) - GT displacements (normalized)
+                - 'depth': (B, frame_stack, 1, H, W) - depth maps (3D mode only)
         
         Returns:
             loss: scalar tensor (MSE between predicted and actual noise)
@@ -283,6 +300,7 @@ class DiffusionIntentTracker(nn.Module):
         frames = batch['frames']
         query_coords = batch['query_coords']
         gt_disp_normalized = batch['gt_disp_normalized']
+        depth = batch.get('depth', None)
         
         B, N, T, _ = gt_disp_normalized.shape
         device = gt_disp_normalized.device
@@ -290,7 +308,7 @@ class DiffusionIntentTracker(nn.Module):
         
         # Build x0 = [zero displacement (normalized), future displacements (normalized)]
         zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=gt_disp_normalized.dtype)
-        x0 = torch.zeros(B, N, total_steps, 2, device=device, dtype=gt_disp_normalized.dtype)
+        x0 = torch.zeros(B, N, total_steps, self.coord_dim, device=device, dtype=gt_disp_normalized.dtype)
         x0[:, :, 0, :] = zero_disp_normalized
         x0[:, :, 1:, :] = gt_disp_normalized
         
@@ -313,7 +331,7 @@ class DiffusionIntentTracker(nn.Module):
         noise = torch.where(condition_mask, torch.zeros_like(noise), noise)
         
         # Predict the noise
-        predicted_noise = self(frames, query_coords, noisy_traj, timestep)
+        predicted_noise = self(frames, query_coords, noisy_traj, timestep, depth=depth)
         
         # Compute loss only on unconditioned slots
         loss_mask = (~condition_mask).float()
@@ -325,19 +343,20 @@ class DiffusionIntentTracker(nn.Module):
         return loss
     
     @torch.no_grad()
-    def predict(self, frames, query_coords, num_inference_steps=10, return_intermediate=False):
+    def predict(self, frames, query_coords, depth=None, num_inference_steps=10, return_intermediate=False):
         """
         Predict clean trajectories using DDIM sampling with cached vision features.
         
         Args:
             frames: (B, frame_stack, 3, H, W) - RGB frames
-            query_coords: (B, N, 2) - initial positions in [0, 1]
+            query_coords: (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+            depth: (B, frame_stack, 1, H, W) - depth maps (3D mode only)
             num_inference_steps: int - number of denoising steps (default 10)
             return_intermediate: bool - if True, return intermediate predictions
         
         Returns:
-            clean_disp: (B, N, T, 2) - final clean displacements (normalized)
-            intermediate: list of (B, N, T, 2) tensors at each step (if return_intermediate=True)
+            clean_disp: (B, N, T, coord_dim) - final clean displacements (normalized)
+            intermediate: list of (B, N, T, coord_dim) tensors at each step (if return_intermediate=True)
         """
         B = frames.shape[0]
         N = query_coords.shape[1]
@@ -346,11 +365,11 @@ class DiffusionIntentTracker(nn.Module):
         device = frames.device
         
         # OPTIMIZATION: Extract vision features ONCE (not at every diffusion step)
-        scene_tokens = self.extract_vit_features(frames)  # (B, frame_stack*256, H)
+        scene_tokens = self.extract_vit_features(frames, depth=depth)  # (B, frame_stack*256, H)
         
         # Conditioning tensors (slot 0 = zero displacement in normalized space)
         zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=scene_tokens.dtype)
-        condition_data = torch.zeros(B, N, total_steps, 2, device=device, dtype=scene_tokens.dtype)
+        condition_data = torch.zeros(B, N, total_steps, self.coord_dim, device=device, dtype=scene_tokens.dtype)
         condition_data[:, :, 0, :] = zero_disp_normalized
         condition_mask = torch.zeros_like(condition_data, dtype=torch.bool)
         condition_mask[:, :, 0, :] = True

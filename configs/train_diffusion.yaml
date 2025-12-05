@@ -7,6 +7,7 @@ dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative
 # Model configuration
 model:
   model_type: 'diffusion'       # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  track_type: '2d'              # '2d' or '3d' - must match dataset_config.yaml
   # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
   hidden_size: 384
   model_resolution: [224, 224]
@@ -31,7 +32,6 @@ training:
   num_epochs: 100
   batch_size: 32                # Batch size (adjust based on GPU memory)
   num_workers: 4                # DataLoader workers (adjust based on CPU cores)
-  aug_prob: 0.9                 # Data augmentation probability
   
   # Optimizer
   lr: 1.0e-4
@@ -50,10 +50,7 @@ training:
   
   # Validation
   val_every_n_epochs: 5
-  val_split: 0.1                # 10% for validation
-  val_num_demos: null           # Or specify exact number
   val_vis_samples: 64            # Number of samples to visualize
-  val_seed: 42                  # For consistent val split
   
   # Checkpointing
   checkpoint_dir: "./checkpoints"  # Base directory (timestamped subdirs will be created)

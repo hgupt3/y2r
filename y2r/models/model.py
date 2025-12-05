@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from y2r.models.blocks import EfficientUpdateFormer, Mlp
 from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
+from y2r.models.model_utils import extend_vit_to_rgbd
 
 class IntentTracker(nn.Module):
     def __init__(
@@ -20,6 +21,7 @@ class IntentTracker(nn.Module):
         mlp_ratio=4.0,
         p_drop_attn=0.0,
         frame_stack=1,
+        track_type='2d',
         cache_quantized_position_encoding=False,
         from_pretrained=True,
     ):
@@ -28,6 +30,8 @@ class IntentTracker(nn.Module):
         self.hidden_size = hidden_size
         self.model_resolution = model_resolution
         self.frame_stack = frame_stack
+        self.track_type = track_type
+        self.coord_dim = 3 if track_type == '3d' else 2
         self.cache_quantized_position_encoding = cache_quantized_position_encoding
 
         # ViT encoder (provides all visual context)
@@ -64,6 +68,10 @@ class IntentTracker(nn.Module):
             # Create model without pretrained weights (pretrained=False)
             self.vit = model_map[vit_model_name](pretrained=False)
         
+        # Extend ViT to handle RGBD input for 3D mode
+        if track_type == '3d':
+            extend_vit_to_rgbd(self.vit)
+        
         self.vit.requires_grad_(not vit_frozen)
         
         # Embedding dimensions (following modern diffusion literature like DiT)
@@ -96,20 +104,21 @@ class IntentTracker(nn.Module):
             input_dim=hidden_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
-            output_dim=2,                # Just (Δx, Δy)
+            output_dim=self.coord_dim,   # 2 for 2D (Δx, Δy), 3 for 3D (Δx, Δy, Δz)
             mlp_ratio=mlp_ratio,
             add_space_attn=add_space_attn,
             p_drop_attn=p_drop_attn,
             linear_layer_for_vis_conf=False,
         )
     
-    def extract_vit_features(self, frame):
+    def extract_vit_features(self, frame, depth=None):
         """
         Extract DINOv2 patch features from frames with temporal encoding.
         
         Args:
             frame: (B, T_obs, 3, 224, 224) - RGB images where T_obs = frame_stack
                    (ImageNet normalized in dataloader)
+            depth: (B, T_obs, 1, 224, 224) - Depth maps for 3D mode, None for 2D
             
         Returns:
             scene_tokens: (B, T_obs*num_patches, feature_dim) - ViT patch embeddings 
@@ -118,8 +127,12 @@ class IntentTracker(nn.Module):
         B, T_obs, C, H, W = frame.shape
         assert T_obs == self.frame_stack, f"Expected {self.frame_stack} frames, got {T_obs}"
         
-        # Flatten temporal dimension: (B, T_obs, 3, H, W) -> (B*T_obs, 3, H, W)
-        frame_flat = frame.view(B * T_obs, C, H, W)
+        # Concatenate RGB + Depth for 3D mode -> RGBD
+        if self.track_type == '3d' and depth is not None:
+            frame = torch.cat([frame, depth], dim=2)  # (B, T_obs, 4, H, W)
+        
+        # Flatten temporal dimension: (B, T_obs, C, H, W) -> (B*T_obs, C, H, W)
+        frame_flat = frame.view(B * T_obs, -1, H, W)
         
         # Process all frames through ViT
         vit_output = self.vit.forward_features(frame_flat)
@@ -143,28 +156,32 @@ class IntentTracker(nn.Module):
         
         return scene_tokens
     
-    def forward(self, frame, query_coords):
+    def forward(self, frame, query_coords, depth=None):
         """
         Predict future point trajectories from observation frames.
         Tokens are purely positional + temporal, all visual info from ViT via cross-attention.
 
         Args:
             frame: (B, frame_stack, 3, 224, 224) - RGB frames (ImageNet normalized in dataloader)
-            query_coords: (B, N, 2) - Initial (x, y) positions in [0, 1] normalized coordinates
+            query_coords: (B, N, 2) or (B, N, 3) - Initial positions in [0, 1] normalized coordinates
+                          For 3D, only (x, y) are used for positional encoding
+            depth: (B, frame_stack, 1, 224, 224) - Depth maps for 3D mode, None for 2D
             
         Returns:
-            displacements: (B, N, T, 2) - Cumulative displacements in [0, 1] normalized space
+            displacements: (B, N, T, coord_dim) - Cumulative displacements (2D or 3D)
         """
         B = frame.shape[0]
         N = query_coords.shape[1]
         T = self.num_future_steps
         
         # 1. Extract ViT scene features with temporal encoding (provides ALL visual context)
-        scene_tokens = self.extract_vit_features(frame)  # (B, frame_stack*256, H)
+        scene_tokens = self.extract_vit_features(frame, depth=depth)  # (B, frame_stack*256, H)
         
         # 2. Query encoding: encode initial query coordinates (where trajectories start)
         # Use 2D sinusoidal positional encoding for spatial localization
-        coords_pixel = query_coords * 224.0  # (B, N, 2) -> [0, 224]
+        # Only use (x, y) for positional encoding, even in 3D mode
+        coords_xy = query_coords[..., :2]  # (B, N, 2)
+        coords_pixel = coords_xy * 224.0  # (B, N, 2) -> [0, 224]
         grid = coords_pixel.permute(2, 0, 1)  # (2, B, N)
         query_encoding = get_2d_sincos_pos_embed_from_grid(self.query_dim, grid)  # (1, B*N, query_dim)
         query_encoding = query_encoding.squeeze(0).reshape(B, N, self.query_dim)
@@ -186,7 +203,7 @@ class IntentTracker(nn.Module):
             scene_tokens, 
             add_space_attn=True
         )
-        # Shape: (B, N, T, 2) - direct prediction
+        # Shape: (B, N, T, coord_dim) - direct prediction
         
         return displacements  # Cumulative displacements (0→1, 0→2, ..., 0→T)
     
@@ -197,9 +214,9 @@ class IntentTracker(nn.Module):
         Args:
             batch: dict with keys:
                 - 'frames': (B, frame_stack, 3, H, W) - RGB frames
-                - 'query_coords': (B, N, 2) - initial positions in [0, 1]
-                - 'gt_disp_normalized': (B, N, T, 2) - GT displacements (normalized)
-                - 'disp_std': (2,) - displacement std for loss scaling
+                - 'query_coords': (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+                - 'gt_disp_normalized': (B, N, T, coord_dim) - GT displacements (normalized)
+                - 'depth': (B, frame_stack, 1, H, W) - depth maps (3D mode only)
         
         Returns:
             loss: scalar tensor
@@ -207,21 +224,13 @@ class IntentTracker(nn.Module):
         frames = batch['frames']
         query_coords = batch['query_coords']
         gt_disp_normalized = batch['gt_disp_normalized']
-        disp_std = batch['disp_std']
+        depth = batch.get('depth', None)
         
         # Forward pass
-        pred_disp = self(frames, query_coords)  # (B, N, T, 2)
+        pred_disp = self(frames, query_coords, depth=depth)  # (B, N, T, coord_dim)
         
-        # Compute normalized displacement loss
-        device = pred_disp.device
-        std_tensor = torch.tensor(disp_std, device=device, dtype=pred_disp.dtype)
-        
-        # Denormalize to compute loss in pixel space
-        pred_disp_denorm = pred_disp * std_tensor
-        gt_disp_denorm = gt_disp_normalized * std_tensor
-        
-        # L2 distance
-        error = torch.norm(pred_disp_denorm - gt_disp_denorm, dim=-1)  # (B, N, T)
+        # L2 distance in normalized space
+        error = torch.norm(pred_disp - gt_disp_normalized, dim=-1)  # (B, N, T)
         
         # Mask out t=0 (should always be zero displacement)
         loss_mask = torch.ones_like(error)
@@ -232,20 +241,21 @@ class IntentTracker(nn.Module):
         
         return loss
     
-    def predict(self, frames, query_coords, return_intermediate=False):
+    def predict(self, frames, query_coords, depth=None, return_intermediate=False):
         """
         Prediction method for inference. Wrapper around forward for API consistency.
         
         Args:
             frames: (B, frame_stack, 3, H, W) - RGB frames
-            query_coords: (B, N, 2) - initial positions in [0, 1]
+            query_coords: (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
+            depth: (B, frame_stack, 1, H, W) - depth maps (3D mode only)
             return_intermediate: bool - ignored for direct model (for API compatibility)
         
         Returns:
-            pred_disp: (B, N, T, 2) - predicted displacements (normalized)
+            pred_disp: (B, N, T, coord_dim) - predicted displacements (normalized)
             (If return_intermediate=True, returns only pred_disp since no intermediate steps)
         """
-        pred_disp = self(frames, query_coords)
+        pred_disp = self(frames, query_coords, depth=depth)
         
         # For API compatibility with diffusion model
         # Direct model has no intermediate steps, so just return final prediction
