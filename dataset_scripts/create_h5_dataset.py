@@ -143,10 +143,10 @@ def center_crop_and_resize(frame, target_size, crop_params=None, interpolation=c
     """
     if crop_params is None:
         # Compute crop parameters
-        h, w = frame.shape[:2]
-        crop_size = min(h, w)
-        crop_offset_x = (w - crop_size) // 2
-        crop_offset_y = (h - crop_size) // 2
+    h, w = frame.shape[:2]
+    crop_size = min(h, w)
+    crop_offset_x = (w - crop_size) // 2
+    crop_offset_y = (h - crop_size) // 2
         return_params = True
     else:
         crop_offset_x, crop_offset_y, crop_size = crop_params
@@ -154,13 +154,13 @@ def center_crop_and_resize(frame, target_size, crop_params=None, interpolation=c
     
     # Perform center crop
     cropped = frame[crop_offset_y:crop_offset_y + crop_size, 
-                    crop_offset_x:crop_offset_x + crop_size]
+                   crop_offset_x:crop_offset_x + crop_size]
     
     # Resize to target size
     resized = cv2.resize(cropped, (target_size, target_size), interpolation=interpolation)
     
     if return_params:
-        return resized, crop_offset_x, crop_offset_y, crop_size
+    return resized, crop_offset_x, crop_offset_y, crop_size
     return resized
 
 
@@ -195,7 +195,7 @@ def transform_intrinsics(intrinsics, crop_offset_x, crop_offset_y, crop_size, ta
 # ==============================================================================
 
 def transform_track_coordinates_2d(tracks, orig_width, orig_height, 
-                                   crop_offset_x, crop_offset_y, crop_size, target_size):
+                                crop_offset_x, crop_offset_y, crop_size, target_size):
     """
     Transform 2D track coordinates from original image space to normalized [0, 1] space
     after center crop and resize.
@@ -419,34 +419,34 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
     if track_type == '2d':
         # 2D: Convert and transform track coordinates
         per_frame_tracks = convert_sliding_windows_to_future_tracks_2d(
-            all_tracks, windows, num_track_ts, total_frames
-        )
-        
+        all_tracks, windows, num_track_ts, total_frames
+    )
+    
         per_frame_query_coords = []
         per_frame_displacements = []
-        track_counts = []
-        
+    track_counts = []
+    
         for tracks_t in per_frame_tracks:
             if tracks_t is None:
                 per_frame_query_coords.append(None)
                 per_frame_displacements.append(None)
-                track_counts.append(0)
-            else:
-                transformed_timesteps = []
-                for ts in range(num_track_ts):
+            track_counts.append(0)
+        else:
+            transformed_timesteps = []
+            for ts in range(num_track_ts):
                     transformed = transform_track_coordinates_2d(
                         tracks_t[ts], orig_width, orig_height,
-                        crop_x, crop_y, crop_size, target_size
-                    )
-                    transformed_timesteps.append(transformed)
-                
-                min_points = min(t.shape[0] for t in transformed_timesteps)
-                
-                if min_points == 0:
+                    crop_x, crop_y, crop_size, target_size
+                )
+                transformed_timesteps.append(transformed)
+            
+            min_points = min(t.shape[0] for t in transformed_timesteps)
+            
+            if min_points == 0:
                     per_frame_query_coords.append(None)
                     per_frame_displacements.append(None)
-                    track_counts.append(0)
-                else:
+                track_counts.append(0)
+            else:
                     truncated = [t[:min_points] for t in transformed_timesteps]
                     tracks_stacked = np.stack(truncated, axis=0).astype(np.float32)  # (T, N, 2)
                     
@@ -456,8 +456,8 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
                     
                     per_frame_query_coords.append(query_coords)
                     per_frame_displacements.append(displacements)
-                    track_counts.append(min_points)
-        
+                track_counts.append(min_points)
+    
         # Collect displacements for statistics
         all_displacements = [d for d in per_frame_displacements if d is not None]
         
@@ -544,7 +544,7 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
                 f.create_dataset('root/depth', data=depth_array, dtype='float32')
             f.create_dataset('root/intrinsics', data=intrinsics_transformed.astype(np.float32), dtype='float32')
             
-            tracks_group = f.create_group('root/tracks')
+        tracks_group = f.create_group('root/tracks')
             for t in range(total_frames):
                 if per_frame_query_coords[t] is not None:
                     frame_group = tracks_group.create_group(f'frame_{t:04d}')

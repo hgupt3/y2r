@@ -25,8 +25,8 @@ def create_train_val_split(h5_dir, val_ratio=0.1, seed=42, split_mode="episode")
     
     Returns:
         For "episode" mode:
-            train_files: List of .hdf5 file paths for training
-            val_files: List of .hdf5 file paths for validation
+        train_files: List of .hdf5 file paths for training
+        val_files: List of .hdf5 file paths for validation
         
         For "sample" mode:
             train_indices: List of sample indices for training

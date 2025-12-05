@@ -1,0 +1,1118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Real-Time Tracker</title>
+    <style>
+        :root {
+            --primary: #8b5cf6;
+            --primary-light: #c4b5fd;
+            --bg: #0a0a0f;
+            --surface: #111118;
+            --border: #2a2a3a;
+            --text: #e0e0e0;
+            --text-dim: #6a6a7a;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            overflow: hidden;
+        }
+        
+        #canvas-container {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #ui-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 10;
+        }
+        
+        #status-bar {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            pointer-events: auto;
+        }
+        
+        .stat {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            backdrop-filter: blur(4px);
+        }
+        
+        .stat.fps { color: var(--success); }
+        .stat.resolution { color: var(--primary); }
+        .stat.status { color: var(--warning); }
+        .stat.points { color: var(--primary-light); }
+        
+        .status-indicator {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--error);
+            box-shadow: 0 0 8px var(--error);
+            transition: all 0.3s ease;
+            pointer-events: auto;
+        }
+        
+        .status-indicator.connected {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+        
+        #control-panel {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(17, 17, 24, 0.95);
+            padding: 12px 20px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            pointer-events: auto;
+            backdrop-filter: blur(4px);
+        }
+        
+        button {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 8px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+            transition: all 0.2s ease;
+        }
+        
+        button:hover {
+            background: #1e1e2e;
+            border-color: var(--primary);
+        }
+        
+        button.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+        
+        input {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            width: 200px;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+        
+        #settings-panel {
+            position: absolute;
+            bottom: 80px;
+            right: 16px;
+            background: rgba(17, 17, 24, 0.98);
+            padding: 16px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            width: 260px;
+            pointer-events: auto;
+            display: none;
+            backdrop-filter: blur(4px);
+        }
+        
+        #settings-panel.visible {
+            display: block;
+        }
+        
+        .settings-title {
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: var(--primary);
+            margin-bottom: 12px;
+        }
+        
+        .settings-group {
+            margin-bottom: 14px;
+        }
+        
+        .settings-group h3 {
+            font-size: 0.75rem;
+            font-weight: 400;
+            color: var(--text-dim);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        
+        .slider-row label {
+            font-size: 0.8rem;
+            min-width: 80px;
+        }
+        
+        .slider-row input[type="range"] {
+            flex: 1;
+            height: 4px;
+            -webkit-appearance: none;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            border: none;
+            padding: 0;
+        }
+        
+        .slider-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--primary);
+            cursor: pointer;
+        }
+        
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        
+        .checkbox-row label {
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+        
+        #loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: var(--bg);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            transition: opacity 0.5s;
+        }
+        
+        #loading-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(139, 92, 246, 0.2);
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            margin-top: 16px;
+            font-size: 0.9rem;
+            color: var(--text-dim);
+        }
+        
+        #hover-info {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.8);
+            color: var(--text);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            pointer-events: none;
+            display: none;
+            z-index: 20;
+            backdrop-filter: blur(4px);
+            border: 1px solid var(--border);
+        }
+        
+        #hover-info.visible {
+            display: block;
+        }
+        
+        /* Mobile responsive styles */
+        @media (max-width: 768px) {
+            #control-panel {
+                flex-wrap: wrap;
+                width: calc(100% - 32px);
+                padding: 10px 14px;
+                gap: 8px;
+            }
+            
+            #control-panel input {
+                width: 100%;
+                order: -1;
+            }
+            
+            #control-panel button {
+                flex: 1;
+                min-width: 70px;
+                padding: 10px 8px;
+                font-size: 0.75rem;
+            }
+            
+            #settings-panel {
+                width: calc(100% - 32px);
+                left: 16px;
+                right: 16px;
+                bottom: 100px;
+            }
+            
+            #status-bar {
+                max-width: 50%;
+            }
+            
+            .stat {
+                font-size: 0.75rem;
+                padding: 4px 8px;
+            }
+            
+            .status-indicator {
+                top: 12px;
+                right: 12px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            #control-panel {
+                padding: 8px 10px;
+            }
+            
+            #control-panel button {
+                font-size: 0.7rem;
+                padding: 8px 6px;
+            }
+            
+            .slider-row label {
+                min-width: 60px;
+                font-size: 0.7rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-overlay">
+        <div id="status-bar">
+            <div class="stat fps" id="fpsDisplay">FPS: --</div>
+            <div class="stat resolution" id="resDisplay">-- × --</div>
+            <div class="stat points" id="pointsDisplay">Points: --</div>
+            <div class="stat status" id="statusDisplay">Disconnected</div>
+        </div>
+        
+        <div id="hover-info"></div>
+        
+        <div class="status-indicator" id="statusIndicator"></div>
+        
+        <div id="control-panel">
+            <input type="text" id="wsUrl" placeholder="WebSocket URL">
+            <button id="connectBtn">Connect</button>
+            <button id="resetBtn">Reset (R)</button>
+            <button id="resetViewBtn">Reset View</button>
+            <button id="settingsBtn">Settings</button>
+        </div>
+        
+        <div id="settings-panel">
+            <div class="settings-title">Visualization Settings</div>
+            
+            <div class="settings-group">
+                <h3>Trajectories</h3>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="showTrajectories" checked>
+                    <label for="showTrajectories">Show Trajectories</label>
+                </div>
+                <div class="slider-row">
+                    <label>Line Width</label>
+                    <input type="range" id="lineWidth" min="1" max="12" step="0.5" value="6">
+                </div>
+            </div>
+            
+            <div class="settings-group">
+                <h3>Point Cloud</h3>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="showPointCloud" checked>
+                    <label for="showPointCloud">Show Point Cloud</label>
+                </div>
+                <div class="slider-row">
+                    <label>Point Size</label>
+                    <input type="range" id="pointSize" min="1" max="20" step="1" value="6">
+                </div>
+            </div>
+            
+            <div class="settings-group">
+                <h3>Camera Frustum</h3>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="showFrustum" checked>
+                    <label for="showFrustum">Show Frustum</label>
+                </div>
+                <div class="slider-row">
+                    <label>Size</label>
+                    <input type="range" id="frustumSize" min="0.1" max="1" step="0.05" value="0.3">
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text">Initializing 3D Viewer...</div>
+    </div>
+    
+    <!-- Three.js Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/lines/LineSegmentsGeometry.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/lines/LineGeometry.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/lines/LineMaterial.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/lines/LineSegments2.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/lines/Line2.js"></script>
+    
+    <script>
+        class Viewer3D {
+            constructor() {
+                // Camera intrinsics (will be updated from server)
+                this.intrinsics = { fx: 615, fy: 615, cx: 320, cy: 240 };
+                this.imageWidth = 640;
+                this.imageHeight = 480;
+                
+                // State
+                this.ws = null;
+                this.enabled = true;
+                this.streaming = false;
+                this.lastFrameTime = 0;
+                this.lastUpdateTime = 0;
+                this.minUpdateInterval = 50;  // Max 20 fps for 3D updates
+                this.trajectories = [];  // Current frame trajectories
+                this.trailHistory = [];  // History of past trajectories for fading
+                this.trailHistorySec = 0.25;  // Duration to keep trails
+                this.trailAlphaFloor = 0.2;   // Minimum opacity for oldest trails
+                this.backgroundPlane = null;
+                this.backgroundTexture = null;
+                this.pointCloud = null;
+                this.pointCloudData = null;  // Store pixel coords for hover lookup
+                
+                // Raycaster for hover detection
+                this.raycaster = new THREE.Raycaster();
+                this.raycaster.params.Points.threshold = 0.02;  // Hover radius
+                this.mouse = new THREE.Vector2();
+                
+                // Trajectory color gradient (RGB - converted from BGR config)
+                this.trajectoryColorStops = [
+                    [13, 8, 135],     // dark purple
+                    [72, 11, 162],    // deep purple
+                    [120, 28, 163],   // purple-pink
+                    [156, 46, 145],   // magenta
+                    [190, 69, 117],   // red-pink
+                    [219, 97, 84],    // orange-red
+                    [241, 135, 50],   // orange
+                    [240, 249, 33]    // yellow
+                ];
+                
+                // Camera frustum
+                this.cameraFrustum = null;
+                
+                // UI Elements
+                this.ui = {
+                    fpsDisplay: document.getElementById('fpsDisplay'),
+                    resDisplay: document.getElementById('resDisplay'),
+                    pointsDisplay: document.getElementById('pointsDisplay'),
+                    statusDisplay: document.getElementById('statusDisplay'),
+                    statusIndicator: document.getElementById('statusIndicator'),
+                    wsUrl: document.getElementById('wsUrl'),
+                    connectBtn: document.getElementById('connectBtn'),
+                    resetBtn: document.getElementById('resetBtn'),
+                    resetViewBtn: document.getElementById('resetViewBtn'),
+                    settingsBtn: document.getElementById('settingsBtn'),
+                    settingsPanel: document.getElementById('settings-panel'),
+                    loadingOverlay: document.getElementById('loading-overlay'),
+                    showTrajectories: document.getElementById('showTrajectories'),
+                    lineWidth: document.getElementById('lineWidth'),
+                    showPointCloud: document.getElementById('showPointCloud'),
+                    pointSize: document.getElementById('pointSize'),
+                    showFrustum: document.getElementById('showFrustum'),
+                    frustumSize: document.getElementById('frustumSize')
+                };
+                
+                this.initThreeJS();
+                this.initEventListeners();
+                this.autoConnect();
+                
+                // Hide loading after init
+                setTimeout(() => {
+                    this.ui.loadingOverlay.classList.add('hidden');
+                }, 500);
+            }
+            
+            initThreeJS() {
+                // Scene
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x0a0a0f);
+                
+                // Camera
+                this.camera = new THREE.PerspectiveCamera(
+                    60,
+                    window.innerWidth / window.innerHeight,
+                    0.01,
+                    100
+                );
+                this.camera.position.set(0, 0, 0);
+                
+                // Renderer
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setPixelRatio(window.devicePixelRatio);
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                document.getElementById('canvas-container').appendChild(this.renderer.domElement);
+                
+                // Controls
+                this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+                this.controls.enableDamping = true;
+                this.controls.dampingFactor = 0.05;
+                this.controls.target.set(0, 0, 1);
+                this.controls.minDistance = 0.1;
+                this.controls.maxDistance = 10;
+                this.controls.update();
+                
+                // Lighting
+                const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+                this.scene.add(ambient);
+                
+                const directional = new THREE.DirectionalLight(0xffffff, 0.4);
+                directional.position.set(0, 1, 0);
+                this.scene.add(directional);
+                
+                // Create camera frustum
+                this.createCameraFrustum();
+                
+                // Start render loop
+                this.animate();
+            }
+            
+            createCameraFrustum() {
+                this.cameraFrustum = new THREE.Group();
+                
+                const size = parseFloat(this.ui.frustumSize.value);
+                const fov = 60 * Math.PI / 180;  // Default FOV
+                const aspect = this.imageWidth / this.imageHeight;
+                
+                const halfHeight = Math.tan(fov / 2) * size;
+                const halfWidth = halfHeight * aspect;
+                
+                // Frustum vertices: apex at origin, base at z=size
+                const vertices = [
+                    new THREE.Vector3(0, 0, 0),  // apex
+                    new THREE.Vector3(-halfWidth, -halfHeight, size),  // bottom-left
+                    new THREE.Vector3(halfWidth, -halfHeight, size),   // bottom-right
+                    new THREE.Vector3(halfWidth, halfHeight, size),    // top-right
+                    new THREE.Vector3(-halfWidth, halfHeight, size)    // top-left
+                ];
+                
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                
+                // Edge pairs: [base edges, rays from apex]
+                const edges = [
+                    [1, 2], [2, 3], [3, 4], [4, 1],  // base square
+                    [0, 1], [0, 2], [0, 3], [0, 4]   // rays from apex
+                ];
+                
+                const colors = {
+                    base: 0x3366ff,
+                    ray: 0x33cc66
+                };
+                
+                edges.forEach((pair, idx) => {
+                    const positions = [
+                        vertices[pair[0]].x, vertices[pair[0]].y, vertices[pair[0]].z,
+                        vertices[pair[1]].x, vertices[pair[1]].y, vertices[pair[1]].z
+                    ];
+                    
+                    const lineGeometry = new THREE.LineGeometry();
+                    lineGeometry.setPositions(positions);
+                    
+                    const lineMaterial = new THREE.LineMaterial({
+                        color: idx < 4 ? colors.base : colors.ray,
+                        linewidth: 2,
+                        resolution: resolution
+                    });
+                    
+                    const line = new THREE.Line2(lineGeometry, lineMaterial);
+                    this.cameraFrustum.add(line);
+                });
+                
+                this.cameraFrustum.visible = this.ui.showFrustum.checked;
+                this.scene.add(this.cameraFrustum);
+            }
+            
+            updateCameraFrustum() {
+                if (!this.cameraFrustum) return;
+                
+                // Remove old frustum
+                this.scene.remove(this.cameraFrustum);
+                this.cameraFrustum.children.forEach(child => {
+                    if (child.geometry) child.geometry.dispose();
+                    if (child.material) child.material.dispose();
+                });
+                
+                // Recreate with new size
+                this.createCameraFrustum();
+            }
+            
+            updatePointCloudFromImages(depthB64, rgbB64, depthMin, depthMax) {
+                if (!depthB64 || !this.ui.showPointCloud.checked) {
+                    // Remove point cloud if disabled
+                    if (this.pointCloud) {
+                        this.scene.remove(this.pointCloud);
+                        this.pointCloud.geometry.dispose();
+                        this.pointCloud.material.dispose();
+                        this.pointCloud = null;
+                    }
+                    return;
+                }
+                
+                // Store old point cloud to remove AFTER new one is ready
+                const oldPointCloud = this.pointCloud;
+                const oldPointCloudData = this.pointCloudData;
+                
+                // Decode both images using canvas
+                const depthImg = new Image();
+                const rgbImg = new Image();
+                
+                let depthLoaded = false, rgbLoaded = false;
+                
+                const createPointCloud = () => {
+                    if (!depthLoaded || !rgbLoaded) return;
+                    
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = this.imageWidth;
+                    canvas.height = this.imageHeight;
+                    
+                    // Get RGB data
+                    ctx.drawImage(rgbImg, 0, 0);
+                    const rgbData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                    
+                    // Get depth data (16-bit PNG decoded as RGBA)
+                    ctx.drawImage(depthImg, 0, 0);
+                    const depthData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                    
+                    // Build point cloud (subsample for performance)
+                    const step = 4;  // Use every 4th pixel
+                    const positions = [];
+                    const colors = [];
+                    const newPointCloudData = [];
+                    
+                    for (let y = 0; y < canvas.height; y += step) {
+                        for (let x = 0; x < canvas.width; x += step) {
+                            const i = (y * canvas.width + x) * 4;
+                            
+                            // Decode depth from R channel (all pixels now valid after blur fill)
+                            const depthVal = depthData[i];  // 0-255
+                            
+                            // Convert back to meters
+                            const depth = depthMin + (depthVal / 255) * (depthMax - depthMin);
+                            
+                            // Unproject to 3D
+                            const pos = this.unproject(x, y, depth);
+                            positions.push(pos.x, pos.y, pos.z);
+                            
+                            // Get RGB color
+                            colors.push(rgbData[i] / 255, rgbData[i + 1] / 255, rgbData[i + 2] / 255);
+                            
+                            // Store for hover lookup
+                            newPointCloudData.push({ px: x, py: y, depth: depth });
+                        }
+                    }
+                    
+                    if (positions.length === 0) return;
+                    
+                    const geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                    
+                    const material = new THREE.PointsMaterial({
+                        size: parseFloat(this.ui.pointSize.value) * 0.001,
+                        vertexColors: true,
+                        sizeAttenuation: true
+                    });
+                    
+                    const newPointCloud = new THREE.Points(geometry, material);
+                    this.scene.add(newPointCloud);
+                    
+                    // NOW remove old point cloud (after new one is added)
+                    if (oldPointCloud) {
+                        this.scene.remove(oldPointCloud);
+                        oldPointCloud.geometry.dispose();
+                        oldPointCloud.material.dispose();
+                    }
+                    
+                    this.pointCloud = newPointCloud;
+                    this.pointCloudData = newPointCloudData;
+                };
+                
+                depthImg.onload = () => { depthLoaded = true; createPointCloud(); };
+                rgbImg.onload = () => { rgbLoaded = true; createPointCloud(); };
+                
+                depthImg.src = 'data:image/png;base64,' + depthB64;
+                rgbImg.src = 'data:image/jpeg;base64,' + rgbB64;
+            }
+            
+            updatePointCloudSettings() {
+                if (this.pointCloud) {
+                    this.pointCloud.material.size = parseFloat(this.ui.pointSize.value) * 0.001;
+                    this.pointCloud.visible = this.ui.showPointCloud.checked;
+                }
+            }
+            
+            onMouseMove(event) {
+                // Update mouse position for raycasting
+                this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                
+                // Raycast to point cloud
+                if (this.pointCloud && this.pointCloudData) {
+                    this.raycaster.setFromCamera(this.mouse, this.camera);
+                    const intersects = this.raycaster.intersectObject(this.pointCloud);
+                    
+                    const hoverInfo = document.getElementById('hover-info');
+                    if (intersects.length > 0) {
+                        const idx = intersects[0].index;
+                        if (idx < this.pointCloudData.length) {
+                            const pt = this.pointCloudData[idx];
+                            hoverInfo.textContent = `u: ${pt.px} | v: ${pt.py} | d: ${pt.depth.toFixed(3)}m`;
+                            hoverInfo.style.left = (event.clientX + 15) + 'px';
+                            hoverInfo.style.top = (event.clientY + 15) + 'px';
+                            hoverInfo.classList.add('visible');
+                        }
+                    } else {
+                        hoverInfo.classList.remove('visible');
+                    }
+                }
+            }
+            
+            initEventListeners() {
+                window.addEventListener('resize', () => this.onWindowResize());
+                window.addEventListener('mousemove', (e) => this.onMouseMove(e));
+                
+                this.ui.connectBtn.addEventListener('click', () => {
+                    if (!this.enabled && !this.ws) {
+                        this.enabled = true;
+                        this.connect();
+                    } else {
+                        this.disconnect();
+                    }
+                });
+                
+                this.ui.resetBtn.addEventListener('click', () => this.resetTracking());
+                this.ui.resetViewBtn.addEventListener('click', () => this.resetView());
+                
+                this.ui.settingsBtn.addEventListener('click', () => {
+                    this.ui.settingsPanel.classList.toggle('visible');
+                    this.ui.settingsBtn.classList.toggle('active');
+                });
+                
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'r' || e.key === 'R') this.resetTracking();
+                    if (e.key === 'Escape') {
+                        this.ui.settingsPanel.classList.remove('visible');
+                        this.ui.settingsBtn.classList.remove('active');
+                    }
+                });
+                
+                // Settings listeners
+                this.ui.showTrajectories.addEventListener('change', () => {
+                    this.trajectories.forEach(t => t.visible = this.ui.showTrajectories.checked);
+                });
+                
+                this.ui.lineWidth.addEventListener('input', () => this.updateTrajectorySettings());
+                
+                // Point cloud settings
+                this.ui.showPointCloud.addEventListener('change', () => this.updatePointCloudSettings());
+                this.ui.pointSize.addEventListener('input', () => this.updatePointCloudSettings());
+                
+                // Frustum settings
+                this.ui.showFrustum.addEventListener('change', () => {
+                    if (this.cameraFrustum) this.cameraFrustum.visible = this.ui.showFrustum.checked;
+                });
+                this.ui.frustumSize.addEventListener('input', () => this.updateCameraFrustum());
+                
+                // Stale check
+                setInterval(() => {
+                    if (this.streaming && Date.now() - this.lastFrameTime > 5000) {
+                        console.log('Stream stale, reconnecting...');
+                        this.streaming = false;
+                        if (this.ws) this.ws.close();
+                    }
+                }, 1000);
+            }
+            
+            autoConnect() {
+                const pageHost = window.location.hostname || 'localhost';
+                this.ui.wsUrl.value = `ws://${pageHost}:8765`;
+                this.connect();
+            }
+            
+            connect() {
+                if (this.ws) {
+                    this.ws.close();
+                    this.ws = null;
+                }
+                
+                this.streaming = false;
+                this.updateUI();
+                
+                try {
+                    this.ws = new WebSocket(this.ui.wsUrl.value);
+                    
+                    this.ws.onopen = () => this.updateUI();
+                    
+                    this.ws.onclose = () => {
+                        this.ws = null;
+                        this.streaming = false;
+                        this.updateUI();
+                        
+                        if (this.enabled) {
+                            setTimeout(() => this.connect(), 2000);
+                        }
+                    };
+                    
+                    this.ws.onerror = (error) => console.error('WebSocket error:', error);
+                    
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'frame') {
+                                this.handleFrame(data);
+                            }
+                        } catch (e) {
+                            console.error('Error processing message:', e);
+                        }
+                    };
+                } catch (e) {
+                    if (this.enabled) {
+                        setTimeout(() => this.connect(), 2000);
+                    }
+                }
+            }
+            
+            disconnect() {
+                this.enabled = false;
+                this.streaming = false;
+                if (this.ws) {
+                    this.ws.close();
+                    this.ws = null;
+                }
+                this.updateUI();
+            }
+            
+            handleFrame(data) {
+                const now = Date.now();
+                this.lastFrameTime = now;
+                
+                if (!this.streaming) {
+                    this.streaming = true;
+                    this.updateUI();
+                }
+                
+                // Throttle heavy 3D updates
+                if (now - this.lastUpdateTime < this.minUpdateInterval) {
+                    return;  // Skip this frame
+                }
+                this.lastUpdateTime = now;
+                
+                // Update resolution
+                if (data.width && data.height) {
+                    this.imageWidth = data.width;
+                    this.imageHeight = data.height;
+                }
+                
+                // Update intrinsics if provided
+                if (data.intrinsics) {
+                    this.intrinsics = data.intrinsics;
+                }
+                
+                // Update point cloud from depth + RGB images (3D mode)
+                if (data.depth_image && data.frame) {
+                    this.updatePointCloudFromImages(
+                        data.depth_image,
+                        data.frame,
+                        data.depth_min || 0.1,
+                        data.depth_max || 2.5
+                    );
+                }
+                
+                // Update trajectories (3D mode data)
+                if (data.trajectories) {
+                    this.updateTrajectories(data.trajectories);
+                }
+                
+                // Update UI stats
+                this.ui.fpsDisplay.textContent = `FPS: ${data.fps || '--'}`;
+                this.ui.resDisplay.textContent = `${data.width || '--'} × ${data.height || '--'}`;
+                
+                const numPcPoints = this.pointCloudData ? this.pointCloudData.length : 0;
+                const numTrajPoints = data.trajectories ? 
+                    (data.trajectories.traj_x ? data.trajectories.traj_x.length : 0) : 0;
+                this.ui.pointsDisplay.textContent = `PC: ${numPcPoints} | Traj: ${numTrajPoints}`;
+            }
+            
+            getGradientColor(ratio) {
+                // Interpolate color from trajectory color stops (same as 2D mode)
+                const stops = this.trajectoryColorStops;
+                if (ratio <= 0) return new THREE.Color(stops[0][0]/255, stops[0][1]/255, stops[0][2]/255);
+                if (ratio >= 1) return new THREE.Color(stops[stops.length-1][0]/255, stops[stops.length-1][1]/255, stops[stops.length-1][2]/255);
+                
+                const n = stops.length - 1;
+                const scaled = ratio * n;
+                const idx = Math.min(Math.floor(scaled), n - 1);
+                const frac = scaled - idx;
+                
+                const c0 = stops[idx];
+                const c1 = stops[idx + 1];
+                return new THREE.Color(
+                    (c0[0] * (1 - frac) + c1[0] * frac) / 255,
+                    (c0[1] * (1 - frac) + c1[1] * frac) / 255,
+                    (c0[2] * (1 - frac) + c1[2] * frac) / 255
+                );
+            }
+            
+            updateTrajectories(trajData) {
+                // Clear all existing trajectory objects
+                this.trajectories.forEach(group => {
+                    group.children.forEach(child => {
+                        if (child.geometry) child.geometry.dispose();
+                        if (child.material) child.material.dispose();
+                    });
+                    this.scene.remove(group);
+                });
+                this.trajectories = [];
+                
+                if (!trajData || !trajData.traj_x || !trajData.traj_y) return;
+                
+                const now = Date.now() / 1000;  // seconds
+                
+                // Add current trajectory to history
+                this.trailHistory.push({
+                    timestamp: now,
+                    data: trajData
+                });
+                
+                // Prune old trails
+                this.trailHistory = this.trailHistory.filter(
+                    entry => (now - entry.timestamp) <= this.trailHistorySec
+                );
+                
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                const lineWidth = parseFloat(this.ui.lineWidth.value);
+                
+                // Draw all trails with fading opacity (oldest first)
+                for (const entry of this.trailHistory) {
+                    const age = now - entry.timestamp;
+                    // Alpha: 1.0 for newest, trailAlphaFloor for oldest
+                    const alpha = 1.0 - (age / this.trailHistorySec) * (1.0 - this.trailAlphaFloor);
+                    const opacity = Math.max(this.trailAlphaFloor, Math.min(1.0, alpha));
+                    
+                    this.drawTrajectorySet(entry.data, opacity, resolution, lineWidth);
+                }
+            }
+            
+            drawTrajectorySet(trajData, opacity, resolution, lineWidth) {
+                const trajX = trajData.traj_x;
+                const trajY = trajData.traj_y;
+                const trajZ = trajData.traj_z || null;
+                
+                const N = trajX.length;
+                const T = trajX[0] ? trajX[0].length : 0;
+                
+                if (N === 0 || T === 0) return;
+                
+                for (let i = 0; i < N; i++) {
+                    const group = new THREE.Group();
+                    
+                    // Build 3D positions from pixel coords + depth
+                    const positions = [];
+                    for (let t = 0; t < T; t++) {
+                        const px = trajX[i][t];
+                        const py = trajY[i][t];
+                        const depth = trajZ && trajZ[i] ? trajZ[i][t] : 1.0;
+                        
+                        const pos = this.unproject(px, py, depth);
+                        positions.push(pos.x, pos.y, pos.z);
+                    }
+                    
+                    // Create gradient line segments
+                    if (T >= 2) {
+                        for (let t = 0; t < T - 1; t++) {
+                            const segPositions = [
+                                positions[t * 3], positions[t * 3 + 1], positions[t * 3 + 2],
+                                positions[(t + 1) * 3], positions[(t + 1) * 3 + 1], positions[(t + 1) * 3 + 2]
+                            ];
+                            
+                            const lineGeometry = new THREE.LineGeometry();
+                            lineGeometry.setPositions(segPositions);
+                            
+                            const ratio = t / (T - 1);
+                            const segColor = this.getGradientColor(ratio);
+                            
+                            const lineMaterial = new THREE.LineMaterial({
+                                color: segColor,
+                                linewidth: lineWidth,
+                                resolution: resolution,
+                                transparent: true,
+                                opacity: opacity
+                            });
+                            
+                            const line = new THREE.Line2(lineGeometry, lineMaterial);
+                            group.add(line);
+                        }
+                    }
+                    
+                    group.visible = this.ui.showTrajectories.checked;
+                    this.scene.add(group);
+                    this.trajectories.push(group);
+                }
+            }
+            
+            unproject(px, py, depth) {
+                // Convert pixel coords + depth to 3D camera coordinates
+                // x = (px - cx) * depth / fx
+                // y = (py - cy) * depth / fy
+                // z = depth
+                const x = (px - this.intrinsics.cx) * depth / this.intrinsics.fx;
+                const y = (py - this.intrinsics.cy) * depth / this.intrinsics.fy;
+                const z = depth;
+                
+                // Flip Y and Z to match Three.js coordinate system
+                return new THREE.Vector3(x, -y, z);
+            }
+            
+            updateTrajectorySettings() {
+                const lineWidth = parseFloat(this.ui.lineWidth.value);
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                
+                this.trajectories.forEach(group => {
+                    group.children.forEach(child => {
+                        if (child.material && child.material.linewidth !== undefined) {
+                            child.material.linewidth = lineWidth;
+                            child.material.resolution = resolution;
+                            child.material.needsUpdate = true;
+                        }
+                    });
+                });
+            }
+            
+            resetTracking() {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({ command: 'reset' }));
+                }
+            }
+            
+            resetView() {
+                this.camera.position.set(0, 0, 0);
+                this.controls.target.set(0, 0, 1);
+                this.controls.update();
+            }
+            
+            updateUI() {
+                const connected = this.ws && this.ws.readyState === WebSocket.OPEN;
+                
+                if (this.streaming) {
+                    this.ui.statusDisplay.textContent = 'Streaming';
+                    this.ui.statusIndicator.classList.add('connected');
+                } else if (connected) {
+                    this.ui.statusDisplay.textContent = 'Waiting for frames...';
+                    this.ui.statusIndicator.classList.remove('connected');
+                } else if (this.enabled) {
+                    this.ui.statusDisplay.textContent = 'Connecting...';
+                    this.ui.statusIndicator.classList.remove('connected');
+                } else {
+                    this.ui.statusDisplay.textContent = 'Disconnected';
+                    this.ui.statusIndicator.classList.remove('connected');
+                }
+                
+                this.ui.connectBtn.textContent = (connected || this.enabled) ? 'Disconnect' : 'Connect';
+            }
+            
+            onWindowResize() {
+                this.camera.aspect = window.innerWidth / window.innerHeight;
+                this.camera.updateProjectionMatrix();
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                
+                // Update line resolutions
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                this.trajectories.forEach(group => {
+                    group.children.forEach(child => {
+                        if (child.material && child.material.resolution) {
+                            child.material.resolution.copy(resolution);
+                        }
+                    });
+                });
+                
+                this.updateBackgroundPlane();
+            }
+            
+            animate() {
+                requestAnimationFrame(() => this.animate());
+                this.controls.update();
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+        
+        // Initialize viewer
+        window.addEventListener('DOMContentLoaded', () => {
+            new Viewer3D();
+        });
+    </script>
+</body>
+</html>
+

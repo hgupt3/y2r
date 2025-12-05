@@ -2,7 +2,7 @@
 """
 Launch file for Real-Time Tracker System.
 
-Starts all nodes: Camera → Preprocessor → Perception → Predictor → Visualization
+Starts all nodes: Camera → Perception → Predictor → Visualization
 
 Usage:
     ros2 launch real_world_execution tracker_system.launch.py
@@ -47,29 +47,15 @@ def generate_launch_description():
         launch_arguments={
             'rgb_camera.color_profile': camera_profile,
             'depth_module.depth_profile': depth_profile,
+            'align_depth.enable': 'true',
         }.items()
     )
     
     # Get absolute paths to node scripts and config
     nodes_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'nodes'))
-    preprocessor_script = os.path.join(nodes_dir, 'preprocessor_node.py')
     visualization_script = os.path.join(nodes_dir, 'visualization_node.py')
     perception_script = os.path.join(nodes_dir, 'perception_node.py')
     predictor_script = os.path.join(nodes_dir, 'predictor_node.py')
-    
-    # Preprocessor Node
-    from launch.actions import ExecuteProcess
-    preprocessor_params = f'--ros-args -p crop_size:={config["preprocessor"]["crop_size"]}'
-    # Only add target_fps if not null
-    if config["preprocessor"]["target_fps"] is not None:
-        preprocessor_params += f' -p target_fps:={config["preprocessor"]["target_fps"]}'
-    
-    preprocessor_node = ExecuteProcess(
-        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {preprocessor_script} {preprocessor_params}'],
-        name='preprocessor_node',
-        output='screen',
-        shell=False
-    )
     
     # Visualization Node
     # trajectory_color_stops is a nested list which ROS2 command line can't handle,
@@ -85,12 +71,23 @@ def generate_launch_description():
     viz_params = {
         'visualization_node': {
             'ros__parameters': {
+                'mode': config["visualization"]["mode"],
+                'websocket_host': config["visualization"]["websocket_host"],
+                'websocket_port': config["visualization"]["websocket_port"],
                 'window_name': config["visualization"]["window_name"],
                 'display_scale': config["visualization"]["display_scale"],
                 'trail_history_sec': config["visualization"]["trail_history_sec"],
                 'trail_alpha_floor': config["visualization"]["trail_alpha_floor"],
                 'trajectory_color_stops': color_stops_flat,  # Flattened: [B,G,R,B,G,R,...]
                 'trajectory_line_thickness': config["visualization"]["trajectory_line_thickness"],
+                # Camera intrinsics for 3D mode
+                'fx': config["camera"]["fx"],
+                'fy': config["camera"]["fy"],
+                'cx': config["camera"]["cx"],
+                'cy': config["camera"]["cy"],
+                # Depth range (from predictor config)
+                'depth_min': config["predictor"]["depth_min"],
+                'depth_max': config["predictor"]["depth_max"],
             }
         }
     }
@@ -117,7 +114,7 @@ def generate_launch_description():
     predictor_node = None
     if config.get("predictor", {}).get("enabled", False):
         predictor_node = ExecuteProcess(
-            cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {predictor_script} --ros-args -p enabled:={config["predictor"]["enabled"]} -p train_config_path:={config["predictor"]["train_config_path"]} -p checkpoint_path:={config["predictor"]["checkpoint_path"]} -p device:={config["predictor"]["device"]}'],
+            cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {predictor_script} --ros-args -p enabled:={config["predictor"]["enabled"]} -p train_config_path:={config["predictor"]["train_config_path"]} -p checkpoint_path:={config["predictor"]["checkpoint_path"]} -p device:={config["predictor"]["device"]} -p depth_min:={config["predictor"]["depth_min"]} -p depth_max:={config["predictor"]["depth_max"]}'],
             name='predictor_node',
             output='screen',
             shell=False
@@ -126,7 +123,6 @@ def generate_launch_description():
     # Build launch description
     launch_list = [
         realsense_launch,
-        preprocessor_node,
         perception_node,
         visualization_node,
     ]

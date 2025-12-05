@@ -872,7 +872,7 @@ def main():
     print(f"Loaded normalization statistics from: {stats_path}")
     
     # Set device from config
-    device_str = getattr(cfg.training, 'device', 'cuda')
+        device_str = getattr(cfg.training, 'device', 'cuda')
     if 'cuda' in device_str and not torch.cuda.is_available():
         print("Warning: CUDA requested but not available, falling back to CPU")
         device_str = 'cpu'
@@ -892,11 +892,11 @@ def main():
     print(f"\nCleaning output directory: {output_path}")
     for ext in ['*.mp4', '*.html', '*.bin']:
         for file in output_path.glob(ext):
-            try:
-                file.unlink()
-                print(f"  Deleted: {file.name}")
-            except Exception as e:
-                print(f"  Warning: Could not delete {file.name}: {e}")
+        try:
+            file.unlink()
+            print(f"  Deleted: {file.name}")
+        except Exception as e:
+            print(f"  Warning: Could not delete {file.name}: {e}")
     
     # Create train/val split
     train_files, val_files = create_train_val_split(
@@ -924,8 +924,8 @@ def main():
         create_windowed_viz_html(output_path)
         
         video_list = []  # (name, split) pairs
-        
-        # Process train videos
+    
+    # Process train videos
         print("\nProcessing TRAIN videos")
         for idx, h5_file in enumerate(train_videos):
             video_name = f'train_{idx}_{model_type}_epoch{epoch}'
@@ -957,32 +957,32 @@ def main():
         
     else:
         # Generate 2D MP4 videos
-        print("\n" + "="*50)
+    print("\n" + "="*50)
         print("Processing TRAIN videos (2D)")
-        print("="*50)
-        train_errors = []
-        for idx, h5_file in enumerate(train_videos):
+    print("="*50)
+    train_errors = []
+    for idx, h5_file in enumerate(train_videos):
             mp4_path = output_path / f'train_{idx}_{model_type}_epoch{epoch}.mp4'
             error = generate_video_2d(model, h5_file, str(mp4_path), cfg, norm_stats, is_diffusion, device)
-            train_errors.append(error)
-        
-        print("\n" + "="*50)
+        train_errors.append(error)
+    
+    print("\n" + "="*50)
         print("Processing VALIDATION videos (2D)")
-        print("="*50)
-        val_errors = []
-        for idx, h5_file in enumerate(val_videos):
+    print("="*50)
+    val_errors = []
+    for idx, h5_file in enumerate(val_videos):
             mp4_path = output_path / f'val_{idx}_{model_type}_epoch{epoch}.mp4'
             error = generate_video_2d(model, h5_file, str(mp4_path), cfg, norm_stats, is_diffusion, device)
-            val_errors.append(error)
-        
-        print("\n" + "="*50)
+        val_errors.append(error)
+    
+    print("\n" + "="*50)
         print("SUMMARY - 2D Videos")
-        print("="*50)
-        print(f"Model: {model_type} (epoch {epoch})")
+    print("="*50)
+    print(f"Model: {model_type} (epoch {epoch})")
         print(f"Train videos: {len(train_videos)}")
-        print(f"  Avg error: {np.mean(train_errors):.4f}")
+    print(f"  Avg error: {np.mean(train_errors):.4f}")
         print(f"Val videos: {len(val_videos)}")
-        print(f"  Avg error: {np.mean(val_errors):.4f}")
+    print(f"  Avg error: {np.mean(val_errors):.4f}")
         print(f"\nVideos saved to: {output_path}")
 
 

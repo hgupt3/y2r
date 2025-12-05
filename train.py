@@ -263,8 +263,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         
         # Only step scheduler if optimizer actually stepped (scale didn't decrease)
         if new_scale >= old_scale:
-            scheduler.step()
-            ema_model.update_parameters(model)
+        scheduler.step()
+        ema_model.update_parameters(model)
         
         # Update progress bar
         pbar.set_postfix({'loss': f'{loss.item():.4f}', 'grad_norm': f'{grad_norm:.4f}'})
@@ -397,32 +397,32 @@ def main():
     # Create datasets based on split mode
     if split_mode == "episode":
         # Split by H5 files (episode-wise)
-        train_files, val_files = create_train_val_split(
-            cfg.dataset_dir,
+    train_files, val_files = create_train_val_split(
+        cfg.dataset_dir,
             val_ratio=val_split,
             seed=val_seed,
             split_mode="episode"
-        )
-        
-        train_dataset = TrackDataset(
-            h5_files=train_files,
-            img_size=cfg.dataset_cfg.img_size,
-            frame_stack=cfg.dataset_cfg.frame_stack,
-            num_track_ts=cfg.dataset_cfg.num_track_ts,
-            num_track_ids=cfg.dataset_cfg.num_track_ids,
-            downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
-            cache_all=cfg.dataset_cfg.cache_all,
-            cache_image=cfg.dataset_cfg.cache_image,
+    )
+    
+    train_dataset = TrackDataset(
+        h5_files=train_files,
+        img_size=cfg.dataset_cfg.img_size,
+        frame_stack=cfg.dataset_cfg.frame_stack,
+        num_track_ts=cfg.dataset_cfg.num_track_ts,
+        num_track_ids=cfg.dataset_cfg.num_track_ids,
+        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
+        cache_all=cfg.dataset_cfg.cache_all,
+        cache_image=cfg.dataset_cfg.cache_image,
             track_type=track_type,
-        )
-        
-        val_dataset = TrackDataset(
-            h5_files=val_files,
-            img_size=cfg.dataset_cfg.img_size,
-            frame_stack=cfg.dataset_cfg.frame_stack,
-            num_track_ts=cfg.dataset_cfg.num_track_ts,
-            num_track_ids=cfg.dataset_cfg.num_track_ids,
-            downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
+    )
+    
+    val_dataset = TrackDataset(
+        h5_files=val_files,
+        img_size=cfg.dataset_cfg.img_size,
+        frame_stack=cfg.dataset_cfg.frame_stack,
+        num_track_ts=cfg.dataset_cfg.num_track_ts,
+        num_track_ids=cfg.dataset_cfg.num_track_ids,
+        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
             cache_all=cfg.dataset_cfg.cache_all,
             cache_image=cfg.dataset_cfg.cache_image,
             track_type=track_type,
@@ -436,7 +436,7 @@ def main():
             num_track_ts=cfg.dataset_cfg.num_track_ts,
             num_track_ids=cfg.dataset_cfg.num_track_ids,
             downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
-            cache_all=cfg.dataset_cfg.cache_all,
+        cache_all=cfg.dataset_cfg.cache_all,
             cache_image=cfg.dataset_cfg.cache_image,
             track_type=track_type,
         )

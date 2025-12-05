@@ -1,0 +1,1 @@
+window.VIEWER_MODE = "3d";

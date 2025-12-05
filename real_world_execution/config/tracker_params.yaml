@@ -4,24 +4,31 @@
 camera:
   # Color camera (RGB)
   fps: 60
-  width: 424
-  height: 240
+  width: 640
+  height: 480
   
   # Depth camera (separate settings - depth sensor has different supported resolutions)
-  depth_fps: 90
-  depth_width: 256
-  depth_height: 144
-
-# Preprocessor settings
-preprocessor:
-  crop_size: 224      # Final output resolution (224x224)
-  target_fps: 0.0     # 0.0 or null = full throughput, or set to number to throttle
+  depth_fps: 60
+  depth_width: 640
+  depth_height: 480
+  
+  # Camera intrinsics (RealSense D435i @ 640x480)
+  fx: 615.0
+  fy: 615.0
+  cx: 320.0
+  cy: 240.0
 
 # Visualization settings
 visualization:
+  mode: "3d"  # "2d" or "3d"
+  
+  # WebSocket server settings
+  websocket_host: "0.0.0.0"
+  websocket_port: 8765
+  
+  # Display settings
   window_name: "Real-Time Tracker"
-  display_scale: 3  # Upscale 224x224 to 448x448 for visibility
-  show_fps: true
+  display_scale: 1  # Scale factor for display (1 = native camera resolution)
   trail_history_sec: 0.25  # Duration (seconds) of trajectory history to keep
   trail_alpha_floor: 0.2   # Minimum opacity for the oldest trail samples
   trajectory_color_stops:
@@ -56,7 +63,9 @@ perception:
 predictor:
   enabled: true
   train_config_path: "/home/harsh/sam/configs/train_direct.yaml"  # Path to training config YAML (contains model+dataset params)
-  checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-11-19_00-08-37/latest.pth"    # Path to model checkpoint (.pth file)
-  device: "cuda" 
+  checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-12-05_03-58-25/best.pth"    # Path to model checkpoint (.pth file)
+  device: "cuda"
+  depth_min: 0.15   # meters - clip depth before normalization
+  depth_max: 2.5   # meters - clip depth before normalization 
 
 

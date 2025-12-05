@@ -54,7 +54,7 @@ endif()
 add_library(tracker_interfaces::tracker_interfaces__rosidl_generator_py SHARED IMPORTED)
 
 set_target_properties(tracker_interfaces::tracker_interfaces__rosidl_generator_py PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "/home/harsh/miniconda3/envs/sam/lib/python3.10/site-packages/numpy/_core/include"
+  INTERFACE_INCLUDE_DIRECTORIES "/home/harsh/miniconda3/envs/sam/lib/python3.10/site-packages/numpy/core/include"
   INTERFACE_LINK_LIBRARIES "tracker_interfaces::tracker_interfaces__rosidl_generator_c;/home/harsh/miniconda3/envs/sam/lib/libpython3.10.so;tracker_interfaces::tracker_interfaces__rosidl_typesupport_c;std_msgs::std_msgs__rosidl_generator_py;builtin_interfaces::builtin_interfaces__rosidl_generator_py;geometry_msgs::geometry_msgs__rosidl_generator_py"
 )
 

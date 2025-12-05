@@ -117,10 +117,10 @@ class PerceptionNode(Node):
         # Load models
         self.load_models()
         
-        # Subscribe to preprocessed images
+        # Subscribe to raw camera images (full resolution)
         self.subscription = self.create_subscription(
             Image,
-            '/preprocessed_image',
+            '/camera/camera/color/image_raw',
             self.image_callback,
             1  # Small queue - always process latest frame
         )
@@ -573,8 +573,8 @@ class PerceptionNode(Node):
     
     def publish_contours(self, mask):
         """
-        Publish mask contours as Polygon message for visualization
-        Much more efficient than publishing full mask image (100s of points vs 50K pixels)
+        Publish mask contours as Polygon message for visualization.
+        Supports multiple disconnected contours, separated by NaN points.
         
         Args:
             mask: Binary mask (H, W) as boolean numpy array
@@ -592,18 +592,29 @@ class PerceptionNode(Node):
         if len(contours) == 0:
             return
         
-        # Use the largest contour
-        largest_contour = max(contours, key=cv2.contourArea)
-        
-        # Create Polygon message with contour points
+        # Create Polygon message with all contours, separated by NaN points
         polygon_msg = Polygon()
-        for point in largest_contour.squeeze():
-            # Point32 uses x, y, z (we set z=0)
-            p = Point32()
-            p.x = float(point[0])
-            p.y = float(point[1])
-            p.z = 0.0
-            polygon_msg.points.append(p)
+        
+        for idx, contour in enumerate(contours):
+            # Add separator between contours (NaN point)
+            if idx > 0:
+                sep = Point32()
+                sep.x = float('nan')
+                sep.y = float('nan')
+                sep.z = float('nan')
+                polygon_msg.points.append(sep)
+            
+            # Add contour points
+            points = contour.squeeze()
+            if len(points.shape) == 1:
+                # Single point contour, skip
+                continue
+            for point in points:
+                p = Point32()
+                p.x = float(point[0])
+                p.y = float(point[1])
+                p.z = 0.0
+                polygon_msg.points.append(p)
         
         self.contour_publisher.publish(polygon_msg)
     

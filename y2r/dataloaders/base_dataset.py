@@ -79,7 +79,7 @@ class SimpleBaseDataset(Dataset):
         self._index_to_local_frame = {}
         
         self.load_demo_info()
-        
+
         # Augmentor should be set up by subclass with config params
         self.augmentor = None
 

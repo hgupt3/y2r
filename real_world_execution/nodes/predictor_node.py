@@ -2,9 +2,9 @@
 """
 Predictor Node - IntentTracker Trajectory Prediction
 
-Subscribes to preprocessed images and query points, maintains frame buffer
-with temporal sampling, runs IntentTracker model inference, and publishes
-predicted trajectories.
+Subscribes to raw camera images (color + depth) and query points.
+Internally crops/resizes to model resolution, runs inference,
+and publishes predicted trajectories in camera resolution.
 """
 
 import os
@@ -15,8 +15,10 @@ import time
 import yaml
 import numpy as np
 import torch
-import torch.nn.functional as TF
-from torchvision import transforms
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from torch.amp import autocast
+import cv2
 
 # Ensure tracker_interfaces messages are discoverable
 REAL_WORLD_ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +29,6 @@ if CUSTOM_MSG_PATH.exists():
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Point
 from std_msgs.msg import Header
 from tracker_interfaces.msg import QueryPoints, PredictedTracks
 
@@ -36,7 +37,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from y2r.models.factory import create_model
-from y2r.visualization import denormalize_displacements
+from y2r.dataloaders.utils import NormalizationStats
 
 
 class PredictorNode(Node):
@@ -48,12 +49,16 @@ class PredictorNode(Node):
         self.declare_parameter('train_config_path', '')
         self.declare_parameter('checkpoint_path', '')
         self.declare_parameter('device', 'cuda')
+        self.declare_parameter('depth_min', 0.1)  # meters
+        self.declare_parameter('depth_max', 2.5)  # meters
         
         # Get parameters
         self.enabled = self.get_parameter('enabled').value
         train_config_path = self.get_parameter('train_config_path').value
         checkpoint_path = self.get_parameter('checkpoint_path').value
         self.device = self.get_parameter('device').value
+        self.depth_min = self.get_parameter('depth_min').value
+        self.depth_max = self.get_parameter('depth_max').value
         
         if not self.enabled:
             self.get_logger().info('Predictor Node disabled in config')
@@ -76,53 +81,93 @@ class PredictorNode(Node):
         self.model_type = getattr(self.train_cfg.model, 'model_type', 'direct')
         self.is_diffusion = (self.model_type == 'diffusion')
         
+        # Get track type (2d or 3d)
+        self.track_type = getattr(self.train_cfg.model, 'track_type', '2d')
+        self.is_3d = (self.track_type == '3d')
+        
+        # Get model resolution from config
+        model_res = getattr(self.train_cfg.model, 'model_resolution', [224, 224])
+        self.model_size = model_res[0]  # Assume square
+        
         # Get dataset FPS for frame sampling
-        # Note: This should match the FPS used during dataset creation (preprocess step)
-        # For your dataset, this was 12 FPS (from dataset_scripts/config.yaml)
-        self.dataset_fps = getattr(self.train_cfg.dataset_cfg, 'target_fps', 12.0)  # Default to 12 FPS if not in config
-        self.frame_dt = 1.0 / self.dataset_fps  # Time between frames in training data
+        self.dataset_fps = getattr(self.train_cfg.dataset_cfg, 'target_fps', 12.0)
+        self.frame_dt = 1.0 / self.dataset_fps
         
         self.get_logger().info(f'  Model type: {self.model_type}')
+        self.get_logger().info(f'  Track type: {self.track_type}')
+        self.get_logger().info(f'  Model resolution: {self.model_size}x{self.model_size}')
         self.get_logger().info(f'  Frame stack: {self.frame_stack}')
         self.get_logger().info(f'  Future steps: {self.num_future_steps}')
         self.get_logger().info(f'  Dataset FPS: {self.dataset_fps}')
         
-        # Load normalization stats
+        # Load normalization stats using NormalizationStats class
         stats_path = Path(self.train_cfg.dataset_dir) / 'normalization_stats.yaml'
-        self.disp_stats = self.load_normalization_stats(str(stats_path))
-        self.get_logger().info(f'  Disp mean: {self.disp_stats["displacement_mean"]}')
-        self.get_logger().info(f'  Disp std: {self.disp_stats["displacement_std"]}')
+        self.norm_stats = NormalizationStats(str(stats_path))
+        self.get_logger().info(f'  Loaded normalization stats from {stats_path}')
+        self.get_logger().info(f'  Disp mean: {self.norm_stats.disp_mean}')
+        self.get_logger().info(f'  Disp std: {self.norm_stats.disp_std}')
+        if self.is_3d:
+            self.get_logger().info(f'  Depth mean: {self.norm_stats.depth_mean}')
+            self.get_logger().info(f'  Depth std: {self.norm_stats.depth_std}')
+            self.get_logger().info(f'  Depth clipping: [{self.depth_min:.2f}, {self.depth_max:.2f}] meters')
         
         # Load model
         self.model = self.load_model(checkpoint_path)
         
-        # Frame buffer: store (timestamp, frame_array) tuples
+        # Frame buffer: store (timestamp, color_frame, depth_frame) tuples
         self.buffer_duration = (self.frame_stack - 1) * self.frame_dt
-        # Worst case: 60 FPS * 0.083s buffer = ~5 frames needed, use 100 as safety cap
         self.frame_buffer = deque(maxlen=100)
         self.get_logger().info(f'  Frame buffer duration: {self.buffer_duration:.3f}s')
         
-        # Latest query points
+        # Camera resolution (will be set on first frame)
+        self.cam_width = None
+        self.cam_height = None
+        
+        # Crop parameters (computed on first frame)
+        self.crop_size = None
+        self.crop_x = None
+        self.crop_y = None
+        self.scale = None
+        
+        # Latest query points (in normalized [0,1] camera space)
         self.latest_query_points = None
         self.query_lock = False
-        
-        # ImageNet normalization transform
-        self.normalize_transform = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
         
         # FPS tracking
         self.fps_start_time = time.time()
         self.process_count = 0
         
-        # Subscribe to preprocessed images
-        self.image_subscription = self.create_subscription(
+        # Pre-compute Gaussian kernel for GPU-based depth fill
+        self.blur_kernel_size = 51
+        self.blur_kernel = self._create_gaussian_kernel(self.blur_kernel_size).to(self.device)
+        
+        # Pre-cache ImageNet normalization tensors on GPU (must be float32!)
+        self.imagenet_mean = torch.as_tensor(self.norm_stats.imagenet_mean, dtype=torch.float32).view(1, 3, 1, 1).to(self.device)
+        self.imagenet_std = torch.as_tensor(self.norm_stats.imagenet_std, dtype=torch.float32).view(1, 3, 1, 1).to(self.device)
+        
+        # Setup subscriptions based on track type
+        # Latest depth frame (for 3D mode)
+        self.latest_depth = None
+        
+        # Subscribe to color
+        self.color_sub = self.create_subscription(
             Image,
-            '/preprocessed_image',
-            self.image_callback,
-            1  # Small queue for freshest frames
+            '/camera/camera/color/image_raw',
+            self.color_callback,
+            1
         )
+        
+        # Subscribe to depth if 3D
+        if self.is_3d:
+            self.depth_sub = self.create_subscription(
+                Image,
+                '/camera/camera/aligned_depth_to_color/image_raw',
+                self.depth_callback,
+                1
+            )
+            self.get_logger().info('  Subscribed to color + depth')
+        else:
+            self.get_logger().info('  Subscribed to color only (2D mode)')
         
         # Subscribe to query points from perception
         self.query_subscription = self.create_subscription(
@@ -175,19 +220,18 @@ class PredictorNode(Node):
         
         return Namespace(cfg)
     
-    def load_normalization_stats(self, stats_path):
-        """Load displacement normalization statistics"""
-        with open(stats_path, 'r') as f:
-            stats = yaml.safe_load(f)
-        return stats
-    
     def load_model(self, checkpoint_path):
         """Load trained model from checkpoint"""
         self.get_logger().info(f'Loading model from: {checkpoint_path}')
         
-        # Create model (from_pretrained=False skips torch.hub.load for ViT)
+        # Create model
         device = torch.device(self.device)
-        model = create_model(self.train_cfg, disp_stats=self.disp_stats, device=device, from_pretrained=False)
+        # Extract disp_stats for model creation (only needed for diffusion model)
+        disp_stats = {
+            'displacement_mean': self.norm_stats.disp_mean.tolist(),
+            'displacement_std': self.norm_stats.disp_std.tolist(),
+        }
+        model = create_model(self.train_cfg, disp_stats=disp_stats, device=device, from_pretrained=False)
         
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -210,170 +254,357 @@ class PredictorNode(Node):
         
         return model
     
-    def image_callback(self, msg):
-        """Store incoming frames in buffer with timestamps"""
+    def compute_crop_params(self, width, height):
+        """Compute center crop parameters for given camera resolution."""
+        self.cam_width = width
+        self.cam_height = height
+        
+        # Center crop to square
+        self.crop_size = min(width, height)
+        self.crop_x = (width - self.crop_size) // 2
+        self.crop_y = (height - self.crop_size) // 2
+        
+        # Scale from crop to model resolution
+        self.scale = self.model_size / self.crop_size
+        
+        self.get_logger().info(f'  Camera resolution: {width}x{height}')
+        self.get_logger().info(f'  Center crop: {self.crop_size}x{self.crop_size} at ({self.crop_x}, {self.crop_y})')
+        self.get_logger().info(f'  Scale factor: {self.scale:.4f}')
+    
+    def center_crop_resize(self, img):
+        """Apply center crop and resize to model resolution."""
+        # Center crop to square
+        cropped = img[self.crop_y:self.crop_y+self.crop_size, 
+                      self.crop_x:self.crop_x+self.crop_size]
+        # Resize to model resolution
+        resized = cv2.resize(cropped, (self.model_size, self.model_size))
+        return resized
+    
+    def _create_gaussian_kernel(self, kernel_size, sigma=None):
+        """Create a Gaussian kernel for GPU convolution."""
+        if sigma is None:
+            sigma = kernel_size / 6.0
+        
+        # Create 1D Gaussian
+        x = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        gauss_1d = torch.exp(-x**2 / (2 * sigma**2))
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        
+        # Create 2D kernel via outer product
+        gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)
+        
+        # Shape for conv2d: (out_channels, in_channels, H, W)
+        return gauss_2d.unsqueeze(0).unsqueeze(0)
+    
+    def _gpu_blur_fill(self, depth_tensor):
+        """
+        Fill invalid depth using GPU-based Gaussian blur.
+        
+        Args:
+            depth_tensor: (T, H, W) tensor on GPU, in meters
+            
+        Returns:
+            Filled depth tensor (T, H, W)
+        """
+        # Mark invalid pixels
+        invalid = (depth_tensor <= 0) | (depth_tensor < self.depth_min)
+        
+        if not invalid.any():
+            return depth_tensor
+        
+        # Set invalid to 0 for blur
+        depth_for_blur = depth_tensor.clone()
+        depth_for_blur[invalid] = 0
+        
+        # Create valid mask (1 where valid, 0 where invalid)
+        valid_mask = (~invalid).float()
+        
+        # Add batch and channel dims for conv2d: (T, H, W) -> (T, 1, H, W)
+        depth_4d = depth_for_blur.unsqueeze(1)
+        mask_4d = valid_mask.unsqueeze(1)
+        
+        # Apply Gaussian blur (padding to keep same size)
+        pad = self.blur_kernel_size // 2
+        blurred = F.conv2d(depth_4d, self.blur_kernel, padding=pad)
+        blurred_mask = F.conv2d(mask_4d, self.blur_kernel, padding=pad)
+        
+        # Normalize by valid neighbor count
+        blurred_mask = blurred_mask.clamp(min=1e-6)
+        filled = (blurred / blurred_mask).squeeze(1)  # (T, H, W)
+        
+        # Replace only invalid pixels
+        result = depth_tensor.clone()
+        result[invalid] = filled[invalid]
+        
+        return result
+    
+    def cam_to_model_coords(self, points_norm):
+        """
+        Transform normalized [0,1] camera coords to normalized [0,1] model coords.
+        
+        Args:
+            points_norm: (N, 2) array of normalized [0,1] coords in camera space
+            
+        Returns:
+            (N, 2) array of normalized [0,1] coords in model space
+        """
+        # Convert to camera pixels
+        cam_x = points_norm[:, 0] * self.cam_width
+        cam_y = points_norm[:, 1] * self.cam_height
+        
+        # Apply crop offset and scale to get model pixels
+        model_px_x = (cam_x - self.crop_x) * self.scale
+        model_px_y = (cam_y - self.crop_y) * self.scale
+        
+        # Normalize to [0, 1] in model space
+        model_x = model_px_x / self.model_size
+        model_y = model_px_y / self.model_size
+        
+        # Clip to valid [0, 1] range
+        model_x = np.clip(model_x, 0, 1)
+        model_y = np.clip(model_y, 0, 1)
+        
+        return np.stack([model_x, model_y], axis=1)
+    
+    def model_to_cam_coords(self, points_model_norm):
+        """
+        Transform normalized [0,1] model x,y coords back to camera pixel coords.
+        
+        Args:
+            points_model_norm: (N, T, 2) tensor of normalized model coords (x,y only)
+            
+        Returns:
+            (N, T, 2) tensor in camera pixel coords
+        """
+        # Convert normalized to model pixels, then inverse transform to camera pixels
+        model_px_x = points_model_norm[..., 0] * self.model_size
+        model_px_y = points_model_norm[..., 1] * self.model_size
+        
+        # Inverse scale and add crop offset
+        cam_x = (model_px_x / self.scale) + self.crop_x
+        cam_y = (model_px_y / self.scale) + self.crop_y
+        
+        return torch.stack([cam_x, cam_y], dim=-1)
+    
+    def depth_callback(self, msg):
+        """Store latest depth frame."""
+        height, width = msg.height, msg.width
+        depth_array = np.frombuffer(msg.data, dtype=np.uint16)
+        self.latest_depth = depth_array.reshape((height, width))
+    
+    def color_callback(self, msg):
+        """Handle color frames - main processing loop."""
         current_time = time.time()
         
-        # Convert ROS Image to numpy
         height, width = msg.height, msg.width
         img_array = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = img_array.reshape((height, width, 3))
+        color_frame = img_array.reshape((height, width, 3))
+        
+        # Compute crop params on first frame
+        if self.cam_width is None:
+            self.compute_crop_params(width, height)
+        
+        # Get depth (use latest if 3D mode)
+        depth_frame = self.latest_depth if self.is_3d else None
         
         # Add to buffer
-        self.frame_buffer.append((current_time, frame))
+        self.frame_buffer.append((current_time, color_frame, depth_frame))
         
-        # Remove old frames outside buffer duration
-        cutoff_time = current_time - self.buffer_duration - 0.1  # Small margin
+        # Remove old frames
+        cutoff_time = current_time - self.buffer_duration - 0.1
         while self.frame_buffer and self.frame_buffer[0][0] < cutoff_time:
             self.frame_buffer.popleft()
         
-        # Try to predict if we have enough frames and query points
+        # Try to predict
         if len(self.frame_buffer) >= self.frame_stack and self.latest_query_points is not None:
             self.predict_trajectories()
     
     def query_callback(self, msg):
-        """Update latest query points from QueryPoints message"""
+        """Update latest query points from QueryPoints message."""
         if not self.query_lock:
             self.query_lock = True
             try:
-                # Parse QueryPoints custom message: geometry_msgs/Point[] points
-                # Each point has x, y, z (we only use x, y which are normalized [0, 1])
                 query_points = []
                 for point in msg.points:
                     query_points.append([point.x, point.y])
                 
                 if len(query_points) > 0:
-                    self.latest_query_points = query_points
+                    self.latest_query_points = np.array(query_points, dtype=np.float32)
             except Exception as e:
                 self.get_logger().error(f'Error parsing query points: {e}')
             finally:
                 self.query_lock = False
     
-    def publish_predictions(self, query_coords, pred_tracks):
-        """Publish predicted trajectories"""
-        msg = PredictedTracks()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        
-        # query_coords: (N, 2) tensor
-        # pred_tracks: (N, T, 2) tensor
-        N, T, _ = pred_tracks.shape
-        
-        # Convert to lists
-        for i in range(N):
-            p = Point()
-            p.x = float(query_coords[i, 0])
-            p.y = float(query_coords[i, 1])
-            p.z = 0.0
-            msg.query_points.append(p)
-            
-            for t in range(T):
-                msg.trajectory_x.append(float(pred_tracks[i, t, 0]))
-                msg.trajectory_y.append(float(pred_tracks[i, t, 1]))
-        
-        msg.num_points = N
-        msg.num_timesteps = T
-        
-        self.track_publisher.publish(msg)
-    
     def sample_frames_at_intervals(self):
         """
         Sample frame_stack frames from buffer at correct temporal intervals.
-        Uses closest-time matching to get evenly spaced samples.
         
         Returns:
-            list of numpy arrays or None if not enough frames
+            (color_frames, depth_frames) or None if not enough frames
+            depth_frames is None for 2D mode
         """
         if len(self.frame_buffer) < self.frame_stack:
-            return None
+            return None, None
         
-        # Target times: current, current - dt, current - 2*dt, ..., current - (frame_stack-1)*dt
         current_time = self.frame_buffer[-1][0]
         target_times = [current_time - i * self.frame_dt for i in range(self.frame_stack)]
-        target_times = target_times[::-1]  # Reverse to get [oldest, ..., newest]
+        target_times = target_times[::-1]  # oldest to newest
         
-        # Find closest frame for each target time
-        sampled_frames = []
+        color_frames = []
+        depth_frames = [] if self.is_3d else None
+        
         for target_t in target_times:
-            # Find frame with minimum time difference
-            closest_frame = min(self.frame_buffer, key=lambda x: abs(x[0] - target_t))
-            sampled_frames.append(closest_frame[1])
+            closest = min(self.frame_buffer, key=lambda x: abs(x[0] - target_t))
+            color_frames.append(closest[1])
+            if self.is_3d:
+                depth_frames.append(closest[2])
         
-        return sampled_frames
+        return color_frames, depth_frames
     
-    def preprocess_frames(self, frames_list):
+    def preprocess_frames(self, color_frames, depth_frames):
         """
         Preprocess frames for model input.
         
         Args:
-            frames_list: list of numpy arrays (224, 224, 3) uint8 [0-255]
+            color_frames: list of numpy arrays (H, W, 3) uint8
+            depth_frames: list of numpy arrays (H, W) uint16, or None for 2D
             
         Returns:
-            torch tensor (1, frame_stack, 3, 224, 224) float32, ImageNet normalized
+            frames: (1, T, 3, model_size, model_size) ImageNet normalized
+            depth: (1, T, 1, model_size, model_size) normalized, or None
         """
-        # Stack frames and normalize to [0, 1]
-        frames = np.stack(frames_list) / 255.0  # (T, H, W, 3)
-        frames = torch.from_numpy(frames).float()
+        t0 = time.time()
+        
+        # Process color frames - crop/resize on CPU, then move to GPU for normalization
+        processed_colors = []
+        for frame in color_frames:
+            cropped = self.center_crop_resize(frame)
+            processed_colors.append(cropped)
+        
+        # Stack and move to GPU, then normalize there (much faster)
+        frames = np.stack(processed_colors).astype(np.float32) / 255.0  # (T, H, W, 3) float32
+        frames = torch.from_numpy(frames).to(self.device)
         frames = frames.permute(0, 3, 1, 2)  # (T, 3, H, W)
         
-        # Apply ImageNet normalization
-        frames = self.normalize_transform(frames)
+        # ImageNet normalization on GPU using cached tensors
+        frames = (frames - self.imagenet_mean) / self.imagenet_std
         
-        return frames.unsqueeze(0)  # (1, T, 3, H, W)
+        frames = frames.unsqueeze(0)  # (1, T, 3, H, W)
+        
+        # Process depth if 3D
+        depth = None
+        if self.is_3d and depth_frames is not None:
+            processed_depths = []
+            for d in depth_frames:
+                cropped = self.center_crop_resize(d)
+                processed_depths.append(cropped)
+            
+            # Stack and convert to meters (RealSense gives mm)
+            depth_np = np.stack(processed_depths).astype(np.float32) / 1000.0  # (T, H, W) in meters
+            depth = torch.from_numpy(depth_np).float().to(self.device)
+            
+            # Fill invalid depth using GPU-based blur
+            depth = self._gpu_blur_fill(depth)
+            
+            # Clip depth to valid range before normalization
+            depth = depth.clamp(self.depth_min, self.depth_max)
+            
+            # Normalize depth
+            depth = self.norm_stats.normalize_depth_torch(depth)
+            
+            depth = depth.unsqueeze(0).unsqueeze(2)  # (1, T, 1, H, W)
+        
+        return frames, depth
+    
+    def sample_depth_at_points(self, depth_tensor, query_points_norm):
+        """
+        Sample depth values at query point locations from processed depth.
+        
+        Args:
+            depth_tensor: (1, T, 1, H, W) normalized depth tensor (use latest frame)
+            query_points_norm: (N, 2) normalized [0,1] model coords
+            
+        Returns:
+            (N,) tensor of normalized depth values
+        """
+        # Use the latest depth frame: (1, T, 1, H, W) -> (H, W)
+        depth_map = depth_tensor[0, -1, 0]  # Latest frame
+        
+        # Convert normalized coords to pixel coords for sampling
+        x = (query_points_norm[:, 0] * self.model_size).long().clamp(0, self.model_size - 1)
+        y = (query_points_norm[:, 1] * self.model_size).long().clamp(0, self.model_size - 1)
+        
+        sampled_depth = depth_map[y, x]
+        return sampled_depth
     
     def predict_trajectories(self):
-        """Run model inference and publish predictions"""
+        """Run model inference and publish predictions."""
         try:
             total_start = time.time()
             
-            # Sample frames at correct temporal spacing
-            sample_start = time.time()
-            frames_list = self.sample_frames_at_intervals()
-            if frames_list is None:
-                return  # Not enough frames yet
-            sample_time = (time.time() - sample_start) * 1000
+            # Sample frames
+            color_frames, depth_frames = self.sample_frames_at_intervals()
+            if color_frames is None:
+                return
             
             # Preprocess frames
-            preproc_start = time.time()
-            frames = self.preprocess_frames(frames_list)
+            frames, depth = self.preprocess_frames(color_frames, depth_frames)
             frames = frames.to(self.device)
-            preproc_time = (time.time() - preproc_start) * 1000
+            if depth is not None:
+                depth = depth.to(self.device)
             
-            # Get query coordinates
+            # Get query coordinates and transform to model space
             if self.latest_query_points is None:
                 return
             
-            query_coords = torch.tensor(self.latest_query_points, dtype=torch.float32).unsqueeze(0)
-            query_coords = query_coords.to(self.device)
+            query_model = self.cam_to_model_coords(self.latest_query_points)  # (N, 2)
+            
+            # For 3D, add depth as z coordinate (already normalized)
+            query_model_t = torch.tensor(query_model, dtype=torch.float32).to(self.device)
+            if self.is_3d and depth is not None:
+                query_depth = self.sample_depth_at_points(depth, query_model_t)  # Already normalized
+                query_coords = torch.cat([query_model_t, query_depth.unsqueeze(1)], dim=1)  # (N, 3)
+            else:
+                query_coords = query_model_t  # (N, 2)
+            
+            query_coords = query_coords.unsqueeze(0)  # (1, N, coord_dim)
             
             # Run inference
             infer_start = time.time()
-            with torch.no_grad():
+            with torch.no_grad(), autocast(device_type='cuda', enabled=True):
                 if self.is_diffusion:
                     num_inference_steps = getattr(self.train_cfg.model, 'num_inference_steps', 10)
-                    pred_disp = self.model.predict(frames, query_coords, num_inference_steps=num_inference_steps)
+                    pred_disp = self.model.predict(frames, query_coords, depth=depth, num_inference_steps=num_inference_steps)
                 else:
-                    pred_disp = self.model.predict(frames, query_coords)
+                    pred_disp = self.model.predict(frames, query_coords, depth=depth)
             infer_time = (time.time() - infer_start) * 1000
             
-            # Denormalize displacements
-            denorm_start = time.time()
-            mean = np.array(self.disp_stats['displacement_mean'])
-            std = np.array(self.disp_stats['displacement_std'])
-            pred_disp_denorm = denormalize_displacements(pred_disp[0], mean, std)
+            # Denormalize displacements to get real changes
+            pred_disp_denorm = self.norm_stats.denormalize_displacement_torch(pred_disp[0])
             
-            # Convert displacements to absolute positions
-            pred_tracks = query_coords[0].unsqueeze(1) + pred_disp_denorm  # (N, T, 2)
-            denorm_time = (time.time() - denorm_start) * 1000
+            # Denormalize query coords z if 3D (x,y are already in [0,1])
+            query_xy = query_coords[0, :, :2]  # (N, 2) in [0,1]
+            if self.is_3d and query_coords.shape[-1] == 3:
+                query_z_denorm = self.norm_stats.denormalize_depth_torch(query_coords[0, :, 2])  # (N,) in meters
             
-            # Publish predictions
-            pub_start = time.time()
-            self.publish_predictions(query_coords[0], pred_tracks)
-            pub_time = (time.time() - pub_start) * 1000
+            # Compute absolute positions in real space
+            # x,y: [0,1] + small_diff ≈ [0,1]
+            # z: meters + meters = meters
+            pred_xy = query_xy.unsqueeze(1) + pred_disp_denorm[..., :2]  # (N, T, 2)
+            
+            pred_z = None
+            if self.is_3d and pred_disp_denorm.shape[-1] == 3:
+                pred_z = query_z_denorm.unsqueeze(1) + pred_disp_denorm[..., 2]  # (N, T) in meters
+            
+            # Transform x,y back to camera pixel coords
+            pred_tracks_cam = self.model_to_cam_coords(pred_xy)
             
             total_time = (time.time() - total_start) * 1000
             
-            # Store timing for FPS display (no per-frame logging spam)
+            # Publish predictions
+            self.publish_predictions(pred_tracks_cam, pred_z)
+            
+            # Store timing
             self._last_infer_time = infer_time
             self._last_total_time = total_time
             
@@ -382,10 +613,7 @@ class PredictorNode(Node):
             elapsed = time.time() - self.fps_start_time
             if elapsed > 2.0:
                 fps = self.process_count / elapsed
-                # Combined FPS + timing stats on one line (like perception node)
-                avg_infer = getattr(self, '_last_infer_time', 0)
-                avg_total = getattr(self, '_last_total_time', 0)
-                self.get_logger().info(f'FPS: {fps:.1f} | Avg: infer={avg_infer:.1f}ms total={avg_total:.1f}ms')
+                self.get_logger().info(f'FPS: {fps:.1f} | infer={self._last_infer_time:.1f}ms total={self._last_total_time:.1f}ms')
                 self.process_count = 0
                 self.fps_start_time = time.time()
         
@@ -393,6 +621,28 @@ class PredictorNode(Node):
             self.get_logger().error(f'Error predicting trajectories: {e}')
             import traceback
             self.get_logger().error(traceback.format_exc())
+    
+    def publish_predictions(self, pred_tracks, pred_z=None):
+        """Publish predicted trajectories in camera pixel coords."""
+        msg = PredictedTracks()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        
+        # pred_tracks: (N, T, 2) tensor in camera pixels
+        # pred_z: (N, T) tensor of denormalized depth values, or None
+        N, T, _ = pred_tracks.shape
+        
+        for i in range(N):
+            for t in range(T):
+                msg.trajectory_x.append(float(pred_tracks[i, t, 0]))
+                msg.trajectory_y.append(float(pred_tracks[i, t, 1]))
+                if pred_z is not None:
+                    msg.trajectory_z.append(float(pred_z[i, t]))
+        
+        msg.num_points = N
+        msg.num_timesteps = T
+        
+        self.track_publisher.publish(msg)
 
 
 def main(args=None):

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Tracker Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #0a0a0f;
+            color: #e0e0e0;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 400;
+            margin-bottom: 20px;
+            color: #8b5cf6;
+            letter-spacing: 0.05em;
+        }
+        
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+        
+        .video-container {
+            position: relative;
+            background: #111118;
+            border: 1px solid #2a2a3a;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+        }
+        
+        #stream {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+        
+        .overlay {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .stat {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            backdrop-filter: blur(4px);
+        }
+        
+        .stat.fps {
+            color: #22c55e;
+        }
+        
+        .stat.resolution {
+            color: #8b5cf6;
+        }
+        
+        .stat.status {
+            color: #f59e0b;
+        }
+        
+        .status-indicator {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ef4444;
+            box-shadow: 0 0 8px #ef4444;
+            transition: all 0.3s ease;
+        }
+        
+        .status-indicator.connected {
+            background: #22c55e;
+            box-shadow: 0 0 8px #22c55e;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 12px;
+        }
+        
+        button {
+            background: #1e1e2e;
+            color: #e0e0e0;
+            border: 1px solid #3a3a4a;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+        }
+        
+        button:hover {
+            background: #2a2a3e;
+            border-color: #8b5cf6;
+        }
+        
+        button:active {
+            transform: scale(0.98);
+        }
+        
+        .connection-form {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        
+        input {
+            background: #1e1e2e;
+            color: #e0e0e0;
+            border: 1px solid #3a3a4a;
+            padding: 10px 14px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 0.9rem;
+            width: 280px;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #8b5cf6;
+        }
+        
+        .placeholder {
+            width: 640px;
+            height: 480px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #4a4a5a;
+            font-size: 1.1rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>REAL-TIME TRACKER</h1>
+    
+    <div class="connection-form">
+        <input type="text" id="wsUrl" placeholder="WebSocket URL">
+        <button id="connectBtn">Connect</button>
+    </div>
+    
+    <div class="container">
+        <div class="video-container">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <div class="overlay">
+                <div class="stat fps" id="fpsDisplay">FPS: --</div>
+                <div class="stat resolution" id="resDisplay">-- × --</div>
+                <div class="stat status" id="statusDisplay">Disconnected</div>
+            </div>
+            <img id="stream" alt="Video Stream">
+            <div class="placeholder" id="placeholder">Waiting for connection...</div>
+        </div>
+        
+        <div class="controls">
+            <button id="resetBtn">Reset Tracking (R)</button>
+        </div>
+    </div>
+    
+    <script>
+        // DOM Elements
+        const streamImg = document.getElementById('stream');
+        const placeholder = document.getElementById('placeholder');
+        const fpsDisplay = document.getElementById('fpsDisplay');
+        const resDisplay = document.getElementById('resDisplay');
+        const statusDisplay = document.getElementById('statusDisplay');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const wsUrlInput = document.getElementById('wsUrl');
+        const connectBtn = document.getElementById('connectBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        
+        // Configuration
+        const RECONNECT_DELAY = 2000;
+        const STALE_TIMEOUT = 5000;
+        
+        // State
+        let ws = null;
+        let enabled = true;
+        let streaming = false;
+        let lastFrameTime = 0;
+        
+        function updateUI() {
+            const connected = ws && ws.readyState === WebSocket.OPEN;
+            
+            if (streaming) {
+                statusDisplay.textContent = 'Streaming';
+                statusIndicator.classList.add('connected');
+                placeholder.style.display = 'none';
+                streamImg.style.display = 'block';
+            } else if (connected) {
+                statusDisplay.textContent = 'Waiting for frames...';
+                statusIndicator.classList.remove('connected');
+                placeholder.style.display = 'flex';
+                placeholder.textContent = 'Waiting for frames...';
+                streamImg.style.display = 'none';
+                fpsDisplay.textContent = 'FPS: --';
+            } else if (enabled) {
+                statusDisplay.textContent = 'Connecting...';
+                statusIndicator.classList.remove('connected');
+                placeholder.style.display = 'flex';
+                placeholder.textContent = 'Connecting...';
+                streamImg.style.display = 'none';
+                fpsDisplay.textContent = 'FPS: --';
+                resDisplay.textContent = '-- × --';
+            } else {
+                statusDisplay.textContent = 'Disconnected';
+                statusIndicator.classList.remove('connected');
+                placeholder.style.display = 'flex';
+                placeholder.textContent = 'Click Connect to start';
+                streamImg.style.display = 'none';
+                fpsDisplay.textContent = 'FPS: --';
+                resDisplay.textContent = '-- × --';
+            }
+            
+            connectBtn.textContent = (connected || enabled) ? 'Disconnect' : 'Connect';
+        }
+        
+        function connect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            streaming = false;
+            updateUI();
+            
+            try {
+                ws = new WebSocket(wsUrlInput.value);
+                
+                ws.onopen = () => updateUI();
+                
+                ws.onclose = (event) => {
+                    console.log('WebSocket closed:', event.code, event.reason);
+                    ws = null;
+                    streaming = false;
+                    updateUI();
+                    
+                    if (enabled) {
+                        setTimeout(connect, RECONNECT_DELAY);
+                    }
+                };
+                
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                };
+                
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'frame') {
+                            lastFrameTime = Date.now();
+                            
+                            if (!streaming) {
+                                streaming = true;
+                                updateUI();
+                            }
+                            
+                            streamImg.src = 'data:image/jpeg;base64,' + data.frame;
+                            fpsDisplay.textContent = `FPS: ${data.fps}`;
+                            resDisplay.textContent = `${data.width} × ${data.height}`;
+                        }
+                    } catch (e) {}
+                };
+                
+            } catch (e) {
+                if (enabled) {
+                    setTimeout(connect, RECONNECT_DELAY);
+                }
+            }
+        }
+        
+        function disconnect() {
+            enabled = false;
+            streaming = false;
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            updateUI();
+        }
+        
+        // Stale check - reconnect if no frames for too long
+        setInterval(() => {
+            if (streaming && Date.now() - lastFrameTime > STALE_TIMEOUT) {
+                console.log('Stream stale, reconnecting...');
+                streaming = false;
+                if (ws) ws.close();
+            }
+        }, 1000);
+        
+        function resetTracking() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ command: 'reset' }));
+            }
+        }
+        
+        // Event listeners
+        connectBtn.addEventListener('click', () => {
+            if (!enabled && !ws) {
+                enabled = true;
+                connect();
+            } else {
+                disconnect();
+            }
+        });
+        
+        resetBtn.addEventListener('click', resetTracking);
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'r' || e.key === 'R') resetTracking();
+        });
+        
+        // Auto-detect WebSocket URL from page host
+        // If page is served from 192.168.x.x, use that IP for WebSocket too
+        const pageHost = window.location.hostname || 'localhost';
+        wsUrlInput.value = `ws://${pageHost}:8765`;
+        
+        // Auto-connect on load
+        streamImg.style.display = 'none';
+        connect();
+    </script>
+</body>
+</html>
+
