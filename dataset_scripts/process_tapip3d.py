@@ -47,12 +47,14 @@ def load_config(config_path="config.yaml"):
     return config
 
 
-def load_vipe_data(npz_path: Path):
+def load_vipe_data(npz_path: Path, frames_dir: Path):
     """
     Load ViPE output data from .npz file.
+    RGB frames loaded from frames_dir instead of npz.
     
     Args:
         npz_path: Path to ViPE .npz file
+        frames_dir: Path to frames directory for this video
     
     Returns:
         video: (T, H, W, 3) uint8 RGB frames
@@ -61,12 +63,29 @@ def load_vipe_data(npz_path: Path):
         extrinsics: (T, 4, 4) float32 world2cam matrices
     """
     data = np.load(npz_path)
-    video = data['video']  # (T, H, W, 3) uint8
-    depths = data['depths']  # (T, H, W) float32
-    intrinsics = data['intrinsics']  # (T, 3, 3) float32
-    extrinsics = data['extrinsics']  # (T, 4, 4) float32
+    
+    # Load RGB from frames directory
+    video = load_frames_from_directory(frames_dir)
+    
+    # Convert depth from float16 to float32
+    depths = data['depths'].astype(np.float32)
+    intrinsics = data['intrinsics']
+    extrinsics = data['extrinsics']
     
     return video, depths, intrinsics, extrinsics
+
+
+def load_frames_from_directory(frames_dir: Path) -> np.ndarray:
+    """Load PNG frames into (T, H, W, 3) uint8 array."""
+    frame_files = sorted(frames_dir.glob("*.png"))
+    if len(frame_files) == 0:
+        raise FileNotFoundError(f"No PNG frames found in {frames_dir}")
+    
+    frames = []
+    for f in frame_files:
+        img = cv2.imread(str(f))
+        frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    return np.stack(frames, axis=0).astype(np.uint8)
 
 
 def generate_sliding_windows(num_frames, window_length, stride):
@@ -307,7 +326,9 @@ def process_video_with_tapip3d(
     num_iters = DEFAULT_NUM_ITERS
     
     # Load ViPE data
-    video_np, depths_np, intrinsics_np, extrinsics_np = load_vipe_data(npz_path)
+    video_name = npz_path.stem
+    frames_dir = Path(config['input_frames_dir']) / video_name
+    video_np, depths_np, intrinsics_np, extrinsics_np = load_vipe_data(npz_path, frames_dir)
     
     num_frames = video_np.shape[0]
     H, W = video_np.shape[1:3]
@@ -438,7 +459,7 @@ def compress_and_write(filename, header, blob):
         f.write(blob)
 
 
-def create_visualization_data(tracks_file, vipe_file, output_file, width=256, height=192, fps=12):
+def create_visualization_data(tracks_file, vipe_file, output_file, width=256, height=192, fps=12, config=None):
     """
     Create visualization binary data for a single video.
     
@@ -461,8 +482,12 @@ def create_visualization_data(tracks_file, vipe_file, output_file, width=256, he
     
     # Load ViPE data
     vipe_data = np.load(vipe_file)
-    video_full = vipe_data['video']
-    depths_full = vipe_data['depths']
+    depths_full = vipe_data['depths'].astype(np.float32)  # Convert float16 to float32
+    
+    # Load RGB from frames directory
+    video_name = vipe_file.stem
+    frames_dir = Path(config['input_frames_dir']) / video_name
+    video_full = load_frames_from_directory(frames_dir)
     
     T_full, H_orig, W_orig = depths_full.shape[:3]
     
@@ -881,6 +906,7 @@ def generate_visualizations(
             vipe_file,
             vis_path / f"{video_name}_data.bin",
             fps=vis_fps,
+            config=tapip3d_config,
         )
         create_video_html(video_name, video_list, vis_path)
     

@@ -259,18 +259,17 @@ def run_vipe_on_video(
     # Convert poses (cam2world) to extrinsics (world2cam)
     extrinsics = convert_poses_to_extrinsics(poses)
     
-    # Prepare TAPIP3D-ready output
+    # Prepare TAPIP3D-ready output (NO video field)
     tapip3d_data = {
-        'video': video,                          # (T, H, W, 3) uint8
-        'depths': depths.astype(np.float32),     # (T, H, W) float32
+        'depths': depths.astype(np.float16),     # (T, H, W) float16 (50% smaller)
         'intrinsics': intrinsics,                # (T, 3, 3) float32
         'extrinsics': extrinsics,                # (T, 4, 4) float32
     }
     
-    # Save .npz file
+    # Save .npz file with compression
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_path = output_dir / f"{video_name}.npz"
-    np.savez(npz_path, **tapip3d_data)
+    np.savez_compressed(npz_path, **tapip3d_data)
     
     result = {
         'npz_path': str(npz_path),

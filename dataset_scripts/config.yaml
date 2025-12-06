@@ -131,6 +131,7 @@ tapip3d:
   visibility_threshold: 0.9  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   resolution_factor: 1  # TAPIP3D inference resolution factor (1=base, 2=1.41x, 4=2x resolution)
   input_vipe_dir: *vipe_dir  # <- Input from ViPE output (.npz files with video, depths, intrinsics, extrinsics)
+  input_frames_dir: *clean_frames_dir  # <- Input from clean_frames (RGB frames for TAPIP3D)
   input_masks_dir: *masks_dir  # <- Optional: Input from gsam output (object masks)
   output_tracks_dir: *tracks_3d_dir  # Where to save 3D track .pt files
   device: *device  # CUDA device to use
