@@ -1,7 +1,0 @@
-# ResetTracking service
-# Request: empty (no input needed)
----
-# Response
-bool success
-string message
-
