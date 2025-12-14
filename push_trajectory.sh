@@ -19,7 +19,7 @@ echo "Loading checkpoint: $LATEST"
 echo "========================================"
 
 ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
-  --task Isaac-Trajectory-Kuka-Allegro-Play-v0 \
+  --task Isaac-Trajectory-Kuka-Allegro-PushT-v0 \
   --checkpoint "$LATEST" \
   --headless \
   --livestream 2 \

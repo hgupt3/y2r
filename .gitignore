@@ -54,3 +54,4 @@ dist/
 
 wandb/
 *log/
+.cursor/
