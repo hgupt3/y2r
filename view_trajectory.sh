@@ -1,7 +1,6 @@
 #!/bin/bash
 # View latest trajectory checkpoint via WebRTC livestream
 # Auto-finds most recent checkpoint in logs/rl_games/trajectory/
-# Connect via browser at http://localhost:8211/streaming/webrtc-client
 
 cd /home/harsh/sam/IsaacLab
 
@@ -23,3 +22,4 @@ echo "========================================"
   --checkpoint "$LATEST" \
   --headless \
   --livestream 2 \
+  # --enable_cameras \
