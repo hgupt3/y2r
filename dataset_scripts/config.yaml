@@ -15,6 +15,7 @@ common:
   tracks_dir: &tracks_dir "/home/harsh/sam/data/tracks"  # Output: cotracker
   tracks_3d_dir: &tracks_3d_dir "/home/harsh/sam/data/tracks_3d"  # Output: tapip3d
   vipe_dir: &vipe_dir "/home/harsh/sam/data/vipe" # Output: vipe depth maps
+  hand_poses_dir: &hand_poses_dir "/home/harsh/sam/data/hand_poses"  # Output: wilor hand poses
   save_h5_dir: &save_h5_dir "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
 
   # Visualization paths
@@ -24,6 +25,7 @@ common:
   spatracker_vis_dir: &spatracker_vis_dir "/home/harsh/sam/data/spatracker_vis"
   vipe_vis_dir: &vipe_vis_dir "/home/harsh/sam/data/vipe_vis"
   tapip3d_vis_dir: &tapip3d_vis_dir "/home/harsh/sam/data/tapip3d_vis"
+  wilor_vis_dir: &wilor_vis_dir "/home/harsh/sam/data/wilor_vis"
   
   # Common parameters
   detection_model: &detection_model "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
@@ -140,6 +142,20 @@ tapip3d:
   vis_flag: *vis_flag  # Enable 3D trajectory visualization
   vis_path: *tapip3d_vis_dir  # Where to save visualization outputs
   vis_fps: *target_fps  # FPS for visualization
+
+wilor:
+  input_frames_dir: *frames_dir  # <- Input from preprocess output (original frames with humans)
+  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (depth maps and intrinsics)
+  output_dir: *hand_poses_dir  # Where to save hand pose .pt files
+  device: *device  # CUDA device to use
+  batch_size: 256  # Number of hand crops per WiLoR batch
+  detection_confidence: 0.3  # YOLO hand detection threshold
+  wrist_depth_offset: 0.02  # Offset in meters (wrist joint is ~2cm inside skin surface)
+  num_videos_to_process: 1 #*num_videos_to_process  # Number of video folders to process (set to null to process all)
+  vis_flag: *vis_flag  # Enable visualization videos (mesh + skeleton overlay)
+  vis_path: *wilor_vis_dir  # Where to save visualization videos
+  vis_fps: *target_fps  # FPS for visualization videos
+  continue: *continue  # Whether to continue from previous run
 
 create_h5_dataset:
   target_size: 224  # Target resolution for images (images will be center-cropped to square then resized)
