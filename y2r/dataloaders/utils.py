@@ -47,6 +47,16 @@ class NormalizationStats:
             self.depth_std = self.stats['depth_std']
             self.pose_mean = np.array(self.stats['pose_mean'])
             self.pose_std = np.array(self.stats['pose_std'])
+            
+            # Hand pose stats (optional - only present if hand data was processed)
+            if 'hand_uvd_disp_mean' in self.stats:
+                self.hand_uvd_disp_mean = np.array(self.stats['hand_uvd_disp_mean'])
+                self.hand_uvd_disp_std = np.array(self.stats['hand_uvd_disp_std'])
+                self.hand_rot_disp_mean = np.array(self.stats['hand_rot_disp_mean'])
+                self.hand_rot_disp_std = np.array(self.stats['hand_rot_disp_std'])
+                self.has_hand_stats = True
+            else:
+                self.has_hand_stats = False
     
     # Depth normalization
     def normalize_depth(self, d):
@@ -115,6 +125,56 @@ class NormalizationStats:
         mean = torch.tensor(self.pose_mean, dtype=pose.dtype, device=pose.device)
         std = torch.tensor(self.pose_std, dtype=pose.dtype, device=pose.device) + 1e-8
         return pose * std + mean
+    
+    # Hand UVD displacement normalization
+    def normalize_hand_uvd_disp(self, disp):
+        """Normalize hand UVD displacement values."""
+        mean = self.hand_uvd_disp_mean.astype(np.float32)
+        std = self.hand_uvd_disp_std.astype(np.float32) + 1e-8
+        return (disp - mean) / std
+    
+    def denormalize_hand_uvd_disp(self, disp):
+        """Denormalize hand UVD displacement values."""
+        mean = self.hand_uvd_disp_mean.astype(np.float32)
+        std = self.hand_uvd_disp_std.astype(np.float32)
+        return disp * std + mean
+    
+    def normalize_hand_uvd_disp_torch(self, disp):
+        """Normalize hand UVD displacement values (torch tensor)."""
+        mean = torch.tensor(self.hand_uvd_disp_mean, dtype=disp.dtype, device=disp.device)
+        std = torch.tensor(self.hand_uvd_disp_std, dtype=disp.dtype, device=disp.device) + 1e-8
+        return (disp - mean) / std
+    
+    def denormalize_hand_uvd_disp_torch(self, disp):
+        """Denormalize hand UVD displacement values (torch tensor)."""
+        mean = torch.tensor(self.hand_uvd_disp_mean, dtype=disp.dtype, device=disp.device)
+        std = torch.tensor(self.hand_uvd_disp_std, dtype=disp.dtype, device=disp.device)
+        return disp * std + mean
+    
+    # Hand rotation displacement normalization
+    def normalize_hand_rot_disp(self, disp):
+        """Normalize hand 6D rotation displacement values."""
+        mean = self.hand_rot_disp_mean.astype(np.float32)
+        std = self.hand_rot_disp_std.astype(np.float32) + 1e-8
+        return (disp - mean) / std
+    
+    def denormalize_hand_rot_disp(self, disp):
+        """Denormalize hand 6D rotation displacement values."""
+        mean = self.hand_rot_disp_mean.astype(np.float32)
+        std = self.hand_rot_disp_std.astype(np.float32)
+        return disp * std + mean
+    
+    def normalize_hand_rot_disp_torch(self, disp):
+        """Normalize hand 6D rotation displacement values (torch tensor)."""
+        mean = torch.tensor(self.hand_rot_disp_mean, dtype=disp.dtype, device=disp.device)
+        std = torch.tensor(self.hand_rot_disp_std, dtype=disp.dtype, device=disp.device) + 1e-8
+        return (disp - mean) / std
+    
+    def denormalize_hand_rot_disp_torch(self, disp):
+        """Denormalize hand 6D rotation displacement values (torch tensor)."""
+        mean = torch.tensor(self.hand_rot_disp_mean, dtype=disp.dtype, device=disp.device)
+        std = torch.tensor(self.hand_rot_disp_std, dtype=disp.dtype, device=disp.device)
+        return disp * std + mean
 
 
 # ==============================================================================

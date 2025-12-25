@@ -89,6 +89,30 @@ def denormalize_sample(sample, norm_stats, track_type):
     else:
         result['depth'] = None
     
+    # Hand pose data
+    for side in ['left', 'right']:
+        prefix = f'{side}_wrist'
+        
+        if sample.get(f'{prefix}_query_uvd') is not None:
+            # Copy query_uvd, denormalize depth
+            query_uvd = sample[f'{prefix}_query_uvd'].clone()
+            if track_type == '3d':
+                query_uvd[2] = norm_stats.denormalize_depth(query_uvd[2].numpy().item())
+            result[f'{prefix}_query_uvd'] = query_uvd
+        
+        if sample.get(f'{prefix}_uvd_displacements') is not None and norm_stats.has_hand_stats:
+            uvd_disp = sample[f'{prefix}_uvd_displacements'].clone().numpy()
+            uvd_disp = norm_stats.denormalize_hand_uvd_disp(uvd_disp)
+            result[f'{prefix}_uvd_displacements'] = torch.from_numpy(uvd_disp.astype(np.float32))
+        
+        if sample.get(f'{prefix}_query_rot_6d') is not None:
+            result[f'{prefix}_query_rot_6d'] = sample[f'{prefix}_query_rot_6d'].clone()
+        
+        if sample.get(f'{prefix}_rot_displacements') is not None and norm_stats.has_hand_stats:
+            rot_disp = sample[f'{prefix}_rot_displacements'].clone().numpy()
+            rot_disp = norm_stats.denormalize_hand_rot_disp(rot_disp)
+            result[f'{prefix}_rot_displacements'] = torch.from_numpy(rot_disp.astype(np.float32))
+    
     return result
 
 
@@ -154,6 +178,113 @@ def poses_9d_to_4x4(poses_9d):
     for t in range(T):
         poses_4x4[t] = pose_9d_to_4x4(poses_9d[t])
     return poses_4x4
+
+
+def rot_6d_to_matrix(rot_6d):
+    """
+    Convert 6D rotation representation back to 3x3 rotation matrix.
+    
+    Args:
+        rot_6d: (6,) array - first two columns of rotation matrix
+    
+    Returns:
+        (3, 3) rotation matrix
+    """
+    r1 = rot_6d[:3]
+    r2 = rot_6d[3:6]
+    
+    # Gram-Schmidt orthogonalization
+    r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+    r2 = r2 - np.dot(r1, r2) * r1
+    r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+    r3 = np.cross(r1, r2)
+    
+    R = np.stack([r1, r2, r3], axis=1)  # (3, 3)
+    return R
+
+
+def compute_wrist_3d_from_uvd(query_uvd, uvd_displacements, intrinsics, img_size, norm_stats=None):
+    """
+    Convert wrist (u, v, d) trajectory to 3D camera coordinates.
+    
+    Args:
+        query_uvd: (3,) initial wrist (u, v, d)
+        uvd_displacements: (T, 3) displacements
+        intrinsics: (3, 3) camera intrinsics
+        img_size: Image size
+        norm_stats: NormalizationStats for denormalization
+    
+    Returns:
+        wrist_3d: (T, 3) 3D wrist positions in camera coords
+    """
+    query_uvd = query_uvd.clone()
+    uvd_disp = uvd_displacements.clone()
+    
+    # Denormalize
+    if norm_stats is not None:
+        # Denormalize query depth
+        query_uvd[2] = norm_stats.denormalize_depth(query_uvd[2].numpy().item())
+        # Denormalize UVD displacements
+        if norm_stats.has_hand_stats:
+            uvd_disp_np = uvd_disp.numpy()
+            uvd_disp_np = norm_stats.denormalize_hand_uvd_disp(uvd_disp_np)
+            uvd_disp = torch.from_numpy(uvd_disp_np.astype(np.float32))
+    
+    # Reconstruct full trajectory
+    T = uvd_disp.shape[0]
+    wrist_uvd = query_uvd.unsqueeze(0).expand(T, -1) + uvd_disp  # (T, 3)
+    
+    # Unproject to 3D
+    u = wrist_uvd[:, 0].numpy() * img_size
+    v = wrist_uvd[:, 1].numpy() * img_size
+    d = wrist_uvd[:, 2].numpy()
+    
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    
+    x_3d = (u - cx) * d / fx
+    y_3d = (v - cy) * d / fy
+    z_3d = d
+    
+    return np.stack([x_3d, y_3d, z_3d], axis=-1)  # (T, 3)
+
+
+def compute_wrist_rotations(query_rot_6d, rot_displacements, norm_stats=None):
+    """
+    Convert wrist rotation data to 3x3 rotation matrices.
+    
+    Args:
+        query_rot_6d: (6,) initial 6D rotation
+        rot_displacements: (T, 6) relative rotation displacements
+        norm_stats: NormalizationStats for denormalization
+    
+    Returns:
+        rotations: (T, 3, 3) rotation matrices
+    """
+    query_rot = query_rot_6d.clone().numpy()
+    rot_disp = rot_displacements.clone()
+    
+    # Denormalize rotation displacements
+    if norm_stats is not None and norm_stats.has_hand_stats:
+        rot_disp_np = rot_disp.numpy()
+        rot_disp_np = norm_stats.denormalize_hand_rot_disp(rot_disp_np)
+        rot_disp = torch.from_numpy(rot_disp_np.astype(np.float32))
+    
+    rot_disp = rot_disp.numpy()
+    T = rot_disp.shape[0]
+    
+    # Convert query rotation to matrix
+    R_0 = rot_6d_to_matrix(query_rot)  # (3, 3)
+    
+    # For each timestep, the relative rotation is stored as 6D
+    # R_rel = R_t @ R_0.T, so R_t = R_rel @ R_0
+    rotations = np.zeros((T, 3, 3), dtype=np.float32)
+    for t in range(T):
+        R_rel = rot_6d_to_matrix(rot_disp[t])
+        R_t = R_rel @ R_0
+        rotations[t] = R_t
+    
+    return rotations
 
 
 def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=None, vis_scale=2):
@@ -230,11 +361,122 @@ def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=Non
         opacity=1.0,
     )
     
+    # Draw wrist trajectories if present
+    rendered_frame = draw_wrist_trajectories_2d(rendered_frame, sample, vis_size, norm_stats)
+    
     # Save
     output_path = output_dir / f"sample_{sample_idx:03d}_2d.png"
     cv2.imwrite(str(output_path), cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR))
     
     return output_path
+
+
+def draw_wrist_trajectories_2d(frame, sample, vis_size, norm_stats=None):
+    """
+    Draw wrist trajectories and rotation axes on a 2D visualization frame.
+    Just line + pose axes at all timesteps, no markers.
+    
+    Args:
+        frame: RGB frame as numpy array (H, W, 3)
+        sample: Dict with optional wrist data
+        vis_size: Visualization size
+        norm_stats: NormalizationStats for denormalizing
+    
+    Returns:
+        Modified frame with wrist trajectories and pose axes drawn
+    """
+    # Make frame contiguous for OpenCV
+    frame_bgr = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    
+    # Colors: left=cyan, right=magenta for trajectory; RGB for axes
+    traj_colors = {
+        'left': (255, 255, 0),   # Cyan in BGR
+        'right': (255, 0, 255),  # Magenta in BGR
+    }
+    axis_colors = {
+        'x': (0, 0, 255),    # Red in BGR
+        'y': (0, 255, 0),    # Green in BGR
+        'z': (255, 0, 0),    # Blue in BGR
+    }
+    
+    axis_length_px = 40  # Length of rotation axes in pixels
+    
+    for side in ['left', 'right']:
+        prefix = f'{side}_wrist'
+        
+        if sample.get(f'{prefix}_query_uvd') is None:
+            continue
+        
+        query_uvd = sample[f'{prefix}_query_uvd'].clone()
+        uvd_disp = sample.get(f'{prefix}_uvd_displacements')
+        query_rot_6d = sample.get(f'{prefix}_query_rot_6d')
+        rot_disp = sample.get(f'{prefix}_rot_displacements')
+        
+        if uvd_disp is None:
+            continue
+        
+        uvd_disp = uvd_disp.clone()
+        
+        # Denormalize displacements
+        if norm_stats is not None and norm_stats.has_hand_stats:
+            uvd_disp_np = uvd_disp.numpy()
+            uvd_disp_np = norm_stats.denormalize_hand_uvd_disp(uvd_disp_np)
+            uvd_disp = torch.from_numpy(uvd_disp_np.astype(np.float32))
+        
+        # Reconstruct wrist trajectory: query + displacements
+        T = uvd_disp.shape[0]
+        wrist_traj = query_uvd[:2].unsqueeze(0).expand(T, -1) + uvd_disp[:, :2]  # (T, 2)
+        
+        # Convert to pixel coordinates
+        wrist_px = (wrist_traj * vis_size).numpy().astype(np.int32)  # (T, 2)
+        
+        traj_color = traj_colors[side]
+        
+        # Draw trajectory line only (no markers)
+        for t in range(T - 1):
+            pt1 = tuple(wrist_px[t])
+            pt2 = tuple(wrist_px[t + 1])
+            cv2.line(frame_bgr, pt1, pt2, traj_color, thickness=2)
+        
+        # Draw rotation axes at ALL timesteps
+        if query_rot_6d is not None and rot_disp is not None:
+            rot_disp = rot_disp.clone()
+            
+            # Denormalize rotation displacements
+            if norm_stats is not None and norm_stats.has_hand_stats:
+                rot_disp_np = rot_disp.numpy()
+                rot_disp_np = norm_stats.denormalize_hand_rot_disp(rot_disp_np)
+                rot_disp = torch.from_numpy(rot_disp_np.astype(np.float32))
+            
+            # Get rotation matrix at t=0
+            R_0 = rot_6d_to_matrix(query_rot_6d.numpy())
+            
+            # Draw axes at ALL timesteps
+            for t in range(T):
+                # Compute rotation at time t: R_t = R_rel @ R_0
+                R_rel = rot_6d_to_matrix(rot_disp[t].numpy())
+                R_t = R_rel @ R_0
+                
+                # Get wrist position at time t
+                wrist_pos = wrist_px[t]
+                
+                # Draw each axis (X=red, Y=green, Z=blue)
+                for axis_idx, axis_name in enumerate(['x', 'y', 'z']):
+                    axis_3d = R_t[:, axis_idx]  # (3,) - the axis direction
+                    
+                    # Project to 2D: use X and Y with some Z perspective
+                    axis_2d_x = axis_3d[0] - axis_3d[2] * 0.3
+                    axis_2d_y = axis_3d[1] - axis_3d[2] * 0.3
+                    
+                    # Scale and compute end point
+                    end_x = int(wrist_pos[0] + axis_2d_x * axis_length_px)
+                    end_y = int(wrist_pos[1] + axis_2d_y * axis_length_px)
+                    
+                    # Draw axis line
+                    cv2.line(frame_bgr, tuple(wrist_pos), (end_x, end_y), 
+                             axis_colors[axis_name], thickness=2)
+    
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
 def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, norm_stats=None):
@@ -295,7 +537,7 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
     
     # Get depth frame if available (use last frame - most recent observation, matching imgs[-1])
     depth_frame = None
-    if sample['depth'] is not None:
+    if sample.get('depth') is not None:
         # sample['depth'] is (frame_stack, H, W) - use last frame (most recent observation)
         # Depth is normalized by dataloader, so denormalize it
         depth_tensor = sample['depth'][-1]
@@ -306,7 +548,7 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
     
     # Get camera poses if available
     camera_poses = None
-    if sample['poses'] is not None:
+    if sample.get('poses') is not None:
         poses_9d = sample['poses'].clone()  # (T, 9)
         # Denormalize poses
         if norm_stats is not None:
@@ -316,10 +558,33 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
         # Convert 9D to 4x4 matrices
         camera_poses = poses_9d_to_4x4(poses_9d.numpy())  # (T, 4, 4)
     
+    # Extract wrist data for visualization
+    wrist_data = {}
+    for side in ['left', 'right']:
+        prefix = f'{side}_wrist'
+        if sample.get(f'{prefix}_query_uvd') is not None:
+            # Get 3D positions
+            wrist_3d = compute_wrist_3d_from_uvd(
+                sample[f'{prefix}_query_uvd'],
+                sample[f'{prefix}_uvd_displacements'],
+                intrinsics, img_size, norm_stats
+            )
+            # Get rotation matrices
+            wrist_rotations = compute_wrist_rotations(
+                sample[f'{prefix}_query_rot_6d'],
+                sample[f'{prefix}_rot_displacements'],
+                norm_stats
+            )
+            wrist_data[side] = {
+                'positions': wrist_3d,  # (T, 3)
+                'rotations': wrist_rotations,  # (T, 3, 3)
+            }
+    
     # Create visualization using TAPIP3D format
     create_3d_viz_data(
         points_3d, frame_np, intrinsics, img_size,
-        output_dir, sample_idx, depth_frame=depth_frame, camera_poses=camera_poses
+        output_dir, sample_idx, depth_frame=depth_frame, camera_poses=camera_poses,
+        wrist_data=wrist_data
     )
     
     return output_dir / f"sample_{sample_idx:03d}_3d.html"
@@ -360,7 +625,7 @@ def add_navigation_to_3d_html(output_dir, all_sample_indices):
             f.write(html)
 
 
-def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None, camera_poses=None):
+def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None, camera_poses=None, wrist_data=None):
     """
     Create visualization data using the same format as process_tapip3d.py.
     
@@ -373,6 +638,7 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         sample_idx: Sample index
         depth_frame: (H, W) optional depth frame in meters
         camera_poses: (T, 4, 4) optional camera poses for each timestep
+        wrist_data: Dict with 'left' and/or 'right' keys, each containing 'positions' (T, 3) and 'rotations' (T, 3, 3)
     """
     T, N, _ = points_3d.shape
     H, W = frame_rgb.shape[:2]
@@ -453,6 +719,25 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         arrays["camera_forwards"] = camera_forwards
         arrays["camera_ups"] = camera_ups
     
+    # Add wrist data if available
+    has_left_wrist = wrist_data is not None and 'left' in wrist_data
+    has_right_wrist = wrist_data is not None and 'right' in wrist_data
+    
+    if has_left_wrist:
+        arrays["left_wrist_positions"] = wrist_data['left']['positions'].astype(np.float32)  # (T, 3)
+        # Flatten rotations: (T, 3, 3) -> store X, Y, Z axes separately for easier JS access
+        rotations = wrist_data['left']['rotations']  # (T, 3, 3)
+        arrays["left_wrist_rot_x"] = rotations[:, :, 0].astype(np.float32)  # (T, 3) - X axis
+        arrays["left_wrist_rot_y"] = rotations[:, :, 1].astype(np.float32)  # (T, 3) - Y axis
+        arrays["left_wrist_rot_z"] = rotations[:, :, 2].astype(np.float32)  # (T, 3) - Z axis
+    
+    if has_right_wrist:
+        arrays["right_wrist_positions"] = wrist_data['right']['positions'].astype(np.float32)  # (T, 3)
+        rotations = wrist_data['right']['rotations']  # (T, 3, 3)
+        arrays["right_wrist_rot_x"] = rotations[:, :, 0].astype(np.float32)  # (T, 3) - X axis
+        arrays["right_wrist_rot_y"] = rotations[:, :, 1].astype(np.float32)  # (T, 3) - Y axis
+        arrays["right_wrist_rot_z"] = rotations[:, :, 2].astype(np.float32)  # (T, 3) - Z axis
+    
     header = {}
     blob_parts = []
     offset = 0
@@ -479,6 +764,8 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         "windowedMode": True,
         "hasCameraPoses": has_camera_poses,
         "numCameraPoses": T if has_camera_poses else 0,
+        "hasLeftWrist": has_left_wrist,
+        "hasRightWrist": has_right_wrist,
     }
     
     # Write binary data file
@@ -491,10 +778,10 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         f.write(compressed_blob)
     
     # Create HTML that uses this data file
-    create_sample_viz_html(output_dir, sample_idx, N, T)
+    create_sample_viz_html(output_dir, sample_idx, N, T, has_left_wrist, has_right_wrist)
 
 
-def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
+def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps, has_left_wrist=False, has_right_wrist=False):
     """
     Create HTML visualization using the TAPIP3D viz.html as template.
     This reuses the exact same viewer as process_tapip3d.py.
@@ -733,14 +1020,14 @@ def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
         pathPositions.push(x, y, z);
       }
       
-      const pathGeometry = new LineGeometry();
+      const pathGeometry = new THREE.LineGeometry();
       pathGeometry.setPositions(pathPositions);
-      const pathMaterial = new LineMaterial({
+      const pathMaterial = new THREE.LineMaterial({
         color: 0x00ffff,
         linewidth: 3,
         resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
       });
-      const cameraPath = new Line2(pathGeometry, pathMaterial);
+      const cameraPath = new THREE.Line2(pathGeometry, pathMaterial);
       this.scene.add(cameraPath);
       
       // Create small camera frustums at each position
@@ -798,10 +1085,10 @@ def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
     }
 '''
     
-    # Insert camera path setup call after trajectory setup
+    # Insert camera path and wrist setup calls after trajectory init
     html = html.replace(
-        'this.setupTrajectories();',
-        'this.setupTrajectories();\n      this.setupCameraPath();'
+        'this.initTrajectories();',
+        'this.initTrajectories();\n          this.setupCameraPath();\n          this.setupWristVisualization();'
     )
     
     # Insert the camera path function before the closing of the class
@@ -810,9 +1097,147 @@ def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps):
         camera_viz_js + '\n    updateTrajectories(frameIndex) {'
     )
     
+    # Add wrist visualization JavaScript
+    wrist_viz_js = '''
+    // Wrist visualization: trajectory line + pose axes at all timesteps
+    setupWristVisualization() {
+      this.wristGroups = {};
+      const axisLength = 0.03;  // Length of rotation axes
+      const colors = {
+        left: { main: 0x00ffff, x: 0xff0000, y: 0x00ff00, z: 0x0000ff },  // Cyan for left
+        right: { main: 0xff00ff, x: 0xff0000, y: 0x00ff00, z: 0x0000ff }  // Magenta for right
+      };
+      
+      for (const side of ['left', 'right']) {
+        const hasWrist = side === 'left' ? this.config.hasLeftWrist : this.config.hasRightWrist;
+        if (!hasWrist) continue;
+        
+        const positions = this.data[`${side}_wrist_positions`];
+        const rotX = this.data[`${side}_wrist_rot_x`];
+        const rotY = this.data[`${side}_wrist_rot_y`];
+        const rotZ = this.data[`${side}_wrist_rot_z`];
+        if (!positions) continue;
+        
+        const group = new THREE.Group();
+        const T = positions.shape[0];
+        const sideColors = colors[side];
+        
+        // Create trajectory line
+        const pathPositions = [];
+        for (let t = 0; t < T; t++) {
+          const x = positions.data[t * 3];
+          const y = -positions.data[t * 3 + 1];
+          const z = -positions.data[t * 3 + 2];
+          pathPositions.push(x, y, z);
+        }
+        
+        const pathGeometry = new THREE.LineGeometry();
+        pathGeometry.setPositions(pathPositions);
+        const pathMaterial = new THREE.LineMaterial({
+          color: sideColors.main,
+          linewidth: 4,
+          resolution: new THREE.Vector2(window.innerWidth, window.innerHeight),
+        });
+        const trajectoryLine = new THREE.Line2(pathGeometry, pathMaterial);
+        group.add(trajectoryLine);
+        
+        // Create pose axes at ALL timesteps
+        const axisGroups = [];
+        if (rotX && rotY && rotZ) {
+          for (let t = 0; t < T; t++) {
+            // Get position at timestep t
+            const px = positions.data[t * 3];
+            const py = -positions.data[t * 3 + 1];
+            const pz = -positions.data[t * 3 + 2];
+            
+            // Get rotation axes at timestep t
+            const rx = new THREE.Vector3(
+              rotX.data[t * 3],
+              -rotX.data[t * 3 + 1],
+              -rotX.data[t * 3 + 2]
+            ).normalize();
+            const ry = new THREE.Vector3(
+              rotY.data[t * 3],
+              -rotY.data[t * 3 + 1],
+              -rotY.data[t * 3 + 2]
+            ).normalize();
+            const rz = new THREE.Vector3(
+              rotZ.data[t * 3],
+              -rotZ.data[t * 3 + 1],
+              -rotZ.data[t * 3 + 2]
+            ).normalize();
+            
+            // Create axis lines using simple Line (not Line2 for performance)
+            const origin = new THREE.Vector3(px, py, pz);
+            
+            // Use Line2 for thick lines (LineBasicMaterial linewidth doesn't work in WebGL)
+            const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+            
+            // X axis (red)
+            const xEnd = origin.clone().add(rx.multiplyScalar(axisLength));
+            const xGeo = new THREE.LineGeometry();
+            xGeo.setPositions([origin.x, origin.y, origin.z, xEnd.x, xEnd.y, xEnd.z]);
+            const xMat = new THREE.LineMaterial({ color: sideColors.x, linewidth: 3, resolution: resolution });
+            const xLine = new THREE.Line2(xGeo, xMat);
+            group.add(xLine);
+            
+            // Y axis (green)  
+            const yEnd = origin.clone().add(ry.multiplyScalar(axisLength));
+            const yGeo = new THREE.LineGeometry();
+            yGeo.setPositions([origin.x, origin.y, origin.z, yEnd.x, yEnd.y, yEnd.z]);
+            const yMat = new THREE.LineMaterial({ color: sideColors.y, linewidth: 3, resolution: resolution });
+            const yLine = new THREE.Line2(yGeo, yMat);
+            group.add(yLine);
+            
+            // Z axis (blue)
+            const zEnd = origin.clone().add(rz.multiplyScalar(axisLength));
+            const zGeo = new THREE.LineGeometry();
+            zGeo.setPositions([origin.x, origin.y, origin.z, zEnd.x, zEnd.y, zEnd.z]);
+            const zMat = new THREE.LineMaterial({ color: sideColors.z, linewidth: 3, resolution: resolution });
+            const zLine = new THREE.Line2(zGeo, zMat);
+            group.add(zLine);
+            
+            axisGroups.push({ x: xLine, y: yLine, z: zLine });
+          }
+        }
+        
+        this.scene.add(group);
+        this.wristGroups[side] = {
+          group: group,
+          line: trajectoryLine,
+          axisGroups: axisGroups,
+          positions: positions,
+        };
+      }
+    }
+    
+    updateWristVisualization(frameIndex) {
+      // Wrist visualization is static (all timesteps shown), no per-frame update needed
+    }
+'''
+    
+    # Insert wrist visualization function
+    html = html.replace(
+        'updateTrajectories(frameIndex) {',
+        wrist_viz_js + '\n    updateTrajectories(frameIndex) {'
+    )
+    
+    # Call updateWristVisualization in the updateTrajectories function
+    html = html.replace(
+        'line.visible = true;\n          }',
+        'line.visible = true;\n          }\n        this.updateWristVisualization(frameIndex);'
+    )
+    
+    # Add wrist info to overlay
+    wrist_info = ""
+    if has_left_wrist:
+        wrist_info += " | Left wrist: ✓"
+    if has_right_wrist:
+        wrist_info += " | Right wrist: ✓"
+    
     # Add info overlay (bottom-left, navigation will be added top-right later)
     info_html = f'''<div style="position:fixed;bottom:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;font-family:system-ui;color:#eee;font-size:12px;">
-Points: {num_points} | Timesteps: {num_timesteps}
+Points: {num_points} | Timesteps: {num_timesteps}{wrist_info}
 </div>'''
     html = html.replace('<body>', '<body>' + info_html)
     
@@ -926,12 +1351,14 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     num_track_ids = config['num_track_ids']
     downsample_factor = config['downsample_factor']
     track_type = config.get('track_type', '2d')
+    hand_mode = config.get('hand_mode', None)
     
     print(f"\n{'='*70}")
     print("TESTING DATALOADER WITH H5 DATASET")
     print(f"{'='*70}")
     print(f"Dataset directory: {dataset_dir}")
     print(f"Track type: {track_type}")
+    print(f"Hand mode: {hand_mode}")
     print(f"Image size: {img_size}x{img_size}")
     print(f"Frame stack: {frame_stack}")
     print(f"Downsample factor: {downsample_factor}x")
@@ -945,24 +1372,25 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     print(f"{'='*70}\n")
     
     # Prepare dataset kwargs (no augmentation - augmentations are on GPU now)
-        dataset_kwargs = {
+    dataset_kwargs = {
         'dataset_dir': dataset_dir,
-            'img_size': img_size,
-            'num_track_ts': num_track_ts,
-            'num_track_ids': num_track_ids,
-            'frame_stack': frame_stack,
-            'downsample_factor': downsample_factor,
+        'img_size': img_size,
+        'num_track_ts': num_track_ts,
+        'num_track_ids': num_track_ids,
+        'frame_stack': frame_stack,
+        'downsample_factor': downsample_factor,
         'track_type': track_type,
+        'hand_mode': hand_mode,
         'cache_all': config.get('cache_all', True),
         'cache_image': config.get('cache_image', True),
-            'num_demos': None,
+        'num_demos': None,
     }
     
     # Create dataset
     print("Creating dataset...")
-        dataset = TrackDataset(**dataset_kwargs)
-        print(f"✓ Dataset created successfully")
-        print(f"  Total samples: {len(dataset)}")
+    dataset = TrackDataset(**dataset_kwargs)
+    print(f"✓ Dataset created successfully")
+    print(f"  Total samples: {len(dataset)}")
     
     # Check normalization stats
     if dataset.norm_stats is not None:
@@ -988,16 +1416,25 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     for i in range(num_samples_to_test):
         sample = dataset[i]
             
-            print(f"\nSample {i}:")
+        print(f"\nSample {i}:")
         print(f"  imgs: {sample['imgs'].shape}")
         print(f"  query_coords: {sample['query_coords'].shape}")
         print(f"  displacements: {sample['displacements'].shape}")
-        if sample['depth'] is not None:
+        if sample.get('depth') is not None:
             print(f"  depth: {sample['depth'].shape}")
-        if sample['poses'] is not None:
+        if sample.get('poses') is not None:
             print(f"  poses: {sample['poses'].shape}")
+        
+        # Print hand data if present
+        for side in ['left', 'right']:
+            prefix = f'{side}_wrist'
+            if sample.get(f'{prefix}_query_uvd') is not None:
+                print(f"  {prefix}_query_uvd: {sample[f'{prefix}_query_uvd'].shape}")
+                print(f"  {prefix}_uvd_displacements: {sample[f'{prefix}_uvd_displacements'].shape}")
+                print(f"  {prefix}_query_rot_6d: {sample[f'{prefix}_query_rot_6d'].shape}")
+                print(f"  {prefix}_rot_displacements: {sample[f'{prefix}_rot_displacements'].shape}")
             
-            # Validate shapes
+        # Validate shapes
         assert sample['imgs'].shape == (frame_stack, 3, img_size, img_size), \
             f"Expected imgs shape ({frame_stack}, 3, {img_size}, {img_size})"
         assert sample['query_coords'].shape[1] == coord_dim, \
@@ -1009,19 +1446,32 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         
         # Validate depth shape for 3D mode
         if track_type == '3d':
-            assert sample['depth'] is not None, "3D mode should have depth"
+            assert sample.get('depth') is not None, "3D mode should have depth"
             assert sample['depth'].shape == (frame_stack, img_size, img_size), \
                 f"Expected depth shape ({frame_stack}, {img_size}, {img_size}), got {sample['depth'].shape}"
-            assert sample['poses'] is not None, "3D mode should have poses"
+            assert sample.get('poses') is not None, "3D mode should have poses"
             assert sample['poses'].shape == (num_track_ts, 9), \
                 f"Expected poses shape ({num_track_ts}, 9)"
+        
+        # Validate hand data shapes if hand_mode is set
+        if hand_mode is not None:
+            sides_to_check = ['left'] if hand_mode == 'left' else ['right'] if hand_mode == 'right' else ['left', 'right']
+            for side in sides_to_check:
+                prefix = f'{side}_wrist'
+                assert sample.get(f'{prefix}_query_uvd') is not None, f"{hand_mode} mode should have {side} hand data"
+                assert sample[f'{prefix}_query_uvd'].shape == (3,), f"Expected {prefix}_query_uvd shape (3,)"
+                assert sample[f'{prefix}_uvd_displacements'].shape == (num_track_ts, 3), \
+                    f"Expected {prefix}_uvd_displacements shape ({num_track_ts}, 3)"
+                assert sample[f'{prefix}_query_rot_6d'].shape == (6,), f"Expected {prefix}_query_rot_6d shape (6,)"
+                assert sample[f'{prefix}_rot_displacements'].shape == (num_track_ts, 6), \
+                    f"Expected {prefix}_rot_displacements shape ({num_track_ts}, 6)"
             
-            print(f"  ✓ Sample {i} validated")
+        print(f"  ✓ Sample {i} validated")
     
     # Test dataloader with batching
     print(f"\nTesting dataloader with batching...")
     dataloader = get_dataloader(dataset, mode="train", num_workers=0, batch_size=2)
-        batch = next(iter(dataloader))
+    batch = next(iter(dataloader))
     
     print(f"  Batch keys: {batch.keys()}")
     print(f"  imgs: {batch['imgs'].shape}")
@@ -1029,7 +1479,7 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     print(f"  displacements: {batch['displacements'].shape}")
     
     assert batch['imgs'].shape[0] == 2, "Expected batch size 2"
-        print(f"  ✓ Dataloader batching works correctly")
+    print(f"  ✓ Dataloader batching works correctly")
     
     # Visualization
     if visualize:
@@ -1066,8 +1516,9 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
                 vflip_prob=config.get('aug_vflip_prob', 0.0),
                 img_noise_std=config.get('aug_noise_std', 0.0),
                 depth_noise_std=config.get('aug_depth_noise_std', 0.0),
+                hand_mode=hand_mode,
             ).cuda()
-            print(f"  Created GPU augmenter on CUDA")
+            print(f"  Created GPU augmenter on CUDA (hand_mode={hand_mode})")
         elif test_augmentations:
             print(f"  Warning: GPU augmentations requested but CUDA not available")
         
@@ -1095,16 +1546,35 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
                     'imgs': sample['imgs'].unsqueeze(0).cuda(),
                     'query_coords': sample['query_coords'].unsqueeze(0).cuda(),
                     'displacements': sample['displacements'].unsqueeze(0).cuda(),
-                    'depth': sample['depth'].unsqueeze(0).cuda() if sample['depth'] is not None else None,
+                    'depth': sample['depth'].unsqueeze(0).cuda() if sample.get('depth') is not None else None,
                 }
+                # Add hand data to batch
+                for side in ['left', 'right']:
+                    prefix = f'{side}_wrist'
+                    if sample.get(f'{prefix}_query_uvd') is not None:
+                        batch_gpu[f'{prefix}_query_uvd'] = sample[f'{prefix}_query_uvd'].unsqueeze(0).cuda()
+                        batch_gpu[f'{prefix}_uvd_displacements'] = sample[f'{prefix}_uvd_displacements'].unsqueeze(0).cuda()
+                        batch_gpu[f'{prefix}_query_rot_6d'] = sample[f'{prefix}_query_rot_6d'].unsqueeze(0).cuda()
+                        batch_gpu[f'{prefix}_rot_displacements'] = sample[f'{prefix}_rot_displacements'].unsqueeze(0).cuda()
+                
                 batch_gpu = gpu_augmenter(batch_gpu)
+                
+                # Move back to CPU
                 sample = {
                     'imgs': batch_gpu['imgs'][0].cpu(),
                     'query_coords': batch_gpu['query_coords'][0].cpu(),
                     'displacements': batch_gpu['displacements'][0].cpu(),
-                    'depth': batch_gpu['depth'][0].cpu() if batch_gpu['depth'] is not None else None,
-                    'poses': sample['poses'],  # Poses are not augmented
+                    'depth': batch_gpu['depth'][0].cpu() if batch_gpu.get('depth') is not None else None,
+                    'poses': sample.get('poses'),  # Poses are not augmented
                 }
+                # Extract augmented hand data
+                for side in ['left', 'right']:
+                    prefix = f'{side}_wrist'
+                    if batch_gpu.get(f'{prefix}_query_uvd') is not None:
+                        sample[f'{prefix}_query_uvd'] = batch_gpu[f'{prefix}_query_uvd'][0].cpu()
+                        sample[f'{prefix}_uvd_displacements'] = batch_gpu[f'{prefix}_uvd_displacements'][0].cpu()
+                        sample[f'{prefix}_query_rot_6d'] = batch_gpu[f'{prefix}_query_rot_6d'][0].cpu()
+                        sample[f'{prefix}_rot_displacements'] = batch_gpu[f'{prefix}_rot_displacements'][0].cpu()
             
             # 2D visualization (pass norm_stats for denormalization)
             path_2d = visualize_sample_2d(sample, idx, vis_dir, img_size, 
@@ -1143,7 +1613,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Test HDF5 dataset with dataloader")
     parser.add_argument("--visualize", action="store_true", help="Create visualizations")
-    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to visualize")
+    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to visualize")
     parser.add_argument("--aug", action="store_true", 
                         help="Test GPU augmentations (applies augmentations on GPU)")
     

@@ -3,23 +3,36 @@ ViPE Processing Script
 Runs NVIDIA ViPE on videos to extract camera poses and dense depth maps.
 Outputs directly in TAPIP3D-ready .npz format.
 
+Supports parallel processing via num_workers config option.
+
 Usage:
     python process_vipe.py
 """
 
 import os
 import sys
-import yaml
 import logging
+import traceback
+import multiprocessing as mp
 from pathlib import Path
+from omegaconf import OmegaConf
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-# Load config and set CUDA device BEFORE any torch imports
+
+def _setup_env_for_worker():
+    """Setup environment variables for a worker process (called before torch import)."""
+    # Suppress huggingface tokenizer parallelism warning
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Disable all internal tqdm progress bars
+    os.environ["TQDM_DISABLE"] = "1"
+
+
 def _load_config_early():
-    with open(SCRIPT_DIR / "config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
+    """Load config and set CUDA device BEFORE any torch imports."""
+    config = OmegaConf.load(SCRIPT_DIR / "config.yaml")
+    
     vipe_config = config.get('vipe', {})
     spatracker_config = config.get('spatracker', {})
     device = vipe_config.get('device', spatracker_config.get('device', 'cuda'))
@@ -28,15 +41,17 @@ def _load_config_early():
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         print(f"Setting CUDA_VISIBLE_DEVICES={gpu_id}")
     
-    # Suppress huggingface tokenizer parallelism warning
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Disable all internal tqdm progress bars (must be set before tqdm import)
-    os.environ["TQDM_DISABLE"] = "1"
+    _setup_env_for_worker()
     
     return config, device
 
-_config_early, _device_early = _load_config_early()
+
+# Only load config in main process at module level
+# Workers will load it themselves after spawn
+if mp.current_process().name == 'MainProcess':
+    _config_early, _device_early = _load_config_early()
+else:
+    _config_early, _device_early = None, None
 
 # NOW import torch and other heavy dependencies
 import warnings
@@ -56,13 +71,12 @@ from vipe import get_config_path, make_pipeline
 from vipe.streams.raw_mp4_stream import RawMp4Stream
 from vipe.streams.frame_dir_stream import FrameDirStream
 from vipe.streams.base import ProcessedVideoStream, FrameAttribute
+from vipe.model_cache import VipeModelCache
 
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 def load_frames(frames_dir: Path, num_frames: int = None) -> np.ndarray:
@@ -76,7 +90,7 @@ def load_frames(frames_dir: Path, num_frames: int = None) -> np.ndarray:
     Returns:
         video: (T, H, W, 3) uint8 array
     """
-    frame_files = sorted(frames_dir.glob("*.png"))
+    frame_files = sorted(list(frames_dir.glob("*.png")) + list(frames_dir.glob("*.jpg")))
     
     if num_frames is not None and len(frame_files) != num_frames:
         print(f"Warning: Expected {num_frames} frames but found {len(frame_files)}")
@@ -126,32 +140,96 @@ def convert_poses_to_extrinsics(poses: np.ndarray) -> np.ndarray:
     return np.linalg.inv(poses).astype(np.float32)
 
 
-def run_vipe_on_video(
-    video_path, 
-    frames_dir, 
-    output_dir, 
-    pipeline_name="default", 
-    save_viz=False, 
-    vis_path=None, 
+def create_vipe_pipeline(
+    pipeline_name="default",
+    output_dir=None,
+    save_viz=False,
+    vis_path=None,
     fixed_fov_degrees=None,
     fov_min_degrees=None,
     fov_max_degrees=None,
     optimize_intrinsics=True,
 ):
     """
-    Run ViPE pipeline on a single video and save results as TAPIP3D-ready .npz file.
+    Create and initialize ViPE pipeline with cached models for reuse across multiple videos.
     
     Args:
-        video_path: Path to video file or directory of frames (for ViPE processing)
-        frames_dir: Path to original frames directory (for loading RGB into output)
-        output_dir: Directory to save outputs (.npz files)
         pipeline_name: ViPE pipeline config name ("default", "no_vda", "wide_angle", "lyra")
+        output_dir: Directory for outputs
         save_viz: Whether to save visualization video
-        vis_path: Directory to save visualization videos (if different from output_dir)
+        vis_path: Directory to save visualization videos
         fixed_fov_degrees: If set, bypass GeoCalib entirely with a fixed FOV
         fov_min_degrees: If set, clamp GeoCalib's estimate to this minimum
         fov_max_degrees: If set, clamp GeoCalib's estimate to this maximum
         optimize_intrinsics: Whether SLAM can refine intrinsics during bundle adjustment
+    
+    Returns:
+        Tuple of (vipe_pipeline, model_cache) - pipeline and cache for reuse
+    """
+    # Configure hydra overrides
+    overrides = [
+        f"pipeline={pipeline_name}",
+        f"pipeline.output.path={vis_path if save_viz and vis_path else output_dir}",
+        f"pipeline.output.save_artifacts={'true' if save_viz else 'false'}",
+        f"pipeline.output.save_viz={'true' if save_viz else 'false'}",
+    ]
+    
+    # Add FOV overrides for initial estimation (GeoCalib clamping)
+    if fixed_fov_degrees is not None:
+        overrides.append(f"pipeline.init.fixed_fov_degrees={fixed_fov_degrees}")
+    else:
+        if fov_min_degrees is not None:
+            overrides.append(f"pipeline.init.fov_min_degrees={fov_min_degrees}")
+        if fov_max_degrees is not None:
+            overrides.append(f"pipeline.init.fov_max_degrees={fov_max_degrees}")
+    
+    # Pass FOV bounds to SLAM for bounded intrinsic optimization
+    if fov_min_degrees is not None:
+        overrides.append(f"+pipeline.slam.fov_min_degrees={fov_min_degrees}")
+    if fov_max_degrees is not None:
+        overrides.append(f"+pipeline.slam.fov_max_degrees={fov_max_degrees}")
+    
+    # Control whether SLAM can refine intrinsics during bundle adjustment
+    overrides.append(f"pipeline.slam.optimize_intrinsics={'true' if optimize_intrinsics else 'false'}")
+    
+    # Initialize hydra with ViPE config
+    with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
+        args = hydra.compose("default", overrides=overrides)
+    
+    # Create model cache ONCE - this loads all expensive models
+    print("  Loading models into cache...")
+    model_cache = VipeModelCache.create(
+        slam_cfg=args.pipeline.slam,
+        init_cfg=args.pipeline.init,
+        post_cfg=args.pipeline.post,
+        device=torch.device("cuda"),
+    )
+    
+    # Create pipeline with cached models
+    vipe_pipeline = make_pipeline(args.pipeline, model_cache=model_cache)
+    vipe_pipeline.return_output_streams = True
+    
+    return vipe_pipeline, model_cache
+
+
+def run_vipe_on_video(
+    vipe_pipeline,
+    video_path, 
+    frames_dir, 
+    output_dir, 
+    save_viz=False, 
+    vis_path=None, 
+):
+    """
+    Run ViPE pipeline on a single video and save results as TAPIP3D-ready .npz file.
+    
+    Args:
+        vipe_pipeline: Pre-initialized ViPE pipeline (reused across videos)
+        video_path: Path to video file or directory of frames (for ViPE processing)
+        frames_dir: Path to original frames directory (for loading RGB into output)
+        output_dir: Directory to save outputs (.npz files)
+        save_viz: Whether to save visualization video
+        vis_path: Directory to save visualization videos (if different from output_dir)
     
     Returns:
         Dictionary with TAPIP3D-ready data:
@@ -166,42 +244,6 @@ def run_vipe_on_video(
     if vis_path:
         vis_path = Path(vis_path)
     
-    # Configure hydra overrides
-    overrides = [
-        f"pipeline={pipeline_name}",
-        f"pipeline.output.path={vis_path if save_viz and vis_path else output_dir}",
-        f"pipeline.output.save_artifacts={'true' if save_viz else 'false'}",
-        f"pipeline.output.save_viz={'true' if save_viz else 'false'}",
-    ]
-    
-    # Add FOV overrides for initial estimation (GeoCalib clamping)
-    if fixed_fov_degrees is not None:
-        # Bypass GeoCalib entirely with a fixed FOV
-        overrides.append(f"pipeline.init.fixed_fov_degrees={fixed_fov_degrees}")
-    else:
-        # Use GeoCalib with optional min/max clamping
-        if fov_min_degrees is not None:
-            overrides.append(f"pipeline.init.fov_min_degrees={fov_min_degrees}")
-        if fov_max_degrees is not None:
-            overrides.append(f"pipeline.init.fov_max_degrees={fov_max_degrees}")
-    
-    # Pass FOV bounds to SLAM for bounded intrinsic optimization (use + to add new keys)
-    if fov_min_degrees is not None:
-        overrides.append(f"+pipeline.slam.fov_min_degrees={fov_min_degrees}")
-    if fov_max_degrees is not None:
-        overrides.append(f"+pipeline.slam.fov_max_degrees={fov_max_degrees}")
-    
-    # Control whether SLAM can refine intrinsics during bundle adjustment
-    overrides.append(f"pipeline.slam.optimize_intrinsics={'true' if optimize_intrinsics else 'false'}")
-    
-    # Initialize hydra with ViPE config
-    with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
-        args = hydra.compose("default", overrides=overrides)
-    
-    # Create pipeline and enable output streams return
-    vipe_pipeline = make_pipeline(args.pipeline)
-    vipe_pipeline.return_output_streams = True
-    
     # Determine if input is video or frame directory
     if video_path.is_file():
         video_stream = ProcessedVideoStream(
@@ -214,7 +256,7 @@ def run_vipe_on_video(
         ).cache(desc="Reading image frames")
         video_name = video_path.name
     
-    # Run pipeline
+    # Run pipeline (reusing pre-loaded models)
     result = vipe_pipeline.run(video_stream)
     
     # Extract data from output streams
@@ -287,11 +329,12 @@ def run_vipe_on_video(
     return result
 
 
-def process_frame_directory_with_vipe(frames_dir, output_dir, config):
+def process_frame_directory_with_vipe(vipe_pipeline, frames_dir, output_dir, config):
     """
     Process a directory of frames with ViPE and save as TAPIP3D-ready .npz file.
     
     Args:
+        vipe_pipeline: Pre-initialized ViPE pipeline (reused across videos)
         frames_dir: Path to directory containing frames (00000.png, 00001.png, etc.)
         output_dir: Directory to save outputs
         config: ViPE config dictionary
@@ -303,31 +346,81 @@ def process_frame_directory_with_vipe(frames_dir, output_dir, config):
     output_dir = Path(output_dir)
     
     # Check if frames exist
-    frame_files = sorted(list(frames_dir.glob("*.png")))
+    frame_files = sorted(list(frames_dir.glob("*.png")) + list(frames_dir.glob("*.jpg")))
     if len(frame_files) == 0:
         tqdm.write(f"  No frames found in {frames_dir}")
         return None
     
     result = run_vipe_on_video(
+        vipe_pipeline=vipe_pipeline,
         video_path=frames_dir,
         frames_dir=frames_dir,  # Same directory for RGB frames
         output_dir=output_dir,
-        pipeline_name=config.get('pipeline', 'default'),
         save_viz=config.get('vis_flag', False),
         vis_path=config.get('vis_path'),
-        fixed_fov_degrees=config.get('fixed_fov_degrees'),
-        fov_min_degrees=config.get('fov_min_degrees'),
-        fov_max_degrees=config.get('fov_max_degrees'),
-        optimize_intrinsics=config.get('optimize_intrinsics', True),
     )
     
     return Path(result.get('npz_path'))
 
 
+def _worker_process(worker_id, video_dirs, output_dir, vipe_config, progress_queue):
+    """
+    Worker process that initializes its own ViPE pipeline and processes a shard of videos.
+    
+    Args:
+        worker_id: Worker index (for logging)
+        video_dirs: List of video directories to process (this worker's shard)
+        output_dir: Output directory for .npz files
+        vipe_config: ViPE config dictionary (resolved, no OmegaConf interpolation)
+        progress_queue: Queue to report progress back to main process
+    """
+    # Setup environment for this worker
+    _setup_env_for_worker()
+    
+    # Suppress verbose logging
+    logging.getLogger("vipe").setLevel(logging.WARNING)
+    logging.getLogger("vipe.slam").setLevel(logging.WARNING)
+    logging.getLogger("vipe.pipeline").setLevel(logging.WARNING)
+    
+    # Initialize ViPE pipeline for this worker (with cached models)
+    try:
+        vipe_pipeline, model_cache = create_vipe_pipeline(
+            pipeline_name=vipe_config.get('pipeline', 'default'),
+            output_dir=output_dir,
+            save_viz=vipe_config.get('vis_flag', False),
+            vis_path=vipe_config.get('vis_path'),
+            fixed_fov_degrees=vipe_config.get('fixed_fov_degrees'),
+            fov_min_degrees=vipe_config.get('fov_min_degrees'),
+            fov_max_degrees=vipe_config.get('fov_max_degrees'),
+            optimize_intrinsics=vipe_config.get('optimize_intrinsics', True),
+        )
+        progress_queue.put(('init', worker_id, None))
+    except Exception as e:
+        progress_queue.put(('error', worker_id, f"Pipeline init failed: {e}"))
+        return
+    
+    # Process each video in this worker's shard
+    for video_dir in video_dirs:
+        video_name = video_dir.name
+        try:
+            npz_path = process_frame_directory_with_vipe(
+                vipe_pipeline, video_dir, output_dir, vipe_config
+            )
+            if npz_path is not None:
+                progress_queue.put(('done', worker_id, video_name))
+            else:
+                progress_queue.put(('fail', worker_id, video_name))
+        except Exception as e:
+            progress_queue.put(('fail', worker_id, f"{video_name}: {e}\n{traceback.format_exc()}"))
+    
+    # Signal worker is finished
+    progress_queue.put(('finished', worker_id, None))
+
+
 def main():
-    """Main function to run ViPE on all videos."""
+    """Main function to run ViPE on all videos with parallel workers."""
     print("=" * 60)
-    print("ViPE Processing Pipeline")
+    print("ViPE Processing Pipeline (Parallel)")
     print("Extracting camera poses and depth maps (TAPIP3D-ready format)")
     print("=" * 60)
     
@@ -352,8 +445,10 @@ def main():
     fov_min_degrees = vipe_config.get('fov_min_degrees')
     fov_max_degrees = vipe_config.get('fov_max_degrees')
     optimize_intrinsics = vipe_config.get('optimize_intrinsics', True)
+    num_workers = vipe_config.get('num_workers', 2)
     
     print(f"Device: {device}")
+    print(f"Workers: {num_workers}")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Output format: TAPIP3D-ready .npz")
@@ -389,36 +484,89 @@ def main():
     if num_videos is not None:
         video_dirs = video_dirs[:num_videos]
     
-    print(f"Found {len(video_dirs)} video directories to process")
+    # Filter out already-processed videos if continuing
+    if continue_flag:
+        videos_to_process = []
+        skipped = 0
+        for video_dir in video_dirs:
+            expected_npz_path = output_dir / f"{video_dir.name}.npz"
+            if expected_npz_path.exists():
+                skipped += 1
+            else:
+                videos_to_process.append(video_dir)
+        if skipped > 0:
+            print(f"Skipping {skipped} already-processed videos")
+        video_dirs = videos_to_process
     
-    # Suppress verbose ViPE logging (BA iterations, etc.)
-    logging.getLogger("vipe").setLevel(logging.WARNING)
-    logging.getLogger("vipe.slam").setLevel(logging.WARNING)
-    logging.getLogger("vipe.pipeline").setLevel(logging.WARNING)
+    total_videos = len(video_dirs)
+    print(f"Processing {total_videos} video directories with {num_workers} workers")
     
-    # Track processed videos
+    if total_videos == 0:
+        print("No videos to process!")
+        return
+    
+    # Convert vipe_config to plain dict (OmegaConf objects can't be pickled for multiprocessing)
+    vipe_config_dict = OmegaConf.to_container(vipe_config, resolve=True)
+    
+    # Split videos into shards for workers (round-robin distribution for balance)
+    shards = [[] for _ in range(num_workers)]
+    for i, video_dir in enumerate(video_dirs):
+        shards[i % num_workers].append(video_dir)
+    
+    # Use spawn context for CUDA safety
+    ctx = mp.get_context('spawn')
+    progress_queue = ctx.Queue()
+    
+    # Start worker processes
+    print(f"\nSpawning {num_workers} worker processes...")
+    workers = []
+    for worker_id in range(num_workers):
+        if len(shards[worker_id]) == 0:
+            continue  # Skip empty shards
+        p = ctx.Process(
+            target=_worker_process,
+            args=(worker_id, shards[worker_id], output_dir, vipe_config_dict, progress_queue)
+        )
+        p.start()
+        workers.append((worker_id, p))
+    
+    # Track progress
     processed = []
     failed = []
+    workers_initialized = 0
+    workers_finished = 0
     
-    # Explicitly enable our progress bar (overrides TQDM_DISABLE env var)
-    pbar = tqdm(video_dirs, desc="Episodes", position=0, leave=True, disable=False)
-    for video_dir in pbar:
-        video_name = video_dir.name
-        pbar.set_postfix_str(video_name)
+    # Progress bar
+    pbar = tqdm(total=total_videos, desc="Videos", position=0, leave=True, disable=False)
+    
+    # Collect results from workers
+    while workers_finished < len(workers):
+        msg = progress_queue.get()
+        msg_type, worker_id, data = msg
         
-        # Check if already processed (now .npz instead of .pt)
-        expected_npz_path = output_dir / f"{video_name}.npz"
-        if continue_flag and expected_npz_path.exists():
-            processed.append(video_name)
-            continue
-        
-        npz_path = process_frame_directory_with_vipe(video_dir, output_dir, vipe_config)
-        
-        if npz_path is not None:
-            processed.append(video_name)
-        else:
-            failed.append(video_name)
-            tqdm.write(f"  ✗ {video_name} failed")
+        if msg_type == 'init':
+            workers_initialized += 1
+            tqdm.write(f"  Worker {worker_id} initialized ({workers_initialized}/{len(workers)})")
+        elif msg_type == 'done':
+            processed.append(data)
+            pbar.update(1)
+            pbar.set_postfix_str(f"W{worker_id}: {data}")
+        elif msg_type == 'fail':
+            failed.append(data)
+            pbar.update(1)
+            tqdm.write(f"  Worker {worker_id} FAIL: {data}")
+        elif msg_type == 'error':
+            tqdm.write(f"  Worker {worker_id} ERROR: {data}")
+            workers_finished += 1
+        elif msg_type == 'finished':
+            workers_finished += 1
+            tqdm.write(f"  Worker {worker_id} finished")
+    
+    pbar.close()
+    
+    # Wait for all workers to exit
+    for worker_id, p in workers:
+        p.join()
     
     # Summary
     print("\n" + "=" * 60)
@@ -427,7 +575,7 @@ def main():
     print(f"  Failed: {len(failed)}")
     print(f"  Output format: TAPIP3D-ready .npz files")
     if failed:
-        print(f"  Failed videos: {failed}")
+        print(f"  Failed videos: {failed[:10]}{'...' if len(failed) > 10 else ''}")
     if vis_flag and vis_path:
         print(f"\n  Interactive 3D Visualization:")
         print(f"    Run: vipe visualize {vis_path} --port 20540")

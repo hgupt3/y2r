@@ -4,108 +4,110 @@
 # These variables are shared across multiple stages of the pipeline
 common:
   # Base paths
-  base_data_dir: &base_data_dir "/home/harsh/sam/data"
-  raw_videos_dir: &raw_videos_dir "/home/harsh/sam/data/raw_videos"
+  base_data_dir: "/home/harsh/sam/data"
+  metadata_file: "${common.base_data_dir}/metadata.csv"
+  raw_videos_dir: "${common.base_data_dir}/raw_videos"
   
   # Intermediate outputs (shared between stages)
-  frames_dir: &frames_dir "/home/harsh/sam/data/frames"  # Output: preprocess -> Input: gsam_human, diffueraser
-  human_masks_dir: &human_masks_dir "/home/harsh/sam/data/human_masks"  # Output: gsam_human -> Input: diffueraser
-  clean_frames_dir: &clean_frames_dir "/home/harsh/sam/data/clean_frames"  # Output: diffueraser -> Input: gsam, cotracker
-  masks_dir: &masks_dir "/home/harsh/sam/data/masks"  # Output: gsam -> Input: cotracker
-  tracks_dir: &tracks_dir "/home/harsh/sam/data/tracks"  # Output: cotracker
-  tracks_3d_dir: &tracks_3d_dir "/home/harsh/sam/data/tracks_3d"  # Output: tapip3d
-  vipe_dir: &vipe_dir "/home/harsh/sam/data/vipe" # Output: vipe depth maps
-  hand_poses_dir: &hand_poses_dir "/home/harsh/sam/data/hand_poses"  # Output: wilor hand poses
-  save_h5_dir: &save_h5_dir "/home/harsh/sam/data/h5_dataset"  # Where to save HDF5 dataset files
+  frames_dir: "${common.base_data_dir}/frames"  # Output: preprocess -> Input: gsam_human, diffueraser
+  human_masks_dir: "${common.base_data_dir}/human_masks"  # Output: gsam_human -> Input: diffueraser
+  clean_frames_dir: "${common.base_data_dir}/clean_frames"  # Output: diffueraser -> Input: gsam, cotracker
+  masks_dir: "${common.base_data_dir}/masks"  # Output: gsam -> Input: cotracker
+  tracks_dir: "${common.base_data_dir}/tracks"  # Output: cotracker
+  tracks_3d_dir: "${common.base_data_dir}/tracks_3d"  # Output: tapip3d
+  vipe_dir: "${common.base_data_dir}/vipe"  # Output: vipe depth maps
+  hand_poses_dir: "${common.base_data_dir}/hand_poses"  # Output: wilor hand poses
+  save_h5_dir: "${common.base_data_dir}/h5_dataset"  # Where to save HDF5 dataset files
 
   # Visualization paths
-  human_vis_dir: &human_vis_dir "/home/harsh/sam/data/human_vis"
-  gsam_vis_dir: &gsam_vis_dir "/home/harsh/sam/data/gsam_vis"
-  cotracker_vis_dir: &cotracker_vis_dir "/home/harsh/sam/data/cotracker_vis"
-  spatracker_vis_dir: &spatracker_vis_dir "/home/harsh/sam/data/spatracker_vis"
-  vipe_vis_dir: &vipe_vis_dir "/home/harsh/sam/data/vipe_vis"
-  tapip3d_vis_dir: &tapip3d_vis_dir "/home/harsh/sam/data/tapip3d_vis"
-  wilor_vis_dir: &wilor_vis_dir "/home/harsh/sam/data/wilor_vis"
+  human_vis_dir: "${common.base_data_dir}/human_vis"
+  gsam_vis_dir: "${common.base_data_dir}/gsam_vis"
+  cotracker_vis_dir: "${common.base_data_dir}/cotracker_vis"
+  spatracker_vis_dir: "${common.base_data_dir}/spatracker_vis"
+  vipe_vis_dir: "${common.base_data_dir}/vipe_vis"
+  tapip3d_vis_dir: "${common.base_data_dir}/tapip3d_vis"
+  wilor_vis_dir: "${common.base_data_dir}/wilor_vis"
   
   # Common parameters
-  detection_model: &detection_model "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
-  device: &device "cuda:0"  # CUDA device to use across all stages
-  target_fps: &target_fps 12  # FPS for both extraction and visualization
-  window_length: &window_length 16  # Number of frames per sliding window
-  num_videos_to_process: &num_videos_to_process null  # Number of videos to process (null = all)
-  continue: &continue false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
-  vis_flag: &vis_flag true  # Enable/disable visualization videos
+  detection_model: "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
+  device: "cuda:0"  # CUDA device to use across all stages
+  target_fps: 10  # FPS for both extraction and visualization
+  window_length: 10  # Number of frames per sliding window
+  num_videos_to_process: null  # Number of videos to process (null = all)
+  continue: false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  vis_flag: false  # Enable/disable visualization videos
+  stride: 1  # Step size between window starts
   
 # ===== PIPELINE STAGES =====
 
 preprocess:
   target_width: 512  # Target width for resized frames (in pixels)
   target_height: 384  # Target height for resized frames (in pixels)
-  target_fps: *target_fps  # Target FPS for frame extraction (set to null to extract all frames)
-  num_videos_to_process: *num_videos_to_process  # Number of videos to process (set to null to process all)
-  raw_videos_dir: *raw_videos_dir  # Input directory containing raw videos
-  output_dir: *frames_dir  # Output directory for processed frames -> feeds into gsam_human & diffueraser
+  target_fps: ${common.target_fps}  # Target FPS for frame extraction (set to null to extract all frames)
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of videos to process (set to null to process all)
+  raw_videos_dir: ${common.raw_videos_dir}  # Input directory containing raw videos
+  output_dir: ${common.frames_dir}  # Output directory for processed frames -> feeds into gsam_human & diffueraser
   video_extensions: ["*.MOV", "*.mov", "*.mp4", "*.MP4"]  # Video file extensions to process
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam_human:
-  detection_model: *detection_model  # Detection model: "grounding-dino" or "florence-2"
+  detection_model: ${common.detection_model}  # Detection model: "grounding-dino" or "florence-2"
   text_prompt: "person."  # Text prompt for object detection (better detection than "human.")
   key_frame_idx: -1  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
-  input_images_dir: *frames_dir  # <- Input from preprocess output
-  device: *device  # CUDA device to use
-  output_masks_dir: *human_masks_dir  # Where to save .pt mask files -> feeds into diffueraser
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  vis_flag: *vis_flag  # Enable visualization videos
-  vis_path: *human_vis_dir  # Where to save visualization videos
-  vis_fps: *target_fps  # FPS for visualization videos
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  input_images_dir: ${common.frames_dir}  # <- Input from preprocess output
+  device: ${common.device}  # CUDA device to use
+  output_masks_dir: ${common.human_masks_dir}  # Where to save .pt mask files -> feeds into diffueraser
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  vis_flag: ${common.vis_flag}  # Enable visualization videos
+  vis_path: ${common.human_vis_dir}  # Where to save visualization videos
+  vis_fps: ${common.target_fps}  # FPS for visualization videos
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 diffueraser:
-  input_images_dir: *frames_dir  # <- Input from preprocess output
-  input_masks_dir: *human_masks_dir  # <- Input from gsam_human output
-  output_frames_dir: *clean_frames_dir  # Where to save cleaned frames -> feeds into gsam & cotracker
-  device: *device  # CUDA device to use
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
+  input_images_dir: ${common.frames_dir}  # <- Input from preprocess output
+  input_masks_dir: ${common.human_masks_dir}  # <- Input from gsam_human output
+  output_frames_dir: ${common.clean_frames_dir}  # Where to save cleaned frames -> feeds into gsam & cotracker
+  device: ${common.device}  # CUDA device to use
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
   max_img_size: 512  # Maximum image dimension (width or height)
   mask_dilation_iter: 8  # Mask dilation iterations
   # Propainter parameters
   ref_stride: 10  # Reference frame stride for Propainter
   neighbor_length: 10  # Neighbor length for Propainter
   subvideo_length: 50  # Subvideo length for Propainter
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam:
-  detection_model: *detection_model  # Detection model: "grounding-dino" or "florence-2"
-  text_prompt: "small red t-shaped block."  # Text prompt for object detection
+  detection_model: ${common.detection_model}  # Detection model: "grounding-dino" or "florence-2"
+  text_prompt: 'small red t-shaped block.'  # Set to null to use noun from metadata.csv, or provide a string to use that for all clips
   key_frame_idx: 0  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
-  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
-  device: *device  # CUDA device to use
-  output_masks_dir: *masks_dir  # Where to save .pt mask files -> feeds into cotracker
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  vis_flag: *vis_flag  # Enable visualization videos
-  vis_path: *gsam_vis_dir  # Where to save visualization videos
-  vis_fps: *target_fps  # FPS for visualization videos
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output
+  device: ${common.device}  # CUDA device to use
+  output_masks_dir: ${common.masks_dir}  # Where to save .pt mask files -> feeds into cotracker
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  vis_flag: ${common.vis_flag}  # Enable visualization videos
+  vis_path: ${common.gsam_vis_dir}  # Where to save visualization videos
+  vis_fps: ${common.target_fps}  # FPS for visualization videos
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 cotracker:
-  window_length: *window_length  # Number of frames per sliding window
-  stride: 1  # Step size between window starts
+  window_length: ${common.window_length}  # Number of frames per sliding window
+  stride: ${common.stride}  # Step size between window starts
   grid_size: 64  # Grid density for point tracking
   visibility_threshold: 0.95  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   mask_erosion_pixels: 2  # Number of pixels to erode object mask (shrink) to avoid unreliable edge points
   subtract_human_masks: false  # Whether to subtract human masks from object masks (set to false to disable)
   human_mask_dilation_pixels: 10  # Number of pixels to dilate human mask (expand) before subtraction to create buffer zone
-  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output
-  input_masks_dir: *masks_dir  # <- Input from gsam output (object masks)
-  input_human_masks_dir: *human_masks_dir  # <- Input from gsam_human output (human masks to subtract)
-  output_tracks_dir: *tracks_dir  # Where to save track .pt files
-  device: *device  # CUDA device to use
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  vis_flag: *vis_flag  # Enable visualization videos
-  vis_path: *cotracker_vis_dir  # Where to save visualization videos
-  vis_fps: *target_fps  # FPS for visualization videos
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  input_images_dir: ${common.clean_frames_dir}  # <- Input from diffueraser output
+  input_masks_dir: ${common.masks_dir}  # <- Input from gsam output (object masks)
+  input_human_masks_dir: ${common.human_masks_dir}  # <- Input from gsam_human output (human masks to subtract)
+  output_tracks_dir: ${common.tracks_dir}  # Where to save track .pt files
+  device: ${common.device}  # CUDA device to use
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  vis_flag: ${common.vis_flag}  # Enable visualization videos
+  vis_path: ${common.cotracker_vis_dir}  # Where to save visualization videos
+  vis_fps: ${common.target_fps}  # FPS for visualization videos
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 vipe:
   pipeline: "lyra"  # ViPE pipeline config: "default", "no_vda" (faster/less memory), "wide_angle", "lyra"
@@ -113,61 +115,72 @@ vipe:
   #   - fixed_fov_degrees: Bypass GeoCalib entirely with a fixed value (e.g., 60)
   #   - fov_min/max_degrees: Let GeoCalib estimate, but clamp to this range (e.g., 40-90)
   fixed_fov_degrees: null
-  fov_min_degrees: 40
+  fov_min_degrees: 60
   fov_max_degrees: 90
   optimize_intrinsics: true  # SLAM can refine intrinsics, but stays within FOV bounds above
-  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
-  output_dir: *vipe_dir  # Where to save TAPIP3D-ready .npz files (video, depths, intrinsics, extrinsics)
-  device: *device  # CUDA device to use (e.g., "cuda:0")
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  vis_flag: *vis_flag  # Enable ViPE visualization videos
-  vis_path: *vipe_vis_dir  # Where to save ViPE visualization videos
-  continue: *continue  # Whether to continue from previous run
+  input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output (clean frames)
+  output_dir: ${common.vipe_dir}  # Where to save TAPIP3D-ready .npz files (video, depths, intrinsics, extrinsics)
+  device: ${common.device}  # CUDA device to use (e.g., "cuda:0")
+  num_workers: 1  # Parallel video workers (increase to raise GPU utilization)
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  vis_flag: ${common.vis_flag}  # Enable ViPE visualization videos
+  vis_path: ${common.vipe_vis_dir}  # Where to save ViPE visualization videos
+  continue: ${common.continue}  # Whether to continue from previous run
 
 tapip3d:
-  window_length: *window_length  # Number of frames per sliding window
-  stride: 1  # Step size between window starts
-  grid_size: 100  # Grid density for query points (NxN grid). Set to 0 to use mask only
+  window_length: ${common.window_length}  # Number of frames per sliding window
+  stride: ${common.stride}  # Step size between window starts
   use_masks: true  # Whether to use masks for query points (if true, points sampled from mask)
+  sampling_method: "random"  # "grid" or "random" - how to sample query points from mask
+  grid_size: 100  # For grid method: creates grid_size × grid_size points over image
+  target_points: 64  # For random method: number of points to sample from mask
+  min_mask_percent: 0.0  # Minimum mask area as % of image (0-100). Skip window if below.
   mask_erosion_pixels: 2  # Number of pixels to erode mask (shrink) to avoid unreliable edge points
-  visibility_threshold: 0.9  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
+  visibility_threshold: 0.0  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   resolution_factor: 1  # TAPIP3D inference resolution factor (1=base, 2=1.41x, 4=2x resolution)
-  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (.npz files with video, depths, intrinsics, extrinsics)
-  input_frames_dir: *clean_frames_dir  # <- Input from clean_frames (RGB frames for TAPIP3D)
-  input_masks_dir: *masks_dir  # <- Optional: Input from gsam output (object masks)
-  output_tracks_dir: *tracks_3d_dir  # Where to save 3D track .pt files
-  device: *device  # CUDA device to use
-  num_videos_to_process: *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  continue: *continue  # Whether to continue from previous run
-  vis_flag: *vis_flag  # Enable 3D trajectory visualization
-  vis_path: *tapip3d_vis_dir  # Where to save visualization outputs
-  vis_fps: *target_fps  # FPS for visualization
+  input_vipe_dir: ${common.vipe_dir}  # <- Input from ViPE output (.npz files with video, depths, intrinsics, extrinsics)
+  input_frames_dir: ${common.frames_dir}  # <- Input from clean_frames (RGB frames for TAPIP3D)
+  input_masks_dir: ${common.masks_dir}  # <- Optional: Input from gsam output (object masks)
+  output_tracks_dir: ${common.tracks_3d_dir}  # Where to save 3D track .pt files
+  device: ${common.device}  # CUDA device to use
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  continue: ${common.continue}  # Whether to continue from previous run
+  vis_flag: ${common.vis_flag}  # Enable 3D trajectory visualization
+  vis_path: ${common.tapip3d_vis_dir}  # Where to save visualization outputs
+  vis_fps: ${common.target_fps}  # FPS for visualization
 
 wilor:
-  input_frames_dir: *frames_dir  # <- Input from preprocess output (original frames with humans)
-  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (depth maps and intrinsics)
-  output_dir: *hand_poses_dir  # Where to save hand pose .pt files
-  device: *device  # CUDA device to use
+  input_frames_dir: ${common.frames_dir}  # <- Input from preprocess output (original frames with humans)
+  input_vipe_dir: ${common.vipe_dir}  # <- Input from ViPE output (depth maps and intrinsics)
+  output_dir: ${common.hand_poses_dir}  # Where to save hand pose .pt files
+  device: ${common.device}  # CUDA device to use
   batch_size: 256  # Number of hand crops per WiLoR batch
-  detection_confidence: 0.3  # YOLO hand detection threshold
+  num_workers: 4  # DataLoader workers for parallel image preprocessing (0 = main process only)
+  detection_confidence: 0.75  # YOLO hand detection threshold
   wrist_depth_offset: 0.02  # Offset in meters (wrist joint is ~2cm inside skin surface)
-  num_videos_to_process: 1 #*num_videos_to_process  # Number of video folders to process (set to null to process all)
-  vis_flag: *vis_flag  # Enable visualization videos (mesh + skeleton overlay)
-  vis_path: *wilor_vis_dir  # Where to save visualization videos
-  vis_fps: *target_fps  # FPS for visualization videos
-  continue: *continue  # Whether to continue from previous run
+  max_hand_velocity: 1.0  # Max hand velocity in m/s; frames exceeding this are marked invalid (filters depth jumps from occlusion)
+  max_interpolation_gap: 20  # Max frames to interpolate over for detection gaps (0 = no interpolation)
+  fps: ${common.target_fps}  # Video FPS for velocity calculation
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  vis_flag: ${common.vis_flag}  # Enable visualization videos
+  vis_path: ${common.wilor_vis_dir}  # Where to save visualization videos
+  vis_fps: ${common.target_fps}  # FPS for visualization videos
+  continue: ${common.continue}  # Whether to continue from previous run
 
 create_h5_dataset:
-  target_size: 224  # Target resolution for images (images will be center-cropped to square then resized)
-  num_track_ts: *window_length  # Number of future timesteps for tracks (should match cotracker window_length)
+  target_size: 256  # Target resolution for images (images will be center-cropped to square then resized)
+  num_track_ts: ${common.window_length}  # Number of future timesteps for tracks (should match cotracker window_length)
   track_type: "3d"  # "2d" for CoTracker, "3d" for TAPIP3D
-  input_images_dir: *clean_frames_dir  # <- Input from diffueraser output (clean frames)
-  input_tracks_dir: *tracks_dir  # <- Input from cotracker output (2D track .pt files)
-  input_tracks_3d_dir: *tracks_3d_dir  # <- Input from TAPIP3D output (3D track .pt files)
-  input_vipe_dir: *vipe_dir  # <- Input from ViPE output (.npz files with depth maps)
+  include_text: false  # Whether to include text descriptions from metadata.csv (requires 'text' column)
+  metadata_file: ${common.metadata_file}  # Path to metadata.csv with text descriptions (only used if include_text=true)
+  input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output (clean frames)
+  input_tracks_dir: ${common.tracks_dir}  # <- Input from cotracker output (2D track .pt files)
+  input_tracks_3d_dir: ${common.tracks_3d_dir}  # <- Input from TAPIP3D output (3D track .pt files)
+  input_vipe_dir: ${common.vipe_dir}  # <- Input from ViPE output (.npz files with depth maps)
+  input_hand_poses_dir: ${common.hand_poses_dir}  # <- Input from WiLoR output (hand pose .pt files)
   depth_min: 0.1  # Min valid depth in meters (null = no lower clip)
   depth_max: 2.5  # Max valid depth in meters (null = no upper clip)
-  output_h5_dir: *save_h5_dir  # Where to save HDF5 dataset files
-  num_videos_to_process: *num_videos_to_process # *num_videos_to_process  # Number of video folders to process (set to null to process all)
-  continue: *continue  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  output_h5_dir: ${common.save_h5_dir}  # Where to save HDF5 dataset files
+  num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
+  continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 

@@ -12,15 +12,17 @@ Usage:
 
 import os
 import sys
-import yaml
 import torch
+from omegaconf import OmegaConf
 import cv2
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import time
 import shutil
-import imageio
+import json
+import struct
+import zlib
 
 # Add thirdparty to path
 SCRIPT_DIR = Path(__file__).parent
@@ -32,10 +34,8 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 def load_frames_from_directory(frames_dir: Path) -> np.ndarray:
@@ -140,6 +140,104 @@ def get_best_detection(detections, is_right_target):
     return best_det
 
 
+def slerp_rotation(R0, R1, t):
+    """
+    Spherical linear interpolation between two rotation matrices.
+    Uses quaternion SLERP for smooth rotation interpolation.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+    
+    rotations = Rotation.from_matrix(np.stack([R0, R1]))
+    slerp = Slerp([0, 1], rotations)
+    return slerp(t).as_matrix()
+
+
+def interpolate_hand_data(result, vis_data, side, max_gap, num_frames):
+    """
+    Interpolate missing frames for a hand side if gaps are within max_gap.
+    
+    Args:
+        result: The result dict with hand data
+        vis_data: Visualization data dict (or None)
+        side: 'left' or 'right'
+        max_gap: Maximum gap to interpolate over
+        num_frames: Total number of frames
+    
+    Returns:
+        Number of frames interpolated
+    """
+    valid = result[f'{side}_valid']
+    wrist_poses = result[f'{side}_wrist_pose']
+    hand_poses = result[f'{side}_hand_pose']
+    joints_3d = result[f'{side}_joints_3d']
+    
+    interpolated_count = 0
+    
+    # Find gaps
+    i = 0
+    while i < num_frames:
+        if valid[i]:
+            i += 1
+            continue
+        
+        # Found start of a gap - find where it ends
+        gap_start = i
+        while i < num_frames and not valid[i]:
+            i += 1
+        gap_end = i  # First valid frame after gap (or num_frames if none)
+        
+        gap_length = gap_end - gap_start
+        
+        # Check if we have valid frames on both sides and gap is within limit
+        if gap_start > 0 and gap_end < num_frames and gap_length <= max_gap:
+            prev_idx = gap_start - 1
+            next_idx = gap_end
+            
+            # Interpolate each frame in the gap
+            for j in range(gap_start, gap_end):
+                t = (j - prev_idx) / (next_idx - prev_idx)
+                
+                # Interpolate wrist pose (position linear, rotation SLERP)
+                prev_pose = wrist_poses[prev_idx]
+                next_pose = wrist_poses[next_idx]
+                
+                interp_pos = (1 - t) * prev_pose[:3, 3] + t * next_pose[:3, 3]
+                interp_rot = slerp_rotation(prev_pose[:3, :3], next_pose[:3, :3], t)
+                
+                interp_wrist_pose = np.eye(4, dtype=np.float32)
+                interp_wrist_pose[:3, :3] = interp_rot
+                interp_wrist_pose[:3, 3] = interp_pos
+                
+                # Interpolate hand pose (linear in rotation matrix space - not perfect but simple)
+                interp_hand_pose = (1 - t) * hand_poses[prev_idx] + t * hand_poses[next_idx]
+                
+                # Interpolate joints
+                interp_joints = (1 - t) * joints_3d[prev_idx] + t * joints_3d[next_idx]
+                
+                # Store interpolated values
+                result[f'{side}_valid'][j] = True
+                result[f'{side}_wrist_pose'][j] = interp_wrist_pose
+                result[f'{side}_hand_pose'][j] = interp_hand_pose
+                result[f'{side}_joints_3d'][j] = interp_joints
+                
+                # Interpolate vis_data if available
+                if vis_data is not None and vis_data[prev_idx][side] is not None and vis_data[next_idx][side] is not None:
+                    prev_verts = vis_data[prev_idx][side]['verts_repositioned']
+                    next_verts = vis_data[next_idx][side]['verts_repositioned']
+                    interp_verts = (1 - t) * prev_verts + t * next_verts
+                    
+                    vis_data[j][side] = {
+                        'verts_repositioned': interp_verts,
+                        'wrist_pos': interp_pos,
+                        'wrist_rot': interp_rot,
+                        'is_right': vis_data[prev_idx][side]['is_right'],
+                    }
+                
+                interpolated_count += 1
+    
+    return interpolated_count
+
+
 def draw_wrist_pose(image, wrist_pos_3d, wrist_rot, intrinsics, axis_length=0.05):
     """
     Draw wrist position and orientation axes on image.
@@ -178,6 +276,198 @@ def draw_wrist_pose(image, wrist_pos_3d, wrist_rot, intrinsics, axis_length=0.05
         cv2.arrowedLine(image, wrist_pt, axis_end_pt, color, 2, tipLength=0.3)
 
 
+def create_3d_visualization(
+    video_name: str,
+    frames: np.ndarray,
+    depths: np.ndarray,
+    intrinsics: np.ndarray,
+    vis_data: dict,
+    mano_faces: np.ndarray,
+    vis_path: Path,
+    vis_fps: int = 12,
+    vis_width: int = 256,
+    vis_height: int = 192,
+):
+    """
+    Create 3D visualization data for WebGL viewer.
+    Uses same format as TAPIP3D for compatibility.
+    """
+    num_frames = len(frames)
+    H_orig, W_orig = frames.shape[1:3]
+    num_verts = 778  # MANO vertex count
+    fixed_size = (vis_width, vis_height)
+    
+    # Resize frames and depths
+    rgb_resized = np.zeros((num_frames, vis_height, vis_width, 3), dtype=np.uint8)
+    depth_float = np.zeros((num_frames, vis_height, vis_width), dtype=np.float32)
+    
+    for i in range(num_frames):
+        rgb_resized[i] = cv2.resize(frames[i], fixed_size, interpolation=cv2.INTER_AREA)
+        depth_float[i] = cv2.resize(depths[i], fixed_size, interpolation=cv2.INTER_NEAREST)
+    
+    # Scale intrinsics and tile for all frames
+    scale_x = vis_width / W_orig
+    scale_y = vis_height / H_orig
+    intrinsics_scaled = np.tile(intrinsics[np.newaxis, :, :], (num_frames, 1, 1)).astype(np.float32)
+    intrinsics_scaled[:, 0, :] *= scale_x
+    intrinsics_scaled[:, 1, :] *= scale_y
+    
+    # Compute FOV
+    fx, fy = intrinsics_scaled[0, 0, 0], intrinsics_scaled[0, 1, 1]
+    fov_y = 2 * np.arctan(vis_height / (2 * fy)) * (180 / np.pi)
+    
+    # Process depth - encode as 16-bit in RGB channels (same as TAPIP3D)
+    valid_depths = depth_float[depth_float > 0]
+    min_depth = float(valid_depths.min()) * 0.8 if len(valid_depths) > 0 else 0.1
+    max_depth = float(valid_depths.max()) * 1.5 if len(valid_depths) > 0 else 10.0
+    
+    depth_normalized = np.clip((depth_float - min_depth) / (max_depth - min_depth), 0, 1)
+    depth_int = (depth_normalized * ((1 << 16) - 1)).astype(np.uint16)
+    
+    depths_rgb = np.zeros((num_frames, vis_height, vis_width, 3), dtype=np.uint8)
+    depths_rgb[:, :, :, 0] = (depth_int & 0xFF).astype(np.uint8)
+    depths_rgb[:, :, :, 1] = ((depth_int >> 8) & 0xFF).astype(np.uint8)
+    
+    # Identity extrinsics (camera at origin looking down -Z)
+    extrinsics = np.tile(np.eye(4, dtype=np.float32)[np.newaxis, :, :], (num_frames, 1, 1))
+    inv_extrinsics = extrinsics.copy()
+    
+    # Prepare hand vertices as "trajectories" - shape (T, N, 3) where N = left + right verts
+    # We'll pack: left_verts (778) + right_verts (778) = 1556 points per frame
+    left_verts = np.zeros((num_frames, num_verts, 3), dtype=np.float32)
+    right_verts = np.zeros((num_frames, num_verts, 3), dtype=np.float32)
+    left_valid = np.zeros(num_frames, dtype=np.uint8)
+    right_valid = np.zeros(num_frames, dtype=np.uint8)
+    
+    for frame_idx in range(num_frames):
+        if vis_data[frame_idx]['left'] is not None:
+            left_valid[frame_idx] = 1
+            left_verts[frame_idx] = vis_data[frame_idx]['left']['verts_repositioned']
+        
+        if vis_data[frame_idx]['right'] is not None:
+            right_valid[frame_idx] = 1
+            right_verts[frame_idx] = vis_data[frame_idx]['right']['verts_repositioned']
+    
+    # Build arrays dict
+    arrays = {
+        "rgb_video": rgb_resized,
+        "depths_rgb": depths_rgb,
+        "intrinsics": intrinsics_scaled,
+        "extrinsics": extrinsics,
+        "inv_extrinsics": inv_extrinsics,
+        "left_verts": left_verts,
+        "right_verts": right_verts,
+        "left_valid": left_valid,
+        "right_valid": right_valid,
+        "faces": mano_faces.astype(np.int32),
+        "cameraZ": np.float64(0.0),
+    }
+    
+    header = {}
+    blob_parts = []
+    offset = 0
+    
+    for key, arr in arrays.items():
+        arr = np.ascontiguousarray(arr)
+        arr_bytes = arr.tobytes()
+        header[key] = {
+            "dtype": str(arr.dtype),
+            "shape": list(arr.shape),
+            "offset": offset,
+            "length": len(arr_bytes)
+        }
+        blob_parts.append(arr_bytes)
+        offset += len(arr_bytes)
+    
+    compressed_blob = zlib.compress(b"".join(blob_parts), level=9)
+    
+    header["meta"] = {
+        "depthRange": [min_depth, max_depth],
+        "totalFrames": num_frames,
+        "resolution": list(fixed_size),
+        "baseFrameRate": vis_fps,
+        "fov": float(fov_y),
+        "numVerts": num_verts,
+    }
+    
+    # Write file
+    header_bytes = json.dumps(header).encode("utf-8")
+    header_len = struct.pack("<I", len(header_bytes))
+    
+    output_file = vis_path / f"{video_name}_data.bin"
+    with open(output_file, "wb") as f:
+        f.write(header_len)
+        f.write(header_bytes)
+        f.write(compressed_blob)
+    
+    return output_file
+
+
+def create_wilor_viz_html(vis_path: Path, video_list: list):
+    """
+    Create HTML files for WiLoR 3D visualization.
+    
+    Args:
+        vis_path: Output directory
+        video_list: List of video names
+    """
+    # Copy the template
+    template_path = SCRIPT_DIR / 'wilor_viz.html'
+    
+    if not template_path.exists():
+        print(f"Warning: Template {template_path} not found")
+        return
+    
+    with open(template_path, 'r') as f:
+        template = f.read()
+    
+    # Create individual video HTML files
+    for i, video_name in enumerate(video_list):
+        html = template.replace("fetch('data.bin')", f"fetch('{video_name}_data.bin')")
+        
+        # Add navigation
+        prev_link = f'<a href="{video_list[i-1]}.html">← Prev</a>' if i > 0 else '<span style="color:#666">← Prev</span>'
+        next_link = f'<a href="{video_list[i+1]}.html">Next →</a>' if i < len(video_list) - 1 else '<span style="color:#666">Next →</span>'
+        
+        nav_html = f'''<div style="position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgba(22,33,62,0.95);padding:8px 16px;border-radius:8px;display:flex;gap:16px;align-items:center;font-size:14px;z-index:100;border:1px solid #333;">
+    <a href="index.html" style="color:#e67e22;">Index</a>
+    <span style="color:#666;">|</span>
+    {prev_link}
+    <span style="font-weight:600;">{video_name}</span>
+    <span style="color:#888;">({i+1}/{len(video_list)})</span>
+    {next_link}
+</div>'''
+        
+        html = html.replace('<div id="frame-info">', nav_html + '\n  <div id="frame-info">')
+        
+        with open(vis_path / f'{video_name}.html', 'w') as f:
+            f.write(html)
+    
+    # Create index page
+    index_html = '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>WiLoR 3D Visualization</title>
+<style>
+body { margin: 0; padding: 20px; font-family: -apple-system, sans-serif; background: #1a1a2e; color: #eee; }
+h1 { color: #e67e22; margin-bottom: 24px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+.card { background: #16213e; border-radius: 8px; padding: 16px; text-decoration: none; color: #eee; border: 1px solid #333; transition: all 0.2s; }
+.card:hover { background: #1f3460; border-color: #e67e22; transform: translateY(-2px); }
+.card h3 { margin: 0 0 8px 0; color: #e67e22; font-size: 14px; }
+.card p { margin: 0; font-size: 12px; color: #888; }
+</style></head><body>
+<h1>🖐️ WiLoR Hand Pose Visualization</h1>
+<div class="grid">
+'''
+    
+    for i, v in enumerate(video_list):
+        index_html += f'<a href="{v}.html" class="card"><h3>{v}</h3><p>Video {i+1}/{len(video_list)}</p></a>\n'
+    
+    index_html += '</div></body></html>'
+    
+    with open(vis_path / 'index.html', 'w') as f:
+        f.write(index_html)
+
+
 def process_video(
     video_name,
     frames_dir,
@@ -186,9 +476,9 @@ def process_video(
     model,
     model_cfg,
     detector,
-    renderer,
     device,
     config,
+    mano_faces=None,
     vis_flag=False,
     vis_path=None,
     vis_fps=12,
@@ -322,7 +612,7 @@ def process_video(
                 'right': batch['right'][i].cpu().numpy(),
             })
     
-    # ========== PHASE 4: Process outputs and compute 3D positions ==========
+    # ========== PHASE 4: Process outputs and compute 3D positions (BATCHED) ==========
     print(f"  Computing 3D positions with depth anchoring...")
     
     left_betas_list = []
@@ -331,6 +621,35 @@ def process_video(
     # For visualization - store per-frame data
     vis_data = {i: {'left': None, 'right': None} for i in range(num_frames)} if vis_flag else None
     
+    num_dets = len(all_wilor_outputs)
+    if num_dets == 0:
+        return result
+    
+    # ===== Batch cam_crop_to_full for all detections at once =====
+    pred_cam_all = np.stack([out['pred_cam'] for out in all_wilor_outputs])
+    box_center_all = np.stack([out['box_center'] for out in all_wilor_outputs])
+    box_size_all = np.stack([out['box_size'] for out in all_wilor_outputs])
+    img_size_all = np.stack([out['img_size'] for out in all_wilor_outputs])
+    is_right_all = np.array([out['right'] for out in all_wilor_outputs])
+    
+    # Adjust pred_cam for handedness
+    multiplier_all = (2 * is_right_all - 1)
+    pred_cam_adjusted_all = pred_cam_all.copy()
+    pred_cam_adjusted_all[:, 1] = multiplier_all * pred_cam_adjusted_all[:, 1]
+    
+    # Compute scaled focal lengths
+    scaled_focal_lengths = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size_all.max(axis=1)
+    
+    # Batch call to cam_crop_to_full
+    pred_cam_t_full_all = cam_crop_to_full(
+        torch.from_numpy(pred_cam_adjusted_all).float(),
+        torch.from_numpy(box_center_all).float(),
+        torch.from_numpy(box_size_all).float(),
+        torch.from_numpy(img_size_all).float(),
+        torch.from_numpy(scaled_focal_lengths).float(),
+    ).numpy()
+    
+    # ===== Process each detection (fast now that cam_crop_to_full is done) =====
     for det_idx, ((frame_idx, side, is_right), wilor_out) in enumerate(zip(all_metadata, all_wilor_outputs)):
         depth_map = depths[frame_idx]
         
@@ -339,28 +658,10 @@ def process_video(
         betas = wilor_out['betas']
         pred_keypoints_3d = wilor_out['pred_keypoints_3d']
         verts = wilor_out['pred_vertices']
-        pred_cam = wilor_out['pred_cam']
-        box_center = wilor_out['box_center']
-        box_size = wilor_out['box_size']
-        img_size = wilor_out['img_size']
         is_right_val = wilor_out['right']
         
-        # Compute camera translation
-        multiplier = (2 * is_right_val - 1)
-        pred_cam_adjusted = pred_cam.copy()
-        pred_cam_adjusted[1] = multiplier * pred_cam_adjusted[1]
-        
-        scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-        
-        # cam_crop_to_full expects tensors
-        pred_cam_t = torch.tensor(pred_cam_adjusted).unsqueeze(0)
-        box_center_t = torch.tensor(box_center).unsqueeze(0)
-        box_size_t = torch.tensor(box_size).unsqueeze(0)
-        img_size_t = torch.tensor(img_size).unsqueeze(0)
-        
-        pred_cam_t_full = cam_crop_to_full(
-            pred_cam_t, box_center_t, box_size_t, img_size_t, scaled_focal_length
-        ).numpy()[0]
+        pred_cam_t_full = pred_cam_t_full_all[det_idx]
+        scaled_focal_length = scaled_focal_lengths[det_idx]
         
         # Mirror vertices/joints for left hand
         joints_3d_wilor = pred_keypoints_3d.copy()
@@ -444,71 +745,87 @@ def process_video(
     result['left_betas'] = np.median(np.stack(left_betas_list), axis=0) if left_betas_list else np.zeros(10, dtype=np.float32)
     result['right_betas'] = np.median(np.stack(right_betas_list), axis=0) if right_betas_list else np.zeros(10, dtype=np.float32)
     
-    # ========== PHASE 5: Generate visualization ==========
-    if vis_flag and vis_path:
-        print(f"  Generating visualization...")
-        vis_frames = []
+    # ========== PHASE 4.5: Velocity-based filtering ==========
+    max_hand_velocity = config.get('max_hand_velocity', None)
+    fps = config.get('fps', 10)
+    
+    if max_hand_velocity is not None and max_hand_velocity > 0:
+        dt = 1.0 / fps
+        max_dist_per_frame = max_hand_velocity * dt
         
-        # Use ViPE intrinsics for metric visualization
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        left_filtered = 0
+        right_filtered = 0
         
-        for frame_idx in range(num_frames):
-            vis_frame = frames[frame_idx].copy()
+        for side in ['left', 'right']:
+            wrist_poses = result[f'{side}_wrist_pose']
             
-            # Collect all hands in this frame for batch rendering
-            all_verts = []
-            all_cam_t = []
-            all_is_right = []
-            all_mesh_colors = []
-            wrist_data_list = []
+            # Track last valid frame for velocity comparison
+            last_valid_idx = None
+            last_valid_pos = None
             
-            for side in ['left', 'right']:
-                data = vis_data[frame_idx][side]
-                if data is None:
+            for frame_idx in range(num_frames):
+                if not result[f'{side}_valid'][frame_idx]:
                     continue
                 
-                mesh_color = (0.2, 0.4, 0.9) if side == 'left' else (0.9, 0.4, 0.2)
+                curr_pos = wrist_poses[frame_idx, :3, 3]
                 
-                # Use vertices repositioned to metric depth (no extra rotation applied)
-                all_verts.append(data['verts_repositioned'])
-                all_cam_t.append(np.zeros(3))  # Already in camera frame
-                all_is_right.append(data['is_right'])
-                all_mesh_colors.append(mesh_color)
-                wrist_data_list.append({
-                    'wrist_pos': data['wrist_pos'],
-                    'wrist_rot': data['wrist_rot'],
-                })
-            
-            # Render all hands in this frame (metric camera frame)
-            if all_verts:
-                # Use first mesh color (could blend if needed)
-                mesh_overlay = renderer.render_rgba_multiple(
-                    all_verts,
-                    cam_t=all_cam_t,
-                    mesh_base_color=all_mesh_colors[0] if len(all_mesh_colors) == 1 else (0.6, 0.4, 0.5),
-                    scene_bg_color=(0, 0, 0),
-                    render_res=[W, H],
-                    focal_length=fx,  # Use ViPE focal length
-                    is_right=all_is_right,
-                )
+                if last_valid_idx is not None:
+                    # Compute distance from last valid frame
+                    dist = np.linalg.norm(curr_pos - last_valid_pos)
+                    
+                    # Compute allowed distance based on frame gap
+                    frame_gap = frame_idx - last_valid_idx
+                    max_allowed_dist = max_dist_per_frame * frame_gap
+                    
+                    if dist > max_allowed_dist:
+                        # Mark current frame as invalid (the one that "jumped")
+                        result[f'{side}_valid'][frame_idx] = False
+                        result[f'{side}_wrist_pose'][frame_idx] = np.full((4, 4), np.nan, dtype=np.float32)
+                        result[f'{side}_hand_pose'][frame_idx] = np.full((15, 3, 3), np.nan, dtype=np.float32)
+                        result[f'{side}_joints_3d'][frame_idx] = np.full((21, 3), np.nan, dtype=np.float32)
+                        
+                        # Also invalidate vis_data if we're visualizing
+                        if vis_flag and vis_data is not None:
+                            vis_data[frame_idx][side] = None
+                        
+                        if side == 'left':
+                            left_filtered += 1
+                        else:
+                            right_filtered += 1
+                        
+                        # Don't update last_valid - keep comparing against last known good frame
+                        continue
                 
-                alpha = mesh_overlay[:, :, 3:4]
-                vis_frame = (vis_frame / 255.0 * (1 - alpha) + mesh_overlay[:, :, :3] * alpha)
-                vis_frame = (vis_frame * 255).astype(np.uint8)
-                
-                # Draw wrist poses using ViPE intrinsics
-                for wrist_data in wrist_data_list:
-                    draw_wrist_pose(vis_frame, wrist_data['wrist_pos'], wrist_data['wrist_rot'], 
-                                   intrinsics, axis_length=0.05)
-            
-            vis_frames.append(vis_frame)
+                # This frame is valid, update tracking
+                last_valid_idx = frame_idx
+                last_valid_pos = curr_pos
         
-        vis_path.mkdir(parents=True, exist_ok=True)
-        video_path = vis_path / f"{video_name}.mp4"
-        writer = imageio.get_writer(video_path, fps=vis_fps)
-        for frame in vis_frames:
-            writer.append_data(frame)
-        writer.close()
+        if left_filtered > 0 or right_filtered > 0:
+            print(f"  Velocity filter (>{max_hand_velocity:.1f} m/s): removed {left_filtered} left, {right_filtered} right frames")
+    
+    # ========== PHASE 4.6: Interpolate gaps ==========
+    max_interpolation_gap = config.get('max_interpolation_gap', 0)
+    
+    if max_interpolation_gap > 0:
+        left_interp = interpolate_hand_data(result, vis_data, 'left', max_interpolation_gap, num_frames)
+        right_interp = interpolate_hand_data(result, vis_data, 'right', max_interpolation_gap, num_frames)
+        
+        if left_interp > 0 or right_interp > 0:
+            print(f"  Interpolated gaps (max {max_interpolation_gap}): {left_interp} left, {right_interp} right frames")
+    
+    # ========== PHASE 5: Generate 3D visualization ==========
+    if vis_flag and vis_path:
+        print(f"  Generating 3D visualization...")
+        create_3d_visualization(
+            video_name=video_name,
+            frames=frames,
+            depths=depths,
+            intrinsics=intrinsics,
+            vis_data=vis_data,
+            mano_faces=mano_faces,
+            vis_path=vis_path,
+            vis_fps=vis_fps,
+        )
     
     return result
 
@@ -585,10 +902,9 @@ def main():
     detector = detector.to(device)
     print("✅ YOLO detector loaded")
     
-    print("Setting up renderer...")
-    from wilor.utils.renderer import Renderer
-    renderer = Renderer(model_cfg, faces=model.mano.faces)
-    print("✅ Renderer setup complete")
+    # Get MANO faces for visualization
+    mano_faces = model.mano.faces.copy()
+    print(f"✅ MANO faces loaded ({len(mano_faces)} triangles)")
     print(f"{'='*60}\n")
     
     # Process videos
@@ -596,6 +912,7 @@ def main():
     skipped_videos = 0
     start_time = time.time()
     videos_to_process = []
+    processed_video_names = []
     
     # Check for existing outputs if continuing
     if continue_mode and output_dir.exists():
@@ -609,6 +926,7 @@ def main():
             if output_file.exists():
                 print(f"✓ Output file {video_folder.name}.pt exists")
                 skipped_videos += 1
+                processed_video_names.append(video_folder.name)  # Include for HTML index
             else:
                 videos_to_process.append(idx)
         
@@ -645,9 +963,9 @@ def main():
             model=model,
             model_cfg=model_cfg,
             detector=detector,
-            renderer=renderer,
             device=device,
             config=wilor_config,
+            mano_faces=mano_faces,
             vis_flag=vis_flag,
             vis_path=vis_path,
             vis_fps=vis_fps,
@@ -661,6 +979,8 @@ def main():
         output_file = output_dir / f"{video_name}.pt"
         torch.save(result, output_file)
         
+        processed_video_names.append(video_name)
+        
         # Print summary
         video_elapsed = time.time() - video_start_time
         left_valid_count = result['left_valid'].sum()
@@ -672,7 +992,7 @@ def main():
         print(f"  Right hand valid: {right_valid_count}/{result['num_frames']} frames")
         print(f"  Saved to: {output_file}")
         if vis_flag:
-            print(f"  Visualization: {vis_path / f'{video_name}.mp4'}")
+            print(f"  3D Visualization: {vis_path / f'{video_name}_data.bin'}")
         
         total_videos_processed += 1
         
@@ -682,6 +1002,11 @@ def main():
         gc.collect()
     
     elapsed_time = time.time() - start_time
+    
+    # Generate HTML index for visualizations
+    if vis_flag and vis_path and processed_video_names:
+        print(f"\nGenerating HTML viewer...")
+        create_wilor_viz_html(vis_path, processed_video_names)
     
     print(f"\n{'='*60}")
     print(f"✅ ALL VIDEOS PROCESSED!")
@@ -698,6 +1023,12 @@ def main():
     print(f"Output saved to: {output_dir}")
     if vis_flag:
         print(f"Visualizations saved to: {vis_path}")
+        print(f"\n{'='*60}")
+        print("TO VIEW 3D VISUALIZATION:")
+        print(f"{'='*60}")
+        print(f"  cd {vis_path}")
+        print(f"  python -m http.server 8000")
+        print(f"  Then open: http://localhost:8000/index.html")
     print(f"{'='*60}\n")
 
 

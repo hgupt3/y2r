@@ -9,8 +9,8 @@ Usage:
 
 import os
 import sys
-import yaml
 import torch
+from omegaconf import OmegaConf
 import cv2
 import numpy as np
 from pathlib import Path
@@ -41,10 +41,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 def load_vipe_data(npz_path: Path, frames_dir: Path):
@@ -112,22 +110,24 @@ def get_query_points_from_mask(
     depths: torch.Tensor,
     intrinsics: torch.Tensor,
     extrinsics: torch.Tensor,
+    sampling_method: str = "grid",
     grid_size: int = 32,
+    target_points: int = 500,
+    min_mask_percent: float = 1.0,
     erosion_pixels: int = 2,
 ) -> torch.Tensor:
     """
-    Generate 3D query points using a grid over the image, filtered by mask.
-    
-    Creates a grid_size × grid_size grid over the entire image, then keeps
-    only points where mask > 0 and depth > 0. This gives even spatial
-    distribution and consistent color gradients.
+    Generate 3D query points from mask using grid or random sampling.
     
     Args:
         mask: (H, W) binary mask
         depths: (T, H, W) depth maps
         intrinsics: (T, 3, 3) camera intrinsics
         extrinsics: (T, 4, 4) camera extrinsics (world2cam)
-        grid_size: Grid density (creates grid_size × grid_size points)
+        sampling_method: "grid" or "random"
+        grid_size: For grid method: creates grid_size × grid_size points
+        target_points: For random method: number of points to sample
+        min_mask_percent: Minimum mask area as percentage of image (0-100). Skip if below.
         erosion_pixels: Pixels to erode mask
     
     Returns:
@@ -135,6 +135,7 @@ def get_query_points_from_mask(
     """
     H, W = mask.shape
     device = mask.device
+    total_pixels = H * W
     
     # Erode mask to avoid edge points
     if erosion_pixels > 0:
@@ -143,24 +144,55 @@ def get_query_points_from_mask(
         mask_np = cv2.erode(mask_np, kernel, iterations=1)
         mask = torch.from_numpy(mask_np).to(device)
     
-    # Create grid_size × grid_size grid over the entire image
-    step_y = H / grid_size
-    step_x = W / grid_size
-    
-    # Grid points at center of each cell
-    y_grid = (torch.arange(grid_size, device=device) * step_y + step_y / 2).long().clamp(0, H - 1)
-    x_grid = (torch.arange(grid_size, device=device) * step_x + step_x / 2).long().clamp(0, W - 1)
-    
-    yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
-    y_coords = yy.reshape(-1)
-    x_coords = xx.reshape(-1)
-    
-    # Filter by mask AND valid depth
+    # Get valid pixels (mask > 0 AND depth > 0)
     depth_0 = depths[0]
-    valid = (mask[y_coords, x_coords] > 0.5) & (depth_0[y_coords, x_coords] > 0)
+    valid_mask = (mask > 0.5) & (depth_0 > 0)
     
-    y_coords = y_coords[valid]
-    x_coords = x_coords[valid]
+    # Check mask percentage threshold
+    mask_pixels = valid_mask.sum().item()
+    mask_percent = (mask_pixels / total_pixels) * 100
+    
+    if mask_percent < min_mask_percent:
+        return torch.zeros((0, 4), device=device)
+    
+    if sampling_method == "random":
+        # Random sampling: pick target_points uniformly from valid pixels
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False)  # (M, 2)
+        num_valid = valid_indices.shape[0]
+        
+        if num_valid == 0:
+            return torch.zeros((0, 4), device=device)
+        
+        # Sample target_points (or all if fewer available)
+        num_samples = min(target_points, num_valid)
+        perm = torch.randperm(num_valid, device=device)[:num_samples]
+        sampled = valid_indices[perm]
+        
+        # Sort in row-major order (by y first, then x)
+        sort_keys = sampled[:, 0] * W + sampled[:, 1]  # y * width + x
+        sort_order = torch.argsort(sort_keys)
+        sampled = sampled[sort_order]
+        
+        y_coords = sampled[:, 0]
+        x_coords = sampled[:, 1]
+    
+    else:  # grid sampling
+        # Create grid_size × grid_size grid over the entire image
+        step_y = H / grid_size
+        step_x = W / grid_size
+        
+        # Grid points at center of each cell
+        y_grid = (torch.arange(grid_size, device=device) * step_y + step_y / 2).long().clamp(0, H - 1)
+        x_grid = (torch.arange(grid_size, device=device) * step_x + step_x / 2).long().clamp(0, W - 1)
+        
+        yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
+        y_coords = yy.reshape(-1)
+        x_coords = xx.reshape(-1)
+        
+        # Filter by valid mask
+        valid = valid_mask[y_coords, x_coords]
+        y_coords = y_coords[valid]
+        x_coords = x_coords[valid]
     
     if len(x_coords) == 0:
         return torch.zeros((0, 4), device=device)
@@ -323,6 +355,9 @@ def process_video_with_tapip3d(
     mask_erosion_pixels = config['mask_erosion_pixels']
     visibility_threshold = config['visibility_threshold']
     resolution_factor = config['resolution_factor']
+    sampling_method = config.get('sampling_method', 'grid')
+    target_points = config.get('target_points', 500)
+    min_mask_percent = config.get('min_mask_percent', 1.0)
     num_iters = DEFAULT_NUM_ITERS
     
     # Load ViPE data
@@ -393,7 +428,10 @@ def process_video_with_tapip3d(
                 depths=depths_tensor,
                 intrinsics=intrinsics_tensor,
                 extrinsics=extrinsics_tensor,
+                sampling_method=sampling_method,
                 grid_size=grid_size,
+                target_points=target_points,
+                min_mask_percent=min_mask_percent,
                 erosion_pixels=mask_erosion_pixels,
             )
         else:
@@ -886,6 +924,7 @@ def generate_visualizations(
     vis_path: Path,
     vis_fps: int,
     video_list: list,
+    config: dict,
 ):
     """Generate all visualization files for processed videos."""
     print(f"\nGenerating 3D visualizations to {vis_path}")
@@ -906,7 +945,7 @@ def generate_visualizations(
             vipe_file,
             vis_path / f"{video_name}_data.bin",
             fps=vis_fps,
-            config=tapip3d_config,
+            config=config,
         )
         create_video_html(video_name, video_list, vis_path)
     
@@ -960,8 +999,14 @@ def main():
     print(f"{'='*60}")
     print(f"Window length: {tapip3d_config['window_length']} frames")
     print(f"Stride: {tapip3d_config['stride']} frames")
-    print(f"Grid size: {tapip3d_config['grid_size']}")
     print(f"Use masks: {tapip3d_config['use_masks']}")
+    sampling_method = tapip3d_config.get('sampling_method', 'grid')
+    print(f"Sampling method: {sampling_method}")
+    if sampling_method == 'grid':
+        print(f"Grid size: {tapip3d_config['grid_size']}")
+    else:
+        print(f"Target points: {tapip3d_config.get('target_points', 500)}")
+    print(f"Min mask percent: {tapip3d_config.get('min_mask_percent', 1.0)}%")
     print(f"Visibility threshold: {tapip3d_config['visibility_threshold']}")
     print(f"Resolution factor: {tapip3d_config['resolution_factor']}")
     print(f"Num iterations: {DEFAULT_NUM_ITERS} (TAPIP3D default)")
@@ -1050,6 +1095,7 @@ def main():
             vis_path=vis_path,
             vis_fps=vis_fps,
             video_list=processed_video_names,
+            config=tapip3d_config,
         )
         
         print(f"\n{'='*60}")

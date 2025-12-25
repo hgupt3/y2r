@@ -7,15 +7,13 @@ dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative
 # Model configuration
 model:
   model_type: 'autoreg'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  model_size: 's'                # 's' (small), 'b' (base), or 'l' (large) - sets hidden_size, num_heads, time_depth, vit_model
   track_type: '2d'               # '2d' or '3d' - must match dataset_config.yaml
-  # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
-  hidden_size: 384
-  model_resolution: [224, 224]
+  hand_mode: null                # 'left', 'right', 'both', or null - must match dataset_config.yaml
+  # Note: num_future_steps, frame_stack, text_mode are derived from dataset_config
+  model_resolution: [256, 256]
   add_space_attn: true
-  vit_model_name: 'dinov2_vits14'
-  vit_frozen: false
-  num_heads: 8
-  mlp_ratio: 4.0
+  vit_frozen: false              # Fine-tune ViT (when unfreeze_after=0, this controls initial state)
   p_drop_attn: 0.1
 
 # Training configuration
@@ -34,6 +32,9 @@ training:
   use_amp: true
   use_compile: true
   ema_decay: 0.999
+  
+  # Encoder unfreezing schedule (curriculum learning for ViT + SigLIP)
+  unfreeze_after: 0.3           # Unfreeze encoders at 30% of training (0.0 = always unfrozen)
 
   lr_schedule: "cosine"
   warmup_epochs: 5
@@ -49,4 +50,3 @@ training:
   log_every_n_steps: 10
   log_gradients: true
   log_params: true
-

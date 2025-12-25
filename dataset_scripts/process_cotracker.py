@@ -1,7 +1,7 @@
 import os
 import sys
-import yaml
 import torch
+from omegaconf import OmegaConf
 import cv2
 import numpy as np
 from pathlib import Path
@@ -19,10 +19,8 @@ from cotracker3.tap import cotracker
 
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 def load_frames_from_directory(frames_dir):

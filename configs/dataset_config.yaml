@@ -5,14 +5,17 @@
 dataset_dir: "/home/harsh/sam/data/h5_dataset"
 
 # Dataset loader configuration
-img_size: 224
+img_size: 256
 frame_stack: 2          # Number of observation frames (model will use this value)
-num_track_ts: 8         # Number of future timesteps to predict (model num_future_steps)
-num_track_ids: 16       # Number of trajectory points per frame
-downsample_factor: 2    # 1=consecutive frames, 2=every 2nd frame, etc.
+num_track_ts: 10         # Number of future timesteps to predict (model num_future_steps)
+num_track_ids: 32       # Number of trajectory points per frame
+downsample_factor: 1    # 1=consecutive frames, 2=every 2nd frame, etc.
+sample_stride: 3        # Minimum frame spacing between samples (1=use all, 3=at least 3 frames apart)
 cache_all: true         # Cache all data in memory
 cache_image: true       # Images are stored in HDF5 file, not separately on disk
 track_type: "3d"        # "2d" or "3d" - determines data format and normalization
+hand_mode: "right"      # "left", "right", "both", or null to disable hand pose loading
+text_mode: false        # Whether to load text descriptions for language conditioning
 # normalization_stats.yaml is auto-detected from dataset_dir
 
 # Train/validation split configuration
@@ -22,9 +25,9 @@ val_seed: 42            # Random seed for reproducibility
 
 # Data augmentation parameters
 aug_prob: 0.9           # Probability of applying augmentations per batch
-aug_color_jitter: {brightness: 0.2, contrast: 0.2, saturation: 0.2, hue: 0.2}
-aug_translation_px: 16
-aug_rotation_deg: 20
+aug_color_jitter: {brightness: 0.3, contrast: 0.3, saturation: 0.3, hue: 0.3}
+aug_translation_px: 20
+aug_rotation_deg: 30
 aug_hflip_prob: 0.5
 aug_vflip_prob: 0.25
 aug_noise_std: 0.02         # Gaussian noise std for images (0 = disabled)

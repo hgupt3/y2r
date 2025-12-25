@@ -19,8 +19,10 @@ import os
 import sys
 import yaml
 import torch
+from omegaconf import OmegaConf
 import cv2
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import time
@@ -59,10 +61,8 @@ def clip_depth(depth, min_depth=None, max_depth=None):
 
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 # ==============================================================================
@@ -70,7 +70,9 @@ def load_config(config_path="config.yaml"):
 # ==============================================================================
 
 def rotation_matrix_to_6d(R):
-    return R[:, :2].flatten()  # (6,)
+    # Column-major order: first column, then second column
+    # This matches the standard 6D representation and the decoding in test_dataloader.py
+    return np.concatenate([R[:, 0], R[:, 1]])  # (6,) = [r00, r10, r20, r01, r11, r21]
 
 
 def pose_matrix_to_9d(pose_4x4):
@@ -85,6 +87,49 @@ def poses_to_9d(poses):
     for t in range(T):
         poses_9d[t] = pose_matrix_to_9d(poses[t])
     return poses_9d
+
+
+def compute_relative_rotation_6d(R_t, R_0):
+    """
+    Compute relative rotation from R_0 to R_t and convert to 6D representation.
+    
+    Args:
+        R_t: (3, 3) rotation matrix at time t
+        R_0: (3, 3) rotation matrix at time 0
+    
+    Returns:
+        (6,) 6D representation of relative rotation R_rel = R_t @ R_0.T
+    """
+    R_rel = R_t @ R_0.T
+    return rotation_matrix_to_6d(R_rel)
+
+
+def project_wrist_to_uvd(wrist_3d, intrinsics, img_size):
+    """
+    Project 3D wrist position to normalized (u, v, d) coordinates.
+    
+    Args:
+        wrist_3d: (3,) wrist position in camera frame [x, y, z]
+        intrinsics: (3, 3) camera intrinsics matrix
+        img_size: (height, width) of the image
+    
+    Returns:
+        (3,) normalized (u, v, d) where u, v in [0, 1] and d in meters
+    """
+    # Project to pixel coords: uv_h = K @ [x, y, z]^T
+    uv = intrinsics @ wrist_3d  # (3,)
+    
+    # Homogeneous division
+    u_px = uv[0] / uv[2]  # pixel x
+    v_px = uv[1] / uv[2]  # pixel y
+    d = wrist_3d[2]  # z-coordinate is depth
+    
+    # Normalize u, v to [0, 1]
+    h, w = img_size
+    u = u_px / w
+    v = v_px / h
+    
+    return np.array([u, v, d], dtype=np.float32)
 
 
 # ==============================================================================
@@ -119,6 +164,84 @@ def project_to_camera_frame(points_local, intrinsics, img_size):
     v = v_px / h
     
     return u, v, d
+
+
+# ==============================================================================
+# HAND POSE PROCESSING FUNCTIONS
+# ==============================================================================
+
+def process_hand_poses_for_window(wrist_poses_4x4, intrinsics, img_size, num_track_ts):
+    """
+    Process hand poses for a window into query coords and displacements.
+    
+    Args:
+        wrist_poses_4x4: (T, 4, 4) wrist SE3 transforms for the window
+        intrinsics: (3, 3) transformed camera intrinsics
+        img_size: (height, width) of the processed image
+        num_track_ts: Number of timesteps to extract
+    
+    Returns:
+        query_uvd: (3,) initial wrist (u, v, d) at t=0
+        uvd_displacements: (T, 3) position displacements relative to t=0
+        query_rot_6d: (6,) initial wrist rotation (6D) at t=0
+        rot_displacements: (T, 6) rotation displacements (relative rotation -> 6D)
+    """
+    T = min(wrist_poses_4x4.shape[0], num_track_ts)
+    
+    # Extract positions and rotations
+    wrist_positions = wrist_poses_4x4[:T, :3, 3]  # (T, 3)
+    wrist_rotations = wrist_poses_4x4[:T, :3, :3]  # (T, 3, 3)
+    
+    # Project positions to (u, v, d)
+    uvd_all = np.zeros((T, 3), dtype=np.float32)
+    for t in range(T):
+        uvd_all[t] = project_wrist_to_uvd(wrist_positions[t], intrinsics, img_size)
+    
+    # Query coords at t=0
+    query_uvd = uvd_all[0]  # (3,)
+    
+    # Position displacements relative to t=0
+    uvd_displacements = uvd_all - uvd_all[0:1]  # (T, 3)
+    
+    # Extract rotation at t=0
+    R_0 = wrist_rotations[0]  # (3, 3)
+    query_rot_6d = rotation_matrix_to_6d(R_0)  # (6,)
+    
+    # Rotation displacements: relative rotation R_t @ R_0.T -> 6D
+    rot_displacements = np.zeros((T, 6), dtype=np.float32)
+    for t in range(T):
+        rot_displacements[t] = compute_relative_rotation_6d(wrist_rotations[t], R_0)
+    
+    return query_uvd, uvd_displacements, query_rot_6d, rot_displacements
+
+
+def get_valid_hand_poses(hand_data, window_frames):
+    """
+    Get valid hand poses for a window. Returns poses for each hand if valid for ALL frames.
+    
+    Args:
+        hand_data: Dict with 'left_valid', 'right_valid', 'left_wrist_pose', 'right_wrist_pose'
+        window_frames: Array of frame indices for this window
+    
+    Returns:
+        Dict with 'left' and 'right' keys. Each value is (T, 4, 4) poses or None if invalid.
+    """
+    left_valid = hand_data['left_valid']
+    right_valid = hand_data['right_valid']
+    
+    # Check validity for all frames in window using numpy
+    left_valid_window = left_valid[window_frames].all()
+    right_valid_window = right_valid[window_frames].all()
+    
+    result = {'left': None, 'right': None}
+    
+    if left_valid_window:
+        result['left'] = hand_data['left_wrist_pose'][window_frames]
+    
+    if right_valid_window:
+        result['right'] = hand_data['right_wrist_pose'][window_frames]
+    
+    return result
 
 
 # ==============================================================================
@@ -276,7 +399,8 @@ def convert_sliding_windows_to_future_tracks_2d(all_tracks, windows, num_track_t
 # ==============================================================================
 
 def convert_sliding_windows_to_future_tracks_3d(all_tracks, all_window_poses, windows, 
-                                                  num_track_ts, total_frames, intrinsics, img_size):
+                                                  num_track_ts, total_frames, intrinsics, img_size,
+                                                  hand_data=None):
     """
     Convert 3D sliding window tracks to per-frame future (u, v, d) coordinates.
     
@@ -284,6 +408,9 @@ def convert_sliding_windows_to_future_tracks_3d(all_tracks, all_window_poses, wi
     Projects to (u, v, d) and computes displacements relative to t=0.
     Filters out points that go outside image bounds or behind camera at any timestep.
     Skips windows that are shorter than num_track_ts.
+    
+    If hand_data is provided, processes both left and right hand poses for each window
+    (storing whichever hands are valid for all frames in the window).
     """
     # Create mapping from window start frame to data (only if long enough)
     window_map = {}
@@ -296,10 +423,12 @@ def convert_sliding_windows_to_future_tracks_3d(all_tracks, all_window_poses, wi
     per_frame_query_coords = []
     per_frame_displacements = []
     per_frame_poses_9d = []
+    per_frame_hand_data = []  # Hand pose data per frame
     
     for frame_idx in range(total_frames):
         if frame_idx in window_map:
             window_tracks, window_poses = window_map[frame_idx]
+            window_frames = np.arange(frame_idx, frame_idx + num_track_ts)
             
             if isinstance(window_tracks, torch.Tensor):
                 window_tracks = window_tracks.numpy()
@@ -336,28 +465,59 @@ def convert_sliding_windows_to_future_tracks_3d(all_tracks, all_window_poses, wi
             # Convert poses to 9D
             poses_9d = poses_to_9d(window_poses)  # (T, 9)
             
+            # Process hand poses if available - always try both hands
+            hand_pose_data = {}
+            if hand_data is not None:
+                valid_hands = get_valid_hand_poses(hand_data, window_frames)
+                
+                # Process left hand if valid
+                if valid_hands['left'] is not None:
+                    left_query_uvd, left_uvd_disp, left_query_rot, left_rot_disp = \
+                        process_hand_poses_for_window(valid_hands['left'], intrinsics, img_size, num_track_ts)
+                    hand_pose_data['left_wrist_query_uvd'] = left_query_uvd
+                    hand_pose_data['left_wrist_uvd_displacements'] = left_uvd_disp
+                    hand_pose_data['left_wrist_query_rot_6d'] = left_query_rot
+                    hand_pose_data['left_wrist_rot_displacements'] = left_rot_disp
+                
+                # Process right hand if valid
+                if valid_hands['right'] is not None:
+                    right_query_uvd, right_uvd_disp, right_query_rot, right_rot_disp = \
+                        process_hand_poses_for_window(valid_hands['right'], intrinsics, img_size, num_track_ts)
+                    hand_pose_data['right_wrist_query_uvd'] = right_query_uvd
+                    hand_pose_data['right_wrist_uvd_displacements'] = right_uvd_disp
+                    hand_pose_data['right_wrist_query_rot_6d'] = right_query_rot
+                    hand_pose_data['right_wrist_rot_displacements'] = right_rot_disp
+            
             per_frame_query_coords.append(query_coords)
             per_frame_displacements.append(displacements)
             per_frame_poses_9d.append(poses_9d)
+            per_frame_hand_data.append(hand_pose_data if hand_pose_data else None)
         else:
             # Frame not a window start - no tracks
             per_frame_query_coords.append(None)
             per_frame_displacements.append(None)
             per_frame_poses_9d.append(None)
+            per_frame_hand_data.append(None)
     
-    return per_frame_query_coords, per_frame_displacements, per_frame_poses_9d
+    return per_frame_query_coords, per_frame_displacements, per_frame_poses_9d, per_frame_hand_data
 
 
 # ==============================================================================
 # VIDEO PROCESSING FUNCTIONS
 # ==============================================================================
 
-def process_video(video_folder, tracks_file, output_h5_path, config, track_type, vipe_file=None):
+def process_video(video_folder, tracks_file, output_h5_path, config, track_type, vipe_file=None, hand_poses_file=None, text_description=""):
     """
     Process a single video with 2D or 3D tracks.
     
     For 2D: transforms track coords to normalized [0,1] space
     For 3D: projects to (u,v,d), computes displacements and 9D poses
+    
+    If hand_poses_file is provided, also processes both left and right hand poses
+    (storing whichever hands are valid for each window).
+    
+    Args:
+        text_description: Optional text description of the video clip for language conditioning.
     """
     target_size = config['target_size']
     num_track_ts = config['num_track_ts']
@@ -496,11 +656,18 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
         else:
             raise ValueError(f"3D mode requires ViPE depth file but not found: {vipe_file}")
         
-        # Convert to (u, v, d), displacements, and 9D poses
-        per_frame_query_coords, per_frame_displacements, per_frame_poses_9d = \
+        # Load hand pose data if available
+        hand_data = None
+        if hand_poses_file and hand_poses_file.exists():
+            print(f"  Loading hand poses from {hand_poses_file.name}...")
+            hand_data = torch.load(hand_poses_file, map_location='cpu', weights_only=False)
+        
+        # Convert to (u, v, d), displacements, 9D poses, and hand data
+        per_frame_query_coords, per_frame_displacements, per_frame_poses_9d, per_frame_hand_data = \
             convert_sliding_windows_to_future_tracks_3d(
                 all_tracks, all_window_poses, windows, num_track_ts, 
-                total_frames, intrinsics_transformed, img_size=(target_size, target_size)
+                total_frames, intrinsics_transformed, img_size=(target_size, target_size),
+                hand_data=hand_data
             )
         
         # Apply depth clipping to track depths and collect statistics
@@ -527,6 +694,31 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
     print(f"    Frames with tracks: {frames_with_tracks}/{total_frames}")
     print(f"    Avg tracks per frame: {avg_tracks:.1f}")
     
+    # Collect hand pose data for statistics (3D only)
+    all_hand_uvd_displacements = []
+    all_hand_rot_displacements = []
+    frames_with_left_hand = 0
+    frames_with_right_hand = 0
+    
+    if track_type == '3d' and hand_data is not None:
+        for hand_pose_data in per_frame_hand_data:
+            if hand_pose_data is not None:
+                # Collect left hand if present
+                if 'left_wrist_uvd_displacements' in hand_pose_data:
+                    frames_with_left_hand += 1
+                    all_hand_uvd_displacements.append(hand_pose_data['left_wrist_uvd_displacements'])
+                    all_hand_rot_displacements.append(hand_pose_data['left_wrist_rot_displacements'])
+                
+                # Collect right hand if present
+                if 'right_wrist_uvd_displacements' in hand_pose_data:
+                    frames_with_right_hand += 1
+                    all_hand_uvd_displacements.append(hand_pose_data['right_wrist_uvd_displacements'])
+                    all_hand_rot_displacements.append(hand_pose_data['right_wrist_rot_displacements'])
+        
+        print(f"  Hand statistics:")
+        print(f"    Frames with valid left hand: {frames_with_left_hand}/{total_frames}")
+        print(f"    Frames with valid right hand: {frames_with_right_hand}/{total_frames}")
+    
     # Save to HDF5
     print(f"  Saving to HDF5...")
     with h5py.File(output_h5_path, 'w') as f:
@@ -551,10 +743,21 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
                     frame_group.create_dataset('query_coords', data=per_frame_query_coords[t].astype(np.float32))
                     frame_group.create_dataset('displacements', data=per_frame_displacements[t].astype(np.float32))
                     frame_group.create_dataset('poses', data=per_frame_poses_9d[t].astype(np.float32))
+                    
+                    # Save hand pose data if available
+                    if per_frame_hand_data[t] is not None:
+                        hand_data_t = per_frame_hand_data[t]
+                        for key, value in hand_data_t.items():
+                            frame_group.create_dataset(key, data=value.astype(np.float32))
         
         f.create_dataset('root/num_frames', data=total_frames)
         f.create_dataset('root/num_track_ts', data=num_track_ts)
         f.create_dataset('root/track_type', data=track_type)
+        
+        # Store text description (variable-length string)
+        if text_description:
+            dt = h5py.special_dtype(vlen=str)
+            f.create_dataset('root/text', data=text_description, dtype=dt)
     
     print(f"  Saved to {output_h5_path}")
     
@@ -568,6 +771,11 @@ def process_video(video_folder, tracks_file, output_h5_path, config, track_type,
     if track_type == '3d':
         result['depth_values'] = all_depth_values
         result['poses_9d'] = all_poses_9d
+        if hand_data is not None:
+            result['hand_uvd_displacements'] = all_hand_uvd_displacements
+            result['hand_rot_displacements'] = all_hand_rot_displacements
+            result['frames_with_left_hand'] = frames_with_left_hand
+            result['frames_with_right_hand'] = frames_with_right_hand
     
     return result
 
@@ -660,6 +868,45 @@ def compute_pose_statistics(all_poses_9d):
     }
 
 
+def compute_hand_pose_statistics(all_uvd_displacements, all_rot_displacements):
+    """
+    Compute mean and std of hand pose displacements.
+    
+    Args:
+        all_uvd_displacements: List of (T, 3) wrist uvd displacement arrays
+        all_rot_displacements: List of (T, 6) wrist rotation displacement arrays
+    
+    Returns:
+        dict with hand pose statistics
+    """
+    result = {
+        'hand_uvd_disp_mean': [0.0] * 3,
+        'hand_uvd_disp_std': [1.0] * 3,
+        'hand_rot_disp_mean': [0.0] * 6,
+        'hand_rot_disp_std': [1.0] * 6,
+        'num_samples': 0
+    }
+    
+    if len(all_uvd_displacements) == 0:
+        print("  Warning: No hand pose data for computing statistics!")
+        return result
+    
+    # UVD displacement statistics
+    all_uvd = np.concatenate([d.reshape(-1, 3) for d in all_uvd_displacements], axis=0)
+    result['hand_uvd_disp_mean'] = all_uvd.mean(axis=0).tolist()
+    result['hand_uvd_disp_std'] = all_uvd.std(axis=0).tolist()
+    
+    # Rotation displacement statistics
+    if len(all_rot_displacements) > 0:
+        all_rot = np.concatenate([d.reshape(-1, 6) for d in all_rot_displacements], axis=0)
+        result['hand_rot_disp_mean'] = all_rot.mean(axis=0).tolist()
+        result['hand_rot_disp_std'] = all_rot.std(axis=0).tolist()
+    
+    result['num_samples'] = int(len(all_uvd))
+    
+    return result
+
+
 # ==============================================================================
 # MAIN FUNCTION
 # ==============================================================================
@@ -682,11 +929,37 @@ def main():
     if track_type == '2d':
         input_tracks_dir = Path(h5_config['input_tracks_dir'])
         input_vipe_dir = None
+        input_hand_poses_dir = None
         track_dim = 2
     else:  # 3d
         input_tracks_dir = Path(h5_config['input_tracks_3d_dir'])
         input_vipe_dir = Path(h5_config['input_vipe_dir'])
+        input_hand_poses_dir = Path(h5_config['input_hand_poses_dir']) if h5_config.get('input_hand_poses_dir') else None
         track_dim = 3
+    
+    # Load metadata for text descriptions (only if include_text is enabled)
+    clip_to_text = {}
+    include_text = h5_config.get('include_text', False)
+    if include_text:
+        metadata_file = h5_config.get('metadata_file')
+        if not metadata_file:
+            raise ValueError("include_text=True but metadata_file not specified in config")
+        
+        metadata_path = Path(metadata_file)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"include_text=True but metadata file not found: {metadata_path}")
+        
+        print(f"Loading metadata from: {metadata_path}")
+        metadata_df = pd.read_csv(metadata_path)
+        
+        if 'text' not in metadata_df.columns:
+            raise ValueError(f"include_text=True but 'text' column not found in {metadata_path}")
+        
+        for _, row in metadata_df.iterrows():
+            clip_id = int(row['clip_id'])
+            text = str(row['text']) if pd.notna(row['text']) else ""
+            clip_to_text[clip_id] = text
+        print(f"✓ Loaded {len(clip_to_text)} text descriptions")
     
     # Delete previous output directory if not continuing
     if not continue_mode and output_h5_dir.exists():
@@ -716,8 +989,11 @@ def main():
         depth_min = h5_config.get('depth_min')
         depth_max = h5_config.get('depth_max')
         print(f"Depth clipping: min={depth_min}, max={depth_max}")
+        if input_hand_poses_dir:
+            print(f"Input hand poses directory: {input_hand_poses_dir}")
     print(f"Output H5 directory: {output_h5_dir}")
     print(f"Videos to process: {len(video_folders)}")
+    print(f"Include text: {include_text}" + (f" ({len(clip_to_text)} descriptions loaded)" if include_text else ""))
     print(f"Continue mode: {continue_mode}")
     print(f"{'='*60}\n")
     
@@ -737,6 +1013,8 @@ def main():
     all_displacements = []
     all_depth_values = []
     all_poses_9d = []
+    all_hand_uvd_displacements = []
+    all_hand_rot_displacements = []
     all_stats = []
     
     # Efficient resume
@@ -776,7 +1054,13 @@ def main():
         
         try:
             vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
-            stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file)
+            hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
+            
+            # Get text description for this clip
+            clip_id = int(video_folder.name)  # Folder name is clip_id (e.g., "00042" -> 42)
+            text_description = clip_to_text.get(clip_id, "")
+            
+            stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file, hand_poses_file, text_description)
             
             if stats is not None:
                 all_stats.append(stats)
@@ -789,6 +1073,10 @@ def main():
                     all_depth_values.extend(stats['depth_values'])
                 if 'poses_9d' in stats:
                     all_poses_9d.extend(stats['poses_9d'])
+                if 'hand_uvd_displacements' in stats:
+                    all_hand_uvd_displacements.extend(stats['hand_uvd_displacements'])
+                if 'hand_rot_displacements' in stats:
+                    all_hand_rot_displacements.extend(stats['hand_rot_displacements'])
                 
                 video_elapsed = time.time() - video_start_time
                 print(f"\n  Completed in {video_elapsed:.2f}s")
@@ -832,6 +1120,17 @@ def main():
         print(f"  Std: {[f'{s:.4f}' for s in pose_stats['pose_std']]}")
         print(f"  Samples: {pose_stats['num_samples']}")
     
+    # Hand pose statistics (3D only, if hand data available)
+    hand_pose_stats = None
+    if track_type == '3d' and len(all_hand_uvd_displacements) > 0:
+        hand_pose_stats = compute_hand_pose_statistics(all_hand_uvd_displacements, all_hand_rot_displacements)
+        print(f"\nHand pose statistics:")
+        print(f"  UVD disp mean: {[f'{m:.4f}' for m in hand_pose_stats['hand_uvd_disp_mean']]}")
+        print(f"  UVD disp std: {[f'{s:.4f}' for s in hand_pose_stats['hand_uvd_disp_std']]}")
+        print(f"  Rot disp mean: {[f'{m:.4f}' for m in hand_pose_stats['hand_rot_disp_mean']]}")
+        print(f"  Rot disp std: {[f'{s:.4f}' for s in hand_pose_stats['hand_rot_disp_std']]}")
+        print(f"  Samples: {hand_pose_stats['num_samples']}")
+    
     # =========================================================================
     # SAVE NORMALIZATION STATISTICS
     # =========================================================================
@@ -858,6 +1157,16 @@ def main():
             'pose_std': pose_stats['pose_std'],
             'pose_num_samples': pose_stats['num_samples'],
         })
+        
+        # Add hand pose statistics if available
+        if hand_pose_stats is not None:
+            norm_stats.update({
+                'hand_uvd_disp_mean': hand_pose_stats['hand_uvd_disp_mean'],
+                'hand_uvd_disp_std': hand_pose_stats['hand_uvd_disp_std'],
+                'hand_rot_disp_mean': hand_pose_stats['hand_rot_disp_mean'],
+                'hand_rot_disp_std': hand_pose_stats['hand_rot_disp_std'],
+                'hand_pose_num_samples': hand_pose_stats['num_samples'],
+            })
     
     stats_path = output_h5_dir / 'normalization_stats.yaml'
     with open(stats_path, 'w') as f:

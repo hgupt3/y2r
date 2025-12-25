@@ -1,12 +1,13 @@
 import os
 import sys
-import yaml
 import torch
+from omegaconf import OmegaConf
 import argparse
 from pathlib import Path
 from tqdm import tqdm
 import time
 import shutil
+import pandas as pd
 
 # Add thirdparty to path
 SCRIPT_DIR = Path(__file__).parent
@@ -16,11 +17,26 @@ sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
 from sam2.grounded_sam2 import gsam_video
 
 
+def transform_noun(noun: str) -> str:
+    """
+    Transform noun from metadata format to GSAM-friendly format.
+    
+    Examples:
+        "pan:frying" -> "frying pan"
+        "board:cutting" -> "cutting board"
+        "top:counter" -> "counter top"
+        "cup" -> "cup"
+    """
+    if ':' in noun:
+        parts = noun.split(':')
+        # Reverse the order: "pan:frying" -> "frying pan"
+        return ' '.join(reversed(parts))
+    return noun
+
+
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 
 def main():
@@ -39,8 +55,27 @@ def main():
     
     # Extract configuration
     detection_model = gsam_config.get('detection_model', 'grounding-dino')  # Default to grounding-dino
-    text_prompt = gsam_config['text_prompt']
     key_frame_idx = gsam_config.get('key_frame_idx', 0)  # Default to 0 if not specified
+    
+    # Get text_prompt from config (None means use metadata CSV)
+    config_text_prompt = gsam_config.get('text_prompt', None)
+    use_metadata_prompts = config_text_prompt is None
+    
+    # Load metadata CSV for dynamic text prompts (only for 'world' mode when text_prompt is null)
+    clip_to_noun = {}
+    if args.mode == 'world' and use_metadata_prompts:
+        metadata_path = Path(config['common']['metadata_file'])
+        if metadata_path.exists():
+            print(f"Loading metadata from: {metadata_path}")
+            metadata_df = pd.read_csv(metadata_path)
+            # Create mapping from clip_id to transformed noun
+            for _, row in metadata_df.iterrows():
+                clip_id = int(row['clip_id'])
+                noun = transform_noun(str(row['noun']))
+                clip_to_noun[clip_id] = noun
+            print(f"✓ Loaded {len(clip_to_noun)} clip-to-noun mappings")
+        else:
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}. Required when text_prompt is null.")
     input_images_dir = Path(gsam_config['input_images_dir'])
     device = gsam_config['device']
     output_masks_dir = Path(gsam_config['output_masks_dir'])
@@ -78,7 +113,10 @@ def main():
     print(f"{'='*60}")
     print(f"Mode: {args.mode}")
     print(f"Detection model: {detection_model}")
-    print(f"Text prompt: {text_prompt}")
+    if use_metadata_prompts:
+        print(f"Text prompt: Dynamic from metadata.csv (noun column)")
+    else:
+        print(f"Text prompt: {config_text_prompt}")
     print(f"Key frame index: {key_frame_idx} ({'middle frame' if key_frame_idx == -1 else f'frame {key_frame_idx}'})")
     print(f"Input directory: {input_images_dir}")
     print(f"Output masks directory: {output_masks_dir}")
@@ -184,26 +222,60 @@ def main():
         save_path = str(vis_path) if vis_flag else None
         video_name = video_folder.name  # Get the video name (e.g., 00000, 00001, etc.)
         
+        # Get text prompt: use config if provided, otherwise get from metadata
+        clip_id = int(video_name)  # Convert folder name to int (e.g., "00042" -> 42)
+        if config_text_prompt is not None:
+            text_prompt = config_text_prompt
+        elif clip_id in clip_to_noun:
+            text_prompt = clip_to_noun[clip_id] + "."  # Add period for GSAM format
+        else:
+            print(f"⚠ No noun found in metadata for clip_id {clip_id}, skipping {video_folder.name}")
+            continue
+        
         # Run GSAM on the video folder
         print(f"Running GSAM detection and segmentation...")
+        print(f"  Text prompt: \"{text_prompt}\"")
+        
+        # Try detection at initial key_frame_idx
+        current_key_frame = key_frame_idx
         masks_4d, obj_dict = gsam_video(
             frames_dir=str(video_folder),
             text_prompt=text_prompt,
-            key_frame_idx=key_frame_idx,  # Pass the key frame index
+            key_frame_idx=current_key_frame,
             save_path=save_path,
-            video_name=video_name,  # Pass video name for unique filenames
+            video_name=video_name,
             device=device,
             fps=vis_fps,
-            grounding_model=grounding_model,  # Pass pre-loaded DINO model (if using DINO)
-            processor=processor,  # Pass pre-loaded DINO processor (if using DINO)
-            sam2_predictor=sam2_predictor,  # Pass pre-loaded SAM2 predictor
-            detection_model=detection_model,  # Pass detection model choice
-            florence2_model=florence2_model,  # Pass pre-loaded Florence-2 model (if using Florence)
-            florence2_processor=florence2_processor  # Pass pre-loaded Florence-2 processor (if using Florence)
+            grounding_model=grounding_model,
+            processor=processor,
+            sam2_predictor=sam2_predictor,
+            detection_model=detection_model,
+            florence2_model=florence2_model,
+            florence2_processor=florence2_processor
         )
         
-        if masks_4d is None:
-            print(f"⚠ Failed to process {video_folder.name}")
+        # If detection failed and we weren't already using middle frame, retry with middle frame
+        if (masks_4d is None or len(obj_dict) == 0) and current_key_frame != -1:
+            print(f"  ⚠ No object detected at frame {current_key_frame}, retrying with middle frame...")
+            masks_4d, obj_dict = gsam_video(
+                frames_dir=str(video_folder),
+                text_prompt=text_prompt,
+                key_frame_idx=-1,  # Middle frame
+                save_path=save_path,
+                video_name=video_name,
+                device=device,
+                fps=vis_fps,
+                grounding_model=grounding_model,
+                processor=processor,
+                sam2_predictor=sam2_predictor,
+                detection_model=detection_model,
+                florence2_model=florence2_model,
+                florence2_processor=florence2_processor
+            )
+        
+        # If still no detection, skip this clip
+        if masks_4d is None or len(obj_dict) == 0:
+            print(f"⚠ No object detected in {video_folder.name} after retrying, skipping clip")
             continue
         
         # Save masks as PyTorch file

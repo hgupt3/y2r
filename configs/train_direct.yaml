@@ -7,15 +7,13 @@ dataset_config: "dataset_config.yaml"  # Path to shared dataset config (relative
 # Model configuration
 model:
   model_type: 'direct'          # 'direct' for IntentTracker, 'diffusion' for DiffusionIntentTracker, 'autoreg' for AutoregressiveIntentTracker
+  model_size: 's'               # 's' (small), 'b' (base), or 'l' (large) - sets hidden_size, num_heads, time_depth, vit_model
   track_type: '3d'              # '2d' or '3d' - must match dataset_config.yaml
-  # Note: num_future_steps and frame_stack are derived from dataset_config (num_track_ts and frame_stack)
-  hidden_size: 384
-  model_resolution: [224, 224]
+  hand_mode: 'right'            # 'left', 'right', 'both', or null - must match dataset_config.yaml
+  # Note: num_future_steps, frame_stack, text_mode are derived from dataset_config
+  model_resolution: [256, 256]
   add_space_attn: true
-  vit_model_name: 'dinov2_vits14'
-  vit_frozen: false             # Fine-tune ViT
-  num_heads: 8                  # Number of attention heads (384/8=48 per head)
-  mlp_ratio: 4.0                # MLP hidden dim = hidden_size * mlp_ratio
+  vit_frozen: false             # Fine-tune ViT (when unfreeze_after=0, this controls initial state)
   p_drop_attn: 0.1              # Attention dropout (0.0 = no dropout, 0.1-0.3 typical)
   
   # Diffusion-specific parameters (only used when model_type='diffusion')
@@ -42,6 +40,9 @@ training:
   use_amp: true                 # Mixed precision training
   use_compile: true             # torch.compile for speed
   ema_decay: 0.999              # Model EMA
+  
+  # Encoder unfreezing schedule (curriculum learning for ViT + SigLIP)
+  unfreeze_after: 0.3           # Unfreeze encoders at 30% of training (0.0 = always unfrozen)
   
   # Learning rate schedule (cosine with warmup)
   lr_schedule: "cosine"

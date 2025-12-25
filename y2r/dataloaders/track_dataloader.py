@@ -54,7 +54,8 @@ class TrackDataset(SimpleBaseDataset):
     
     def __init__(self, h5_files=None, dataset_dir=None, img_size=224, num_track_ts=16, 
                  num_track_ids=64, frame_stack=1, downsample_factor=1, cache_all=False, 
-                 cache_image=False, num_demos=None, track_type="2d"):
+                 cache_image=False, num_demos=None, track_type="2d", hand_mode=None,
+                 sample_stride=1, text_mode=False):
         """
         Initialize TrackDataset.
         
@@ -70,6 +71,9 @@ class TrackDataset(SimpleBaseDataset):
             cache_image: Whether to cache images in memory
             num_demos: Fraction of demos to use (0-1)
             track_type: "2d" or "3d" - determines data format and normalization
+            hand_mode: "left", "right", "both", or None - filter samples by hand availability
+            sample_stride: Minimum frame spacing between samples (1=use all, 3=at least 3 frames apart)
+            text_mode: Whether to load text descriptions for language conditioning
         """
         if h5_files is not None and dataset_dir is not None:
             raise ValueError("Provide either h5_files or dataset_dir, not both")
@@ -78,6 +82,12 @@ class TrackDataset(SimpleBaseDataset):
         
         self._custom_h5_files = h5_files
         self.track_type = track_type
+        self.hand_mode = hand_mode
+        self.text_mode = text_mode
+        
+        # Validate hand_mode
+        if hand_mode is not None and hand_mode not in ('left', 'right', 'both'):
+            raise ValueError(f"hand_mode must be 'left', 'right', 'both', or None, got '{hand_mode}'")
         
         # Determine dataset directory for stats loading
         if h5_files is not None:
@@ -111,6 +121,7 @@ class TrackDataset(SimpleBaseDataset):
         self.num_track_ids = num_track_ids
         self.cache_all = cache_all
         self.cache_image = cache_image
+        self.sample_stride = sample_stride
         
         if not cache_all:
             assert not cache_image, "cache_image is only supported when cache_all is True."
@@ -149,9 +160,99 @@ class TrackDataset(SimpleBaseDataset):
         self._demo_id_to_demo_length = {}
         self._demo_id_to_valid_indices = {}
         self._index_to_local_frame = {}
+        self._demo_id_to_text = {}  # Text description per demo (for language conditioning)
         
         # Load demo info
         self.load_demo_info()
+
+    def load_demo_info(self):
+        """Load metadata for all demos and create index mappings, filtering by track and hand availability."""
+        start_idx = 0
+        demos_with_text = 0
+        for demo_idx, fn in enumerate(self.buffer_fns):
+            demo = self.load_h5(fn)
+            
+            # Load text description if text_mode is enabled
+            if self.text_mode:
+                text = ""
+                if 'text' in demo['root']:
+                    text_data = demo['root']['text']
+                    # Handle both bytes and string formats
+                    if isinstance(text_data, bytes):
+                        text = text_data.decode('utf-8')
+                    elif isinstance(text_data, np.ndarray):
+                        text = str(text_data.item()) if text_data.ndim == 0 else str(text_data[0])
+                    else:
+                        text = str(text_data)
+                    if text:
+                        demos_with_text += 1
+                self._demo_id_to_text[demo_idx] = text
+            
+            # Get demo length from video shape
+            demo_len = demo["root"]["video"].shape[0]
+            
+            # Determine valid frame indices based on track and hand availability
+            valid_frame_indices = []
+            for t in range(demo_len):
+                track_key = f"frame_{t:04d}"
+                if track_key not in demo["root"]["tracks"]:
+                    continue
+                    
+                frame_data = demo["root"]["tracks"][track_key]
+                num_points = frame_data['query_coords'].shape[0]
+                if num_points < self.num_track_ids:
+                    continue
+                
+                # Check hand availability if hand_mode is set
+                if self.hand_mode is not None:
+                    has_left = f'left_wrist_query_uvd' in frame_data
+                    has_right = f'right_wrist_query_uvd' in frame_data
+                    
+                    if self.hand_mode == 'left' and not has_left:
+                        continue
+                    elif self.hand_mode == 'right' and not has_right:
+                        continue
+                    elif self.hand_mode == 'both' and not (has_left and has_right):
+                        continue
+                
+                valid_frame_indices.append(t)
+            
+            # Apply sample stride - ensure minimum spacing between selected frames
+            if self.sample_stride > 1 and len(valid_frame_indices) > 0:
+                strided_indices = [valid_frame_indices[0]]  # Always include first
+                for f in valid_frame_indices[1:]:
+                    if f - strided_indices[-1] >= self.sample_stride:
+                        strided_indices.append(f)
+                valid_frame_indices = strided_indices
+            
+            num_valid = len(valid_frame_indices)
+            
+            if self.cache_all:
+                demo = self.process_demo(demo)
+                if not self.cache_image:
+                    del demo["root"]["video"]
+                demo["_valid_frame_indices"] = valid_frame_indices
+                self._cache.append(demo)
+            
+            self._demo_id_to_path[demo_idx] = fn
+            self._demo_id_to_valid_indices[demo_idx] = valid_frame_indices
+            for local_idx in valid_frame_indices:
+                self._index_to_demo_id[start_idx] = demo_idx
+                self._index_to_local_frame[start_idx] = local_idx
+                start_idx += 1
+            
+            self._demo_id_to_demo_length[demo_idx] = demo_len
+            
+            hand_info = ""
+            if self.hand_mode:
+                hand_info = f" (hand_mode={self.hand_mode})"
+            print(f"Demo {demo_idx} ({os.path.basename(fn)}): {num_valid}/{demo_len} valid frames{hand_info}")
+
+        num_samples = len(self._index_to_demo_id)
+        assert num_samples == start_idx
+        print(f"Total samples: {num_samples}")
+        if self.text_mode:
+            print(f"Text mode: {demos_with_text}/{len(self.buffer_fns)} demos with text descriptions")
 
     def _load_image_list_from_demo(self, demo, time_offset, num_frames=None, backward=False):
         """Load images from cached demo with temporal downsampling support."""
@@ -246,6 +347,23 @@ class TrackDataset(SimpleBaseDataset):
         if self.track_type == '3d' and 'poses' in frame_data:
             poses = torch.Tensor(frame_data['poses'])  # (T_stored, 9)
         
+        # Load hand pose data if hand_mode is set
+        hand_data = {}
+        if self.hand_mode is not None:
+            sides_to_load = []
+            if self.hand_mode in ('left', 'both'):
+                sides_to_load.append('left')
+            if self.hand_mode in ('right', 'both'):
+                sides_to_load.append('right')
+            
+            for side in sides_to_load:
+                prefix = f'{side}_wrist'
+                if f'{prefix}_query_uvd' in frame_data:
+                    hand_data[f'{prefix}_query_uvd'] = torch.Tensor(frame_data[f'{prefix}_query_uvd'])  # (3,)
+                    hand_data[f'{prefix}_uvd_displacements'] = torch.Tensor(frame_data[f'{prefix}_uvd_displacements'])  # (T, 3)
+                    hand_data[f'{prefix}_query_rot_6d'] = torch.Tensor(frame_data[f'{prefix}_query_rot_6d'])  # (6,)
+                    hand_data[f'{prefix}_rot_displacements'] = torch.Tensor(frame_data[f'{prefix}_rot_displacements'])  # (T, 6)
+        
         # Apply temporal downsampling to displacements and poses
         stored_num_track_ts = displacements.shape[0]
         required_stored_ts = self.num_track_ts * self.downsample_factor
@@ -261,11 +379,19 @@ class TrackDataset(SimpleBaseDataset):
             displacements = displacements[indices]
             if poses is not None:
                 poses = poses[indices]
+            # Apply downsampling to hand data
+            for key in list(hand_data.keys()):
+                if 'displacements' in key:
+                    hand_data[key] = hand_data[key][indices]
         else:
             indices = torch.arange(self.num_track_ts)
             displacements = displacements[:self.num_track_ts]
             if poses is not None:
                 poses = poses[:self.num_track_ts]
+            # Apply downsampling to hand data
+            for key in list(hand_data.keys()):
+                if 'displacements' in key:
+                    hand_data[key] = hand_data[key][:self.num_track_ts]
         
         # Load depth (required for 3D) - load PAST frames matching imgs (for model input)
         depth = None
@@ -309,6 +435,17 @@ class TrackDataset(SimpleBaseDataset):
                 # Normalize depth maps
                 if depth is not None:
                     depth = self.norm_stats.normalize_depth_torch(depth)
+                # Normalize hand data
+                if hand_data and self.norm_stats.has_hand_stats:
+                    for key in list(hand_data.keys()):
+                        if 'query_uvd' in key:
+                            # Normalize depth component (3rd dimension) of query_uvd
+                            hand_data[key][2] = self.norm_stats.normalize_depth_torch(hand_data[key][2])
+                        elif 'uvd_displacements' in key:
+                            hand_data[key] = self.norm_stats.normalize_hand_uvd_disp_torch(hand_data[key])
+                        elif 'rot_displacements' in key:
+                            hand_data[key] = self.norm_stats.normalize_hand_rot_disp_torch(hand_data[key])
+                        # query_rot_6d is not normalized (it's a rotation representation)
             else:
                 # 2D: just normalize displacements
                 displacements = self.norm_stats.normalize_displacement_torch(displacements)
@@ -331,5 +468,13 @@ class TrackDataset(SimpleBaseDataset):
             result['poses'] = poses
         if depth is not None:
             result['depth'] = depth
+        
+        # Add hand data to result
+        for key, value in hand_data.items():
+            result[key] = value
+        
+        # Add text description if text_mode enabled (string, not tensor - handled specially by collate)
+        if self.text_mode:
+            result['text'] = self._demo_id_to_text.get(demo_id, "")
         
         return result

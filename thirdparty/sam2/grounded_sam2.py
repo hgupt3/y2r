@@ -64,11 +64,18 @@ def gsam_video(
         print(f"Error: Directory not found: {frames_dir}")
         return None, None
     
-    # Get all PNG files, sorted by name
-    png_files = sorted(frames_path.glob("*.png"))
+    # Get all image files (PNG or JPG), sorted by name
+    png_files = sorted(
+        list(frames_path.glob("*.png")) + 
+        list(frames_path.glob("*.jpg")) + 
+        list(frames_path.glob("*.jpeg")) +
+        list(frames_path.glob("*.PNG")) +
+        list(frames_path.glob("*.JPG")) +
+        list(frames_path.glob("*.JPEG"))
+    )
     
     if len(png_files) == 0:
-        print(f"No PNG files found in {frames_dir}")
+        print(f"No image files (PNG/JPG) found in {frames_dir}")
         return None, None
     
     # Load first frame to get dimensions

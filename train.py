@@ -76,7 +76,7 @@ def load_normalization_stats(stats_path):
     return stats
 
 
-def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None, is_diffusion=False, num_inference_steps=10):
+def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None, is_diffusion=False, num_inference_steps=10, hand_mode=None, text_mode=False):
     """
     Run validation and return metrics + visualizations.
     
@@ -88,14 +88,19 @@ def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None
         vis_sample_indices: list of indices to visualize
         is_diffusion: bool, whether model is diffusion-based
         num_inference_steps: int, number of DDIM steps for diffusion models (ignored for direct models)
+        hand_mode: "left", "right", "both", or None - determines hand data loading
+        text_mode: bool - whether to use text conditioning
         
     Returns:
-        metrics: dict with 'avg_error'
+        metrics: dict with 'avg_error' and optionally hand errors
         vis_data: list of dicts with sample predictions for logging
     """
     model.eval()
-    total_error = 0.0
-    total_points = 0
+    total_track_error = 0.0
+    total_track_points = 0
+    total_hand_uvd_error = 0.0
+    total_hand_rot_error = 0.0
+    total_hand_points = 0
     
     # Store specific samples for visualization
     vis_data = []
@@ -121,21 +126,79 @@ def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None
                 # Model expects (B, frame_stack, 1, H, W)
                 model_depth = depth.unsqueeze(2)  # (B, frame_stack, 1, H, W)
             
+            # Prepare hand data if hand_mode is set
+            hand_query_uvd = None
+            hand_query_rot = None
+            gt_hand_uvd_disp = None
+            gt_hand_rot_disp = None
+            
+            if hand_mode is not None:
+                hand_query_uvd_list = []
+                hand_query_rot_list = []
+                gt_hand_uvd_disp_list = []
+                gt_hand_rot_disp_list = []
+                
+                sides = []
+                if hand_mode in ('left', 'both'):
+                    sides.append('left')
+                if hand_mode in ('right', 'both'):
+                    sides.append('right')
+                
+                for side in sides:
+                    prefix = f'{side}_wrist'
+                    if f'{prefix}_query_uvd' in batch:
+                        hand_query_uvd_list.append(batch[f'{prefix}_query_uvd'].to(device))
+                        hand_query_rot_list.append(batch[f'{prefix}_query_rot_6d'].to(device))
+                        gt_hand_uvd_disp_list.append(batch[f'{prefix}_uvd_displacements'].to(device))
+                        gt_hand_rot_disp_list.append(batch[f'{prefix}_rot_displacements'].to(device))
+                
+                if hand_query_uvd_list:
+                    hand_query_uvd = torch.stack(hand_query_uvd_list, dim=1)
+                    hand_query_rot = torch.stack(hand_query_rot_list, dim=1)
+                    gt_hand_uvd_disp = torch.stack(gt_hand_uvd_disp_list, dim=1)
+                    gt_hand_rot_disp = torch.stack(gt_hand_rot_disp_list, dim=1)
+            
+            # Extract text for text_mode
+            text = batch.get('text') if text_mode else None
+            
             # BATCHED prediction (much faster!)
             if is_diffusion:
-                pred_disp = model.predict(frames, query_coords, depth=model_depth, num_inference_steps=num_inference_steps)
+                outputs = model.predict(frames, query_coords, depth=model_depth, num_inference_steps=num_inference_steps,
+                                       hand_query_uvd=hand_query_uvd, hand_query_rot=hand_query_rot, text=text)
             else:
-                pred_disp = model.predict(frames, query_coords, depth=model_depth)
+                outputs = model.predict(frames, query_coords, depth=model_depth,
+                                       hand_query_uvd=hand_query_uvd, hand_query_rot=hand_query_rot, text=text)
             
-            # Compute error in normalized space (L2 norm)
-            error = torch.norm(pred_disp - gt_disp_normalized, dim=-1)  # (B, N, T)
+            # Handle dict output (new format) or tensor output (backward compat)
+            if isinstance(outputs, dict):
+                pred_track_disp = outputs['track_disp']
+            else:
+                pred_track_disp = outputs
+            
+            # Compute track error in normalized space (L2 norm)
+            track_error = torch.norm(pred_track_disp - gt_disp_normalized, dim=-1)  # (B, N, T)
             
             # Mask out t=0 (displacement at t=0 should be zero)
-            loss_mask = torch.ones_like(error)
+            loss_mask = torch.ones_like(track_error)
             loss_mask[:, :, 0] = 0.0
             
-            total_error += (error * loss_mask).sum().item()
-            total_points += loss_mask.sum().item()
+            total_track_error += (track_error * loss_mask).sum().item()
+            total_track_points += loss_mask.sum().item()
+            
+            # Compute hand errors if available
+            if hand_mode is not None and gt_hand_uvd_disp is not None and isinstance(outputs, dict) and 'hand_uvd_disp' in outputs:
+                pred_hand_uvd = outputs['hand_uvd_disp']  # (B, H, T, 3)
+                pred_hand_rot = outputs['hand_rot_disp']  # (B, H, T, 6)
+                
+                hand_uvd_error = torch.norm(pred_hand_uvd - gt_hand_uvd_disp, dim=-1)  # (B, H, T)
+                hand_rot_error = torch.norm(pred_hand_rot - gt_hand_rot_disp, dim=-1)  # (B, H, T)
+                
+                hand_mask = torch.ones_like(hand_uvd_error)
+                hand_mask[:, :, 0] = 0.0
+                
+                total_hand_uvd_error += (hand_uvd_error * hand_mask).sum().item()
+                total_hand_rot_error += (hand_rot_error * hand_mask).sum().item()
+                total_hand_points += hand_mask.sum().item()
             
             # Collect visualization samples (only for specific indices)
             if vis_sample_indices is not None:
@@ -151,13 +214,19 @@ def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None
                         if is_diffusion:
                             frame = frames[b:b+1]
                             d = model_depth[b:b+1] if model_depth is not None else None
+                            sample_text = [text[b]] if text is not None else None
                             pred_single, intermediate = model.predict(
-                                frame, qc, depth=d, num_inference_steps=num_inference_steps, return_intermediate=True
+                                frame, qc, depth=d, num_inference_steps=num_inference_steps, return_intermediate=True, text=sample_text
                             )
+                            # Handle dict or tensor output
+                            if isinstance(pred_single, dict):
+                                pred_disp_vis = pred_single['track_disp']
+                            else:
+                                pred_disp_vis = pred_single
                             vis_dict = {
                                 'frame': frame.cpu(),
                                 'gt_disp': gt_disp_b.cpu(),  # (N, T, coord_dim)
-                                'pred_disp': pred_single.cpu(),  # (1, N, T, coord_dim)
+                                'pred_disp': pred_disp_vis.cpu(),  # (1, N, T, coord_dim)
                                 'query_coords': qc[0].cpu(),  # (N, coord_dim)
                                 'intermediate': [x.cpu() for x in intermediate],
                                 'track_type': track_type,
@@ -166,20 +235,39 @@ def validate(model, val_loader, device, track_type='2d', vis_sample_indices=None
                             vis_dict = {
                                 'frame': frames[b:b+1].cpu(),
                                 'gt_disp': gt_disp_b.cpu(),  # (N, T, coord_dim)
-                                'pred_disp': pred_disp[b:b+1].cpu(),  # (1, N, T, coord_dim)
+                                'pred_disp': pred_track_disp[b:b+1].cpu(),  # (1, N, T, coord_dim)
                                 'query_coords': query_coords[b].cpu(),  # (N, coord_dim)
                                 'track_type': track_type,
                             }
+                        
+                        # Add hand data to vis_dict if available
+                        if hand_mode is not None and hand_query_uvd is not None:
+                            vis_dict['hand_query_uvd'] = hand_query_uvd[b].cpu()  # (H, 3)
+                            vis_dict['hand_query_rot'] = hand_query_rot[b].cpu()  # (H, 6)
+                            
+                            if gt_hand_uvd_disp is not None:
+                                vis_dict['gt_hand_uvd'] = gt_hand_uvd_disp[b].cpu()  # (H, T, 3)
+                                vis_dict['gt_hand_rot'] = gt_hand_rot_disp[b].cpu()  # (H, T, 6)
+                            
+                            if isinstance(outputs, dict) and 'hand_uvd_disp' in outputs:
+                                vis_dict['pred_hand_uvd'] = outputs['hand_uvd_disp'][b].cpu()  # (H, T, 3)
+                                vis_dict['pred_hand_rot'] = outputs['hand_rot_disp'][b].cpu()  # (H, T, 6)
+                        
                         vis_data.append(vis_dict)
     
     metrics = {
-        'avg_error': total_error / total_points if total_points > 0 else 0.0,
+        'avg_error': total_track_error / total_track_points if total_track_points > 0 else 0.0,
     }
+    
+    # Add hand metrics if available
+    if total_hand_points > 0:
+        metrics['avg_hand_uvd_error'] = total_hand_uvd_error / total_hand_points
+        metrics['avg_hand_rot_error'] = total_hand_rot_error / total_hand_points
     
     return metrics, vis_data
 
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model, device, cfg, epoch, global_step, track_type='2d', gpu_augmenter=None, aug_prob=0.0):
+def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model, device, cfg, epoch, global_step, track_type='2d', gpu_augmenter=None, aug_prob=0.0, hand_mode=None, text_mode=False):
     """
     Train for one epoch.
     
@@ -197,6 +285,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         track_type: "2d" or "3d" - determines whether depth is used
         gpu_augmenter: GPUAugmentations instance for GPU-accelerated augmentations
         aug_prob: Probability of applying augmentations per batch
+        hand_mode: "left", "right", "both", or None - determines hand data loading
+        text_mode: bool - whether to use text conditioning
     
     Returns:
         global_step: updated global step counter
@@ -244,9 +334,49 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
             'depth': model_depth,
         }
         
+        # === TEXT DATA ===
+        if text_mode and 'text' in batch:
+            model_batch['text'] = batch['text']  # List[str]
+        
+        # === HAND DATA ===
+        if hand_mode is not None:
+            # Collect hand data from batch based on hand_mode
+            hand_query_uvd_list = []
+            hand_query_rot_list = []
+            gt_hand_uvd_disp_list = []
+            gt_hand_rot_disp_list = []
+            
+            sides = []
+            if hand_mode in ('left', 'both'):
+                sides.append('left')
+            if hand_mode in ('right', 'both'):
+                sides.append('right')
+            
+            for side in sides:
+                prefix = f'{side}_wrist'
+                if f'{prefix}_query_uvd' in batch:
+                    hand_query_uvd_list.append(batch[f'{prefix}_query_uvd'].to(device, non_blocking=True))
+                    hand_query_rot_list.append(batch[f'{prefix}_query_rot_6d'].to(device, non_blocking=True))
+                    # Displacements are (B, T, dim), need to permute to (B, T, dim) -> keep as is
+                    gt_hand_uvd_disp_list.append(batch[f'{prefix}_uvd_displacements'].to(device, non_blocking=True))
+                    gt_hand_rot_disp_list.append(batch[f'{prefix}_rot_displacements'].to(device, non_blocking=True))
+            
+            if hand_query_uvd_list:
+                # Stack along hand dimension: (B, H, dim)
+                # hand_query_uvd: list of (B, 3) -> stack to (B, H, 3)
+                model_batch['hand_query_uvd'] = torch.stack(hand_query_uvd_list, dim=1)
+                model_batch['hand_query_rot'] = torch.stack(hand_query_rot_list, dim=1)
+                # gt_hand_uvd_disp: list of (B, T, 3) -> stack to (B, H, T, 3)
+                model_batch['gt_hand_uvd_disp'] = torch.stack(gt_hand_uvd_disp_list, dim=1)
+                model_batch['gt_hand_rot_disp'] = torch.stack(gt_hand_rot_disp_list, dim=1)
+        
         # === FORWARD ===
         with autocast(device_type='cuda', enabled=cfg.training.use_amp):
-            loss = model.compute_loss(model_batch)
+            loss_dict = model.compute_loss(model_batch)
+            loss = loss_dict['total_loss']
+            track_loss = loss_dict['track_loss']
+            hand_uvd_loss = loss_dict.get('hand_uvd_loss', torch.tensor(0.0))
+            hand_rot_loss = loss_dict.get('hand_rot_loss', torch.tensor(0.0))
         
         # === BACKWARD ===
         optimizer.zero_grad()
@@ -263,8 +393,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         
         # Only step scheduler if optimizer actually stepped (scale didn't decrease)
         if new_scale >= old_scale:
-        scheduler.step()
-        ema_model.update_parameters(model)
+            scheduler.step()
+            ema_model.update_parameters(model)
         
         # Update progress bar
         pbar.set_postfix({'loss': f'{loss.item():.4f}', 'grad_norm': f'{grad_norm:.4f}'})
@@ -272,7 +402,10 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         # Log to W&B
         if global_step % cfg.training.log_every_n_steps == 0:
             log_dict = {
-                'train/loss': loss.item(),
+                'train/total_loss': loss.item(),
+                'train/track_loss': track_loss.item(),
+                'train/hand_uvd_loss': hand_uvd_loss.item() if torch.is_tensor(hand_uvd_loss) else hand_uvd_loss,
+                'train/hand_rot_loss': hand_rot_loss.item() if torch.is_tensor(hand_rot_loss) else hand_rot_loss,
                 'train/grad_norm': grad_norm.item(),
                 'train/lr': optimizer.param_groups[0]['lr'],
             }
@@ -390,42 +523,59 @@ def main():
     split_mode = getattr(cfg.dataset_cfg, 'split_mode', 'episode')
     val_split = getattr(cfg.dataset_cfg, 'val_split', 0.1)
     val_seed = getattr(cfg.dataset_cfg, 'val_seed', 42)
-    track_type = getattr(cfg.dataset_cfg, 'track_type', '2d')
+    track_type = getattr(cfg.model, 'track_type', '2d')
+    hand_mode = getattr(cfg.model, 'hand_mode', None)
+    text_mode = getattr(cfg.dataset_cfg, 'text_mode', False)
+    sample_stride = getattr(cfg.dataset_cfg, 'sample_stride', 1)
+    
+    # Encoder unfreezing schedule (percentage of training when encoders should be unfrozen)
+    unfreeze_after = getattr(cfg.training, 'unfreeze_after', 0.0)  # Default: never freeze (backward compat)
+    
     print(f"Track type: {track_type}")
+    print(f"Hand mode: {hand_mode}")
+    print(f"Text mode: {text_mode}")
     print(f"Split mode: {split_mode}")
+    if unfreeze_after > 0:
+        print(f"Encoder unfreezing at: {unfreeze_after * 100:.1f}% of training")
     
     # Create datasets based on split mode
     if split_mode == "episode":
         # Split by H5 files (episode-wise)
-    train_files, val_files = create_train_val_split(
-        cfg.dataset_dir,
+        train_files, val_files = create_train_val_split(
+            cfg.dataset_dir,
             val_ratio=val_split,
             seed=val_seed,
             split_mode="episode"
-    )
-    
-    train_dataset = TrackDataset(
-        h5_files=train_files,
-        img_size=cfg.dataset_cfg.img_size,
-        frame_stack=cfg.dataset_cfg.frame_stack,
-        num_track_ts=cfg.dataset_cfg.num_track_ts,
-        num_track_ids=cfg.dataset_cfg.num_track_ids,
-        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
-        cache_all=cfg.dataset_cfg.cache_all,
-        cache_image=cfg.dataset_cfg.cache_image,
-            track_type=track_type,
-    )
-    
-    val_dataset = TrackDataset(
-        h5_files=val_files,
-        img_size=cfg.dataset_cfg.img_size,
-        frame_stack=cfg.dataset_cfg.frame_stack,
-        num_track_ts=cfg.dataset_cfg.num_track_ts,
-        num_track_ids=cfg.dataset_cfg.num_track_ids,
-        downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
+        )
+        
+        train_dataset = TrackDataset(
+            h5_files=train_files,
+            img_size=cfg.dataset_cfg.img_size,
+            frame_stack=cfg.dataset_cfg.frame_stack,
+            num_track_ts=cfg.dataset_cfg.num_track_ts,
+            num_track_ids=cfg.dataset_cfg.num_track_ids,
+            downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
             cache_all=cfg.dataset_cfg.cache_all,
             cache_image=cfg.dataset_cfg.cache_image,
             track_type=track_type,
+            hand_mode=hand_mode,
+            sample_stride=sample_stride,
+            text_mode=text_mode,
+        )
+        
+        val_dataset = TrackDataset(
+            h5_files=val_files,
+            img_size=cfg.dataset_cfg.img_size,
+            frame_stack=cfg.dataset_cfg.frame_stack,
+            num_track_ts=cfg.dataset_cfg.num_track_ts,
+            num_track_ids=cfg.dataset_cfg.num_track_ids,
+            downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
+            cache_all=cfg.dataset_cfg.cache_all,
+            cache_image=cfg.dataset_cfg.cache_image,
+            track_type=track_type,
+            hand_mode=hand_mode,
+            sample_stride=sample_stride,
+            text_mode=text_mode,
         )
     else:
         # Split by individual samples
@@ -436,9 +586,12 @@ def main():
             num_track_ts=cfg.dataset_cfg.num_track_ts,
             num_track_ids=cfg.dataset_cfg.num_track_ids,
             downsample_factor=getattr(cfg.dataset_cfg, 'downsample_factor', 1),
-        cache_all=cfg.dataset_cfg.cache_all,
+            cache_all=cfg.dataset_cfg.cache_all,
             cache_image=cfg.dataset_cfg.cache_image,
             track_type=track_type,
+            hand_mode=hand_mode,
+            sample_stride=sample_stride,
+            text_mode=text_mode,
         )
         
         train_dataset, val_dataset = create_sample_split(
@@ -482,7 +635,14 @@ def main():
     model_type = getattr(cfg.model, 'model_type', 'direct')
     is_diffusion = (model_type == 'diffusion')
     
-    model = create_model(cfg, disp_stats=disp_stats, device=device)
+    model = create_model(cfg, disp_stats=disp_stats, device=device, text_mode=text_mode)
+    
+    # Apply initial encoder freezing if unfreeze_after is set
+    # The model starts with encoders frozen, then unfreezes at unfreeze_after% of training
+    encoders_frozen = False
+    if unfreeze_after > 0:
+        model.freeze_encoders()
+        encoders_frozen = True
     
     # Compile model if requested
     if cfg.training.use_compile:
@@ -558,11 +718,20 @@ def main():
         print(f"Epoch {epoch+1}/{cfg.training.num_epochs}")
         print(f"{'='*50}")
         
+        # Check if we should unfreeze encoders at this epoch
+        training_progress = epoch / cfg.training.num_epochs
+        if encoders_frozen and training_progress >= unfreeze_after:
+            model.unfreeze_encoders()
+            encoders_frozen = False
+            print(f"Encoders unfrozen at epoch {epoch+1} ({training_progress*100:.1f}% of training)")
+            wandb.log({'training/encoders_unfrozen': 1}, step=global_step)
+        
         # Train (scheduler.step() is called per batch inside train_one_epoch)
         global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler, ema_model, 
             device, cfg, epoch, global_step, track_type=track_type,
-            gpu_augmenter=gpu_augmenter, aug_prob=aug_prob
+            gpu_augmenter=gpu_augmenter, aug_prob=aug_prob, hand_mode=hand_mode, 
+            text_mode=text_mode
         )
         
         # Log current learning rate
@@ -579,16 +748,24 @@ def main():
             metrics, vis_data = validate(
                 ema_model.module, val_loader, device, track_type=track_type,
                 vis_sample_indices=vis_sample_indices, is_diffusion=is_diffusion, 
-                num_inference_steps=num_inference_steps
+                num_inference_steps=num_inference_steps, hand_mode=hand_mode,
+                text_mode=text_mode
             )
             
-            print(f"Validation avg error: {metrics['avg_error']:.4f}")
+            print(f"Validation avg track error: {metrics['avg_error']:.4f}")
+            if 'avg_hand_uvd_error' in metrics:
+                print(f"Validation avg hand UVD error: {metrics['avg_hand_uvd_error']:.4f}")
+                print(f"Validation avg hand rot error: {metrics['avg_hand_rot_error']:.4f}")
             
             # Log metrics
-            wandb.log({
+            log_metrics = {
                 'val/avg_error': metrics['avg_error'],
                 'epoch': epoch + 1,
-            }, step=global_step)
+            }
+            if 'avg_hand_uvd_error' in metrics:
+                log_metrics['val/avg_hand_uvd_error'] = metrics['avg_hand_uvd_error']
+                log_metrics['val/avg_hand_rot_error'] = metrics['avg_hand_rot_error']
+            wandb.log(log_metrics, step=global_step)
             
             # Log visualizations
             if len(vis_data) > 0:

@@ -13,6 +13,29 @@ import io
 import wandb
 
 
+def rot_6d_to_matrix(rot_6d):
+    """
+    Convert 6D rotation representation back to 3x3 rotation matrix.
+    
+    Args:
+        rot_6d: (6,) array - first two columns of rotation matrix
+    
+    Returns:
+        (3, 3) rotation matrix
+    """
+    r1 = rot_6d[:3]
+    r2 = rot_6d[3:6]
+    
+    # Gram-Schmidt orthogonalization
+    r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+    r2 = r2 - np.dot(r1, r2) * r1
+    r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+    r3 = np.cross(r1, r2)
+    
+    R = np.stack([r1, r2, r3], axis=1)  # (3, 3)
+    return R
+
+
 def denormalize_image(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
     """
     Denormalize ImageNet-normalized image for visualization.
@@ -84,13 +107,63 @@ def _draw_gradient_trajectory(ax, traj_x, traj_y, cmap, linewidth=3, alpha=0.85)
     ax.add_collection(lc)
 
 
+def _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, axis_length_px=40, linewidth=2):
+    """
+    Draw wrist trajectory line + rotation axes at ALL timesteps.
+    Same style as misc/test_dataloader.py.
+    
+    Args:
+        ax: matplotlib axis
+        wrist_uv: (T, 2) array in [0, 1] coordinates
+        rotations: (T, 3, 3) rotation matrices (optional, can be None)
+        H, W: image height and width
+        color: trajectory color (RGB tuple normalized to [0, 1])
+        axis_length_px: length of rotation axes in pixels
+        linewidth: line width for trajectory
+    """
+    T = wrist_uv.shape[0]
+    
+    # Convert to pixel coordinates
+    wrist_px_x = wrist_uv[:, 0] * W
+    wrist_px_y = wrist_uv[:, 1] * H
+    
+    # Draw trajectory line (no markers)
+    ax.plot(wrist_px_x, wrist_px_y, color=color, linewidth=linewidth, alpha=0.85)
+    
+    # Draw rotation axes at ALL timesteps
+    if rotations is not None:
+        axis_colors = {'x': '#FF0000', 'y': '#00FF00', 'z': '#0000FF'}  # RGB for XYZ axes
+        
+        for t in range(T):
+            wrist_pos_x = wrist_px_x[t]
+            wrist_pos_y = wrist_px_y[t]
+            R_t = rotations[t]
+            
+            # Draw each axis (X=red, Y=green, Z=blue)
+            for axis_idx, axis_name in enumerate(['x', 'y', 'z']):
+                axis_3d = R_t[:, axis_idx]  # (3,) - the axis direction
+                
+                # Project to 2D: use X and Y with some Z perspective
+                axis_2d_x = axis_3d[0] - axis_3d[2] * 0.3
+                axis_2d_y = axis_3d[1] - axis_3d[2] * 0.3
+                
+                # Scale and compute end point
+                end_x = wrist_pos_x + axis_2d_x * axis_length_px
+                end_y = wrist_pos_y + axis_2d_y * axis_length_px
+                
+                # Draw axis line
+                ax.plot([wrist_pos_x, end_x], [wrist_pos_y, end_y], 
+                       color=axis_colors[axis_name], linewidth=2, alpha=0.8)
+
+
 def visualize_tracks_on_frame(
     frame,
     query_coords,
     gt_tracks=None,
     pred_tracks=None,
     title="Track Visualization",
-    max_points=32
+    max_points=32,
+    wrist_data=None
 ):
     """
     Visualize ground truth and predicted tracks overlaid on a frame.
@@ -103,6 +176,8 @@ def visualize_tracks_on_frame(
         pred_tracks: (N, T, 2) tensor - predicted positions in [0, 1] coordinates (optional)
         title: str - plot title
         max_points: int - maximum number of points to visualize
+        wrist_data: dict with 'gt' and/or 'pred' keys, each containing:
+            - 'left'/'right' with 'uv' (T, 2) and 'rotations' (T, 3, 3)
         
     Returns:
         fig: matplotlib figure
@@ -142,7 +217,7 @@ def visualize_tracks_on_frame(
         ['#90EE90', '#7FD87F', '#50C850', '#228B22', '#006400']  # light green → dark green
     )
     
-    # Pred: Light cyan → Dark blue
+    # Pred: Light cyan → Dark blue (changed from purple for tracks to keep distinction)
     pred_cmap = LinearSegmentedColormap.from_list(
         'pred_gradient',
         ['#B0E0E6', '#87CEEB', '#00BFFF', '#1E90FF', '#0000CD']  # light cyan → dark blue
@@ -162,12 +237,41 @@ def visualize_tracks_on_frame(
             traj_y = pred_tracks_np[i, :, 1] * H
             _draw_gradient_trajectory(ax, traj_x, traj_y, pred_cmap, linewidth=3, alpha=0.85)
     
+    # Draw wrist trajectories if provided (GT=green, Pred=purple)
+    if wrist_data is not None:
+        # GT wrists = green (both left and right)
+        gt_color = '#00FF00'  # Green
+        # Pred wrists = purple (both left and right)
+        pred_color = '#FF00FF'  # Purple/Magenta
+        
+        for data_type in ['gt', 'pred']:
+            if data_type not in wrist_data:
+                continue
+            color = gt_color if data_type == 'gt' else pred_color
+            
+            for side in ['left', 'right']:
+                if side not in wrist_data[data_type]:
+                    continue
+                data = wrist_data[data_type][side]
+                wrist_uv = data.get('uv')  # (T, 2)
+                rotations = data.get('rotations')  # (T, 3, 3) or None
+                
+                if wrist_uv is not None:
+                    _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, 
+                                          axis_length_px=40, linewidth=2)
+    
     # Create simple legend
     from matplotlib.lines import Line2D
     legend_elements = [
-        Line2D([0], [0], color='#50C850', linewidth=3, alpha=0.85, label='GT'),
-        Line2D([0], [0], color='#00BFFF', linewidth=3, alpha=0.85, label='Pred'),
+        Line2D([0], [0], color='#50C850', linewidth=3, alpha=0.85, label='GT Track'),
+        Line2D([0], [0], color='#00BFFF', linewidth=3, alpha=0.85, label='Pred Track'),
     ]
+    # Add wrist legend if present
+    if wrist_data is not None:
+        if 'gt' in wrist_data:
+            legend_elements.append(Line2D([0], [0], color='#00FF00', linewidth=2, alpha=0.85, label='GT Wrist'))
+        if 'pred' in wrist_data:
+            legend_elements.append(Line2D([0], [0], color='#FF00FF', linewidth=2, alpha=0.85, label='Pred Wrist'))
     ax.legend(handles=legend_elements, loc='upper right', fontsize=12, framealpha=0.9)
     
     # Set axis limits to match image
@@ -215,6 +319,13 @@ def visualize_predictions(vis_data, disp_stats, epoch):
             - 'gt_disp': (N, T, coord_dim) tensor - GT displacements (normalized)
             - 'pred_disp': (1, N, T, coord_dim) tensor - predicted displacements (normalized)
             - 'query_coords': (N, coord_dim) tensor - initial positions in [0, 1]
+            Optional hand keys:
+            - 'gt_hand_uvd': (H, T, 3) tensor - GT hand UVD positions
+            - 'gt_hand_rot': (H, T, 6) tensor - GT hand 6D rotations
+            - 'pred_hand_uvd': (H, T, 3) tensor - Pred hand UVD displacements
+            - 'pred_hand_rot': (H, T, 6) tensor - Pred hand 6D rotations
+            - 'hand_query_uvd': (H, 3) tensor - query hand UVD
+            - 'hand_query_rot': (H, 6) tensor - query hand 6D rotation
         disp_stats: dict with 'displacement_mean' and 'displacement_std'
         epoch: int - current epoch number
         
@@ -225,6 +336,12 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     
     mean = disp_stats['displacement_mean']
     std = disp_stats['displacement_std']
+    
+    # Hand stats if available
+    hand_uvd_mean = np.array(disp_stats.get('hand_uvd_displacement_mean', [0, 0, 0]))
+    hand_uvd_std = np.array(disp_stats.get('hand_uvd_displacement_std', [1, 1, 1]))
+    hand_rot_mean = np.array(disp_stats.get('hand_rot_displacement_mean', [0]*6))
+    hand_rot_std = np.array(disp_stats.get('hand_rot_displacement_std', [1]*6))
     
     for idx, sample in enumerate(vis_data):
         # Use the last (most recent) frame for visualization
@@ -251,13 +368,83 @@ def visualize_predictions(vis_data, disp_stats, epoch):
         gt_tracks = query_xy.unsqueeze(1) + gt_disp_denorm  # (N, T, 2)
         pred_tracks = query_xy.unsqueeze(1) + pred_disp_denorm  # (N, T, 2)
         
+        # Process hand data if available
+        wrist_data = None
+        if 'hand_query_uvd' in sample and sample['hand_query_uvd'] is not None:
+            wrist_data = {}
+            hand_query_uvd = sample['hand_query_uvd']  # (H, 3) - H is number of hands
+            hand_query_rot = sample['hand_query_rot']  # (H, 6)
+            
+            # GT hand data
+            if 'gt_hand_uvd' in sample and sample['gt_hand_uvd'] is not None:
+                gt_hand_uvd_disp = sample['gt_hand_uvd']  # (H, T, 3) normalized
+                gt_hand_rot_disp = sample['gt_hand_rot']  # (H, T, 6) normalized
+                
+                wrist_data['gt'] = {}
+                H = gt_hand_uvd_disp.shape[0]
+                sides = ['left', 'right'][:H]  # Map H hands to sides
+                
+                for h, side in enumerate(sides):
+                    # Denormalize UVD displacement
+                    uvd_disp_h = gt_hand_uvd_disp[h].cpu().numpy()  # (T, 3)
+                    uvd_disp_h = uvd_disp_h * hand_uvd_std + hand_uvd_mean
+                    
+                    # Reconstruct trajectory: query + disp (use only u, v)
+                    query_uv = hand_query_uvd[h, :2].cpu().numpy()  # (2,)
+                    wrist_uv = query_uv[None, :] + uvd_disp_h[:, :2]  # (T, 2)
+                    
+                    # Compute rotations
+                    rot_disp_h = gt_hand_rot_disp[h].cpu().numpy()  # (T, 6)
+                    rot_disp_h = rot_disp_h * hand_rot_std + hand_rot_mean
+                    query_rot = hand_query_rot[h].cpu().numpy()  # (6,)
+                    R_0 = rot_6d_to_matrix(query_rot)
+                    
+                    rotations = np.zeros((rot_disp_h.shape[0], 3, 3), dtype=np.float32)
+                    for t in range(rot_disp_h.shape[0]):
+                        R_rel = rot_6d_to_matrix(rot_disp_h[t])
+                        rotations[t] = R_rel @ R_0
+                    
+                    wrist_data['gt'][side] = {'uv': wrist_uv, 'rotations': rotations}
+            
+            # Pred hand data
+            if 'pred_hand_uvd' in sample and sample['pred_hand_uvd'] is not None:
+                pred_hand_uvd_disp = sample['pred_hand_uvd']  # (H, T, 3) normalized
+                pred_hand_rot_disp = sample['pred_hand_rot']  # (H, T, 6) normalized
+                
+                wrist_data['pred'] = {}
+                H = pred_hand_uvd_disp.shape[0]
+                sides = ['left', 'right'][:H]
+                
+                for h, side in enumerate(sides):
+                    # Denormalize UVD displacement
+                    uvd_disp_h = pred_hand_uvd_disp[h].cpu().numpy()  # (T, 3)
+                    uvd_disp_h = uvd_disp_h * hand_uvd_std + hand_uvd_mean
+                    
+                    # Reconstruct trajectory: query + disp (use only u, v)
+                    query_uv = hand_query_uvd[h, :2].cpu().numpy()  # (2,)
+                    wrist_uv = query_uv[None, :] + uvd_disp_h[:, :2]  # (T, 2)
+                    
+                    # Compute rotations
+                    rot_disp_h = pred_hand_rot_disp[h].cpu().numpy()  # (T, 6)
+                    rot_disp_h = rot_disp_h * hand_rot_std + hand_rot_mean
+                    query_rot = hand_query_rot[h].cpu().numpy()  # (6,)
+                    R_0 = rot_6d_to_matrix(query_rot)
+                    
+                    rotations = np.zeros((rot_disp_h.shape[0], 3, 3), dtype=np.float32)
+                    for t in range(rot_disp_h.shape[0]):
+                        R_rel = rot_6d_to_matrix(rot_disp_h[t])
+                        rotations[t] = R_rel @ R_0
+                    
+                    wrist_data['pred'][side] = {'uv': wrist_uv, 'rotations': rotations}
+        
         # Create visualization
         fig = visualize_tracks_on_frame(
             frame=frame,
             query_coords=query_xy,
             gt_tracks=gt_tracks,
             pred_tracks=pred_tracks,
-            title=f"Epoch {epoch} - Sample {idx+1}"
+            title=f"Epoch {epoch} - Sample {idx+1}",
+            wrist_data=wrist_data
         )
         
         # Convert to wandb image

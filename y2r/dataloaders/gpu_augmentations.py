@@ -66,13 +66,23 @@ class GPUAugmentations(nn.Module):
         # Noise
         img_noise_std=0.02,
         depth_noise_std=0.015,
+        # Hand mode
+        hand_mode=None,
     ):
         super().__init__()
         self.img_size = img_size
         self.translation = translation_px / img_size  # Normalize to [-1, 1] range
         self.rotation_deg = rotation_deg
-        self.hflip_prob = hflip_prob
-        self.vflip_prob = vflip_prob
+        self.hand_mode = hand_mode
+        
+        # Disable flips when hand_mode is set (flipping creates complex 3D rotation issues)
+        if hand_mode is not None:
+            self.hflip_prob = 0.0
+            self.vflip_prob = 0.0
+        else:
+            self.hflip_prob = hflip_prob
+            self.vflip_prob = vflip_prob
+        
         self.img_noise_std = img_noise_std
         self.depth_noise_std = depth_noise_std
         
@@ -102,6 +112,10 @@ class GPUAugmentations(nn.Module):
                 - 'displacements': (B, T, N, 2 or 3) - normalized displacements
                 - 'depth': (B, T, H, W) or None - normalized depth maps
                 - 'poses': (B, T, 9) or None - normalized poses (unchanged)
+                - '{side}_wrist_query_uvd': (B, 3) - wrist position (u, v, d)
+                - '{side}_wrist_uvd_displacements': (B, T, 3) - wrist position displacements
+                - '{side}_wrist_query_rot_6d': (B, 6) - wrist rotation (6D)
+                - '{side}_wrist_rot_displacements': (B, T, 6) - wrist rotation displacements
         
         Returns:
             Augmented data dict (same structure)
@@ -219,6 +233,104 @@ class GPUAugmentations(nn.Module):
             
             data['displacements'] = disp
         
+        # === TRANSFORM HAND DATA ===
+        if self.hand_mode is not None:
+            # Build R_z rotation matrix for 3D rotation transformation
+            # When image rotates by angle, we need to apply R_z(angle) to 3D rotation
+            # R_z = [[cos, -sin, 0], [sin, cos, 0], [0, 0, 1]]
+            R_z = torch.zeros(B, 3, 3, device=device, dtype=imgs.dtype)
+            R_z[:, 0, 0] = cos_a
+            R_z[:, 0, 1] = -sin_a
+            R_z[:, 1, 0] = sin_a
+            R_z[:, 1, 1] = cos_a
+            R_z[:, 2, 2] = 1.0
+            
+            for side in ['left', 'right']:
+                prefix = f'{side}_wrist'
+                
+                # Transform wrist query_uvd position (same as query_coords)
+                if data.get(f'{prefix}_query_uvd') is not None:
+                    wrist_uvd = data[f'{prefix}_query_uvd'].clone()  # (B, 3)
+                    
+                    u = wrist_uvd[:, 0] * 2 - 1
+                    v = wrist_uvd[:, 1] * 2 - 1
+                    
+                    u_new = affine_inv[:, 0, 0] * u + affine_inv[:, 0, 1] * v + affine_inv[:, 0, 2]
+                    v_new = affine_inv[:, 1, 0] * u + affine_inv[:, 1, 1] * v + affine_inv[:, 1, 2]
+                    
+                    wrist_uvd[:, 0] = (u_new + 1) / 2
+                    wrist_uvd[:, 1] = (v_new + 1) / 2
+                    # depth unchanged
+                    data[f'{prefix}_query_uvd'] = wrist_uvd
+                
+                # Transform wrist UVD displacements (same rotation as track displacements)
+                if data.get(f'{prefix}_uvd_displacements') is not None:
+                    wrist_disp = data[f'{prefix}_uvd_displacements'].clone()  # (B, T, 3)
+                    
+                    du = wrist_disp[..., 0]  # (B, T)
+                    dv = wrist_disp[..., 1]
+                    
+                    rot_inv_00_1d = affine_inv[:, 0, 0].view(B, 1)
+                    rot_inv_01_1d = affine_inv[:, 0, 1].view(B, 1)
+                    rot_inv_10_1d = affine_inv[:, 1, 0].view(B, 1)
+                    rot_inv_11_1d = affine_inv[:, 1, 1].view(B, 1)
+                    
+                    wrist_disp[..., 0] = rot_inv_00_1d * du + rot_inv_01_1d * dv
+                    wrist_disp[..., 1] = rot_inv_10_1d * du + rot_inv_11_1d * dv
+                    # depth displacement unchanged
+                    data[f'{prefix}_uvd_displacements'] = wrist_disp
+                
+                # Transform wrist 6D rotation: apply R_z to the rotation
+                # 6D = [r1, r2] where r1, r2 are first two columns of rotation matrix
+                # New rotation = R_z @ R_old, so new columns = R_z @ old_columns
+                if data.get(f'{prefix}_query_rot_6d') is not None:
+                    rot_6d = data[f'{prefix}_query_rot_6d'].clone()  # (B, 6)
+                    
+                    r1 = rot_6d[:, :3]  # (B, 3)
+                    r2 = rot_6d[:, 3:]  # (B, 3)
+                    
+                    # R_z @ r1, R_z @ r2
+                    r1_new = torch.bmm(R_z, r1.unsqueeze(-1)).squeeze(-1)  # (B, 3)
+                    r2_new = torch.bmm(R_z, r2.unsqueeze(-1)).squeeze(-1)  # (B, 3)
+                    
+                    rot_6d[:, :3] = r1_new
+                    rot_6d[:, 3:] = r2_new
+                    data[f'{prefix}_query_rot_6d'] = rot_6d
+                
+                # Transform wrist rotation displacements
+                # These are relative rotations (R_t @ R_0.T) encoded as 6D
+                # After image rotation: new_R_t = R_z @ R_t, new_R_0 = R_z @ R_0
+                # new_relative = (R_z @ R_t) @ (R_z @ R_0).T = R_z @ R_t @ R_0.T @ R_z.T
+                # = R_z @ R_rel @ R_z.T (similarity transform)
+                if data.get(f'{prefix}_rot_displacements') is not None:
+                    rot_disp = data[f'{prefix}_rot_displacements'].clone()  # (B, T, 6)
+                    B_rot, T_rot, _ = rot_disp.shape
+                    
+                    r1 = rot_disp[..., :3]  # (B, T, 3)
+                    r2 = rot_disp[..., 3:]  # (B, T, 3)
+                    
+                    # For similarity transform R_z @ R @ R_z.T:
+                    # We need to apply R_z @ [r1, r2] @ R_z.T
+                    # But 6D only stores first two columns, so we apply R_z from left
+                    # and the effect of R_z.T from right is implicit in how we use these
+                    # Actually, for the relative rotation, we just transform it same way
+                    R_z_exp = R_z.unsqueeze(1).expand(-1, T_rot, -1, -1)  # (B, T, 3, 3)
+                    R_z_T_exp = R_z_exp.transpose(-1, -2)  # (B, T, 3, 3)
+                    
+                    # Apply R_z from left to each column
+                    r1_flat = r1.reshape(B_rot * T_rot, 3, 1)
+                    r2_flat = r2.reshape(B_rot * T_rot, 3, 1)
+                    R_z_flat = R_z_exp.reshape(B_rot * T_rot, 3, 3)
+                    R_z_T_flat = R_z_T_exp.reshape(B_rot * T_rot, 3, 3)
+                    
+                    # R_z @ r1
+                    r1_rot = torch.bmm(R_z_flat, r1_flat).squeeze(-1)  # (B*T, 3)
+                    r2_rot = torch.bmm(R_z_flat, r2_flat).squeeze(-1)  # (B*T, 3)
+                    
+                    rot_disp[..., :3] = r1_rot.reshape(B_rot, T_rot, 3)
+                    rot_disp[..., 3:] = r2_rot.reshape(B_rot, T_rot, 3)
+                    data[f'{prefix}_rot_displacements'] = rot_disp
+        
         # === GAUSSIAN NOISE ===
         if self.img_noise_std > 0:
             noise = torch.randn_like(data['imgs']) * self.img_noise_std
@@ -260,6 +372,8 @@ def create_gpu_augmentations(cfg, device):
     else:
         brightness = contrast = saturation = hue = 0
     
+    hand_mode = getattr(dataset_cfg, 'hand_mode', None)
+    
     augmenter = GPUAugmentations(
         img_size=dataset_cfg.img_size,
         brightness=brightness,
@@ -272,6 +386,7 @@ def create_gpu_augmentations(cfg, device):
         vflip_prob=getattr(dataset_cfg, 'aug_vflip_prob', 0.0),
         img_noise_std=getattr(dataset_cfg, 'aug_noise_std', 0.0),
         depth_noise_std=getattr(dataset_cfg, 'aug_depth_noise_std', 0.0),
+        hand_mode=hand_mode,
     ).to(device)
     
     return augmenter

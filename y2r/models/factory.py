@@ -9,9 +9,10 @@ import torch
 from y2r.models.model import IntentTracker
 from y2r.models.diffusion_model import DiffusionIntentTracker
 from y2r.models.autoreg_model import AutoregressiveIntentTracker
+from y2r.models.model_config import MODEL_SIZE_CONFIGS
 
 
-def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
+def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True, text_mode=None):
     """
     Factory function to create models based on configuration.
     
@@ -22,14 +23,17 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
     Args:
         cfg: Configuration namespace with model parameters. Must have:
             - cfg.model.model_type: str, one of 'direct', 'diffusion', 'autoreg'
+            - cfg.model.model_size: str, one of 's', 'b', 'l'
             - cfg.model.*: other model parameters
         disp_stats: Optional dict with displacement statistics:
-            - 'displacement_mean': list/array of length 2
-            - 'displacement_std': list/array of length 2
+            - 'displacement_mean': list/array of length 2 or 3
+            - 'displacement_std': list/array of length 2 or 3
             Required for 'diffusion' model type.
         device: str or torch.device, device to place model on (default: 'cuda')
-        from_pretrained: bool, if True loads ViT from torch.hub, if False skips
+        from_pretrained: bool, if True loads ViT pretrained weights, if False skips
             (for loading from checkpoint). Default: True for backward compatibility.
+        text_mode: bool or None, whether to enable text conditioning. If None, reads
+            from cfg.dataset_cfg.text_mode or cfg.model.text_mode.
     
     Returns:
         model: Instantiated model moved to specified device.
@@ -42,33 +46,61 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
         >>> cfg = load_config('configs/train_direct.yaml')
         >>> model = create_model(cfg, device='cuda:0')
     """
-    # Extract model type and track type
+    # Extract model type, model size, track type, and hand_mode
     model_type = getattr(cfg.model, 'model_type', 'direct')
+    model_size = getattr(cfg.model, 'model_size', 's')
     track_type = getattr(cfg.model, 'track_type', '2d')
+    hand_mode = getattr(cfg.model, 'hand_mode', None)
+    
+    # Determine text_mode: explicit arg > model config > dataset config > False
+    if text_mode is None:
+        text_mode = getattr(cfg.model, 'text_mode', None)
+        if text_mode is None and hasattr(cfg, 'dataset_cfg'):
+            text_mode = getattr(cfg.dataset_cfg, 'text_mode', False)
+        if text_mode is None:
+            text_mode = False
+    
+    # Validate model_size
+    if model_size not in MODEL_SIZE_CONFIGS:
+        raise ValueError(
+            f"Invalid model_size: '{model_size}'. "
+            f"Must be one of: {list(MODEL_SIZE_CONFIGS.keys())}"
+        )
     
     # Common parameters shared across all models
+    # Note: model_size replaces hidden_size, num_heads, mlp_ratio, vit_model_name
     common_params = {
+        'model_size': model_size,
         'num_future_steps': cfg.model.num_future_steps,
-        'hidden_size': cfg.model.hidden_size,
-        'model_resolution': cfg.model.model_resolution,
+        'model_resolution': tuple(cfg.model.model_resolution),
         'add_space_attn': cfg.model.add_space_attn,
-        'vit_model_name': cfg.model.vit_model_name,
         'vit_frozen': cfg.model.vit_frozen,
-        'num_heads': cfg.model.num_heads,
-        'mlp_ratio': cfg.model.mlp_ratio,
         'p_drop_attn': cfg.model.p_drop_attn,
         'frame_stack': cfg.model.frame_stack,
         'track_type': track_type,
         'from_pretrained': from_pretrained,
+        'hand_mode': hand_mode,
+        'text_mode': text_mode,
     }
+    
+    # Get config info for logging
+    size_cfg = MODEL_SIZE_CONFIGS[model_size]
     
     # Instantiate model based on type
     if model_type == 'direct':
-        print("Creating IntentTracker model (direct prediction)...")
+        print(f"Creating IntentTracker model (direct prediction, size={model_size})...")
+        print(f"  hidden_size={size_cfg['hidden_size']}, num_heads={size_cfg['num_heads']}, "
+              f"time_depth={size_cfg['time_depth']}, vit={size_cfg['vit_model_name']}")
         model = IntentTracker(**common_params)
+        if hand_mode:
+            print(f"  Hand mode enabled: {hand_mode}")
+        if text_mode:
+            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
     
     elif model_type == 'diffusion':
-        print("Creating DiffusionIntentTracker model...")
+        print(f"Creating DiffusionIntentTracker model (size={model_size})...")
+        print(f"  hidden_size={size_cfg['hidden_size']}, num_heads={size_cfg['num_heads']}, "
+              f"time_depth={size_cfg['time_depth']}, vit={size_cfg['vit_model_name']}")
         
         # Diffusion models require displacement statistics
         if disp_stats is None:
@@ -82,14 +114,25 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
             **common_params,
             'num_diffusion_steps': getattr(cfg.model, 'num_diffusion_steps', 100),
             'beta_schedule': getattr(cfg.model, 'beta_schedule', 'squaredcos_cap_v2'),
+            'num_inference_steps': getattr(cfg.model, 'num_inference_steps', 10),
             'disp_mean': disp_stats['displacement_mean'],
             'disp_std': disp_stats['displacement_std'],
         }
         model = DiffusionIntentTracker(**diffusion_params)
+        if hand_mode:
+            print(f"  Hand mode enabled: {hand_mode}")
+        if text_mode:
+            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
     
     elif model_type == 'autoreg':
-        print("Creating AutoregressiveIntentTracker model...")
+        print(f"Creating AutoregressiveIntentTracker model (size={model_size})...")
+        print(f"  hidden_size={size_cfg['hidden_size']}, num_heads={size_cfg['num_heads']}, "
+              f"time_depth={size_cfg['time_depth']}, vit={size_cfg['vit_model_name']}")
         model = AutoregressiveIntentTracker(**common_params)
+        if hand_mode:
+            print(f"  Hand mode enabled: {hand_mode}")
+        if text_mode:
+            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
     
     else:
         raise ValueError(
@@ -105,4 +148,3 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
     print(f"Model created and moved to {device}")
     
     return model
-

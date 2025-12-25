@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WiLoR Hand Mesh Visualizer</title>
+  <style>
+    :root {
+      --primary: #e67e22;
+      --bg: #1a1a2e;
+      --surface: #16213e;
+      --text: #eee;
+      --border: #333;
+    }
+    body { margin: 0; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
+    #canvas-container { position: absolute; width: 100%; height: 100%; }
+    
+    #control-panel {
+      position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+      background: rgba(22, 33, 62, 0.95); padding: 12px 16px; border-radius: 12px;
+      display: flex; gap: 16px; align-items: center; backdrop-filter: blur(4px); border: 1px solid var(--border);
+    }
+    #timeline { width: 350px; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; cursor: pointer; position: relative; }
+    #progress { position: absolute; height: 100%; background: var(--primary); border-radius: 3px; width: 0%; }
+    
+    button {
+      background: rgba(255,255,255,0.1); border: 1px solid var(--border); color: var(--text);
+      padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 500; transition: all 0.2s;
+    }
+    button:hover { background: rgba(255,255,255,0.2); }
+    button.active { background: var(--primary); }
+    
+    #settings-panel {
+      position: absolute; top: 16px; right: 16px; background: rgba(22, 33, 62, 0.95);
+      padding: 16px; border-radius: 12px; width: 240px; border: 1px solid var(--border);
+    }
+    #settings-panel h3 { margin: 0 0 12px 0; font-size: 13px; color: var(--primary); text-transform: uppercase; }
+    .setting-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; }
+    input[type="range"] { width: 100px; accent-color: var(--primary); }
+    input[type="checkbox"] { accent-color: var(--primary); }
+    
+    #frame-info { position: absolute; top: 16px; left: 16px; background: rgba(22, 33, 62, 0.9); padding: 8px 14px; border-radius: 8px; font-size: 13px; }
+    
+    #loading-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg);
+      display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100;
+    }
+    #loading-overlay.hidden { display: none; }
+    .spinner { width: 40px; height: 40px; border: 3px solid rgba(230,126,34,0.2); border-radius: 50%; border-top-color: var(--primary); animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading-text { margin-top: 16px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap" rel="stylesheet">
+  <div id="canvas-container"></div>
+  
+  <div id="frame-info">Frame: <span id="frame-num">0</span> / <span id="total-frames">0</span></div>
+  
+  <div id="control-panel">
+    <button id="play-btn">▶</button>
+    <div id="timeline"><div id="progress"></div></div>
+    <button id="speed-btn">1x</button>
+    <button id="reset-btn">Reset</button>
+  </div>
+  
+  <div id="settings-panel">
+    <h3>Display</h3>
+    <div class="setting-row"><label>Point Cloud</label><input type="checkbox" id="show-pc" checked></div>
+    <div class="setting-row"><label>Left Hand</label><input type="checkbox" id="show-left" checked></div>
+    <div class="setting-row"><label>Right Hand</label><input type="checkbox" id="show-right" checked></div>
+    <div class="setting-row"><label>Point Size</label><input type="range" id="pt-size" min="0.005" max="0.05" step="0.005" value="0.02"></div>
+    <div class="setting-row"><label>Max Depth</label><input type="range" id="max-depth" min="0.5" max="5" step="0.1" value="2"></div>
+    <div class="setting-row"><label>Mesh Opacity</label><input type="range" id="mesh-opacity" min="0.3" max="1" step="0.1" value="0.85"></div>
+  </div>
+  
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div id="loading-text">Loading...</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+  
+  <script>
+    class WiLoRViz {
+      constructor() {
+        this.data = null;
+        this.config = {};
+        this.frame = 0;
+        this.playing = false;
+        this.speed = 1;
+        this.lastTime = 0;
+        
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x1a1a2e);
+        
+        this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+        this.camera.position.set(0, 0, 0);
+        
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setPixelRatio(window.devicePixelRatio);
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('canvas-container').appendChild(this.renderer.domElement);
+        
+        this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.target.set(0, 0, -1);  // Look down -Z axis
+        
+        // Lights
+        this.scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+        dir.position.set(1, 1, -1);
+        this.scene.add(dir);
+        
+        this.pointCloud = null;
+        this.leftMesh = null;
+        this.rightMesh = null;
+        
+        this.initUI();
+        this.loadData();
+      }
+      
+      initUI() {
+        document.getElementById('play-btn').onclick = () => this.togglePlay();
+        document.getElementById('speed-btn').onclick = () => this.cycleSpeed();
+        document.getElementById('reset-btn').onclick = () => this.resetView();
+        document.getElementById('timeline').onclick = (e) => {
+          const rect = e.target.getBoundingClientRect();
+          this.seekTo((e.clientX - rect.left) / rect.width);
+        };
+        
+        document.getElementById('show-pc').onchange = () => this.updateVis();
+        document.getElementById('show-left').onchange = () => this.updateVis();
+        document.getElementById('show-right').onchange = () => this.updateVis();
+        document.getElementById('pt-size').oninput = () => this.updatePointSize();
+        document.getElementById('max-depth').oninput = () => this.updateFrame(this.frame);
+        document.getElementById('mesh-opacity').oninput = () => this.updateMeshOpacity();
+        
+        window.onresize = () => {
+          this.camera.aspect = window.innerWidth / window.innerHeight;
+          this.camera.updateProjectionMatrix();
+          this.renderer.setSize(window.innerWidth, window.innerHeight);
+        };
+        
+        document.onkeydown = (e) => {
+          if (e.code === 'Space') { this.togglePlay(); e.preventDefault(); }
+          if (e.code === 'ArrowLeft') this.updateFrame(Math.max(0, this.frame - 1));
+          if (e.code === 'ArrowRight') this.updateFrame(Math.min(this.config.totalFrames - 1, this.frame + 1));
+        };
+      }
+      
+      async loadData() {
+        try {
+          document.getElementById('loading-text').textContent = 'Loading data...';
+          
+          const res = await fetch('data.bin');
+          if (!res.ok) throw new Error('Failed to load data.bin');
+          
+          const buf = await res.arrayBuffer();
+          const view = new DataView(buf);
+          const headerLen = view.getUint32(0, true);
+          const header = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + headerLen)));
+          const decompressed = pako.inflate(new Uint8Array(buf, 4 + headerLen)).buffer;
+          
+          const arrays = {};
+          for (const key in header) {
+            if (key === 'meta') continue;
+            const { dtype, shape, offset, length } = header[key];
+            const slice = decompressed.slice(offset, offset + length);
+            switch (dtype) {
+              case 'uint8': arrays[key] = { data: new Uint8Array(slice), shape }; break;
+              case 'int32': arrays[key] = { data: new Int32Array(slice), shape }; break;
+              case 'float32': arrays[key] = { data: new Float32Array(slice), shape }; break;
+              case 'float64': arrays[key] = { data: new Float64Array(slice), shape }; break;
+            }
+          }
+          
+          this.data = arrays;
+          this.config = header.meta;
+          
+          document.getElementById('total-frames').textContent = this.config.totalFrames;
+          
+          // Set camera FOV
+          this.camera.fov = this.config.fov || 60;
+          this.camera.updateProjectionMatrix();
+          
+          this.initPointCloud();
+          this.initMeshes();
+          this.updateFrame(0);
+          
+          document.getElementById('loading-overlay').classList.add('hidden');
+          this.resetView();
+          this.animate();
+          
+        } catch (err) {
+          document.getElementById('loading-text').textContent = 'Error: ' + err.message;
+          console.error(err);
+        }
+      }
+      
+      initPointCloud() {
+        const geom = new THREE.BufferGeometry();
+        const mat = new THREE.PointsMaterial({
+          size: parseFloat(document.getElementById('pt-size').value),
+          vertexColors: true,
+          sizeAttenuation: true
+        });
+        this.pointCloud = new THREE.Points(geom, mat);
+        this.scene.add(this.pointCloud);
+      }
+      
+      initMeshes() {
+        const faces = this.data.faces;
+        const indices = [];
+        for (let i = 0; i < faces.shape[0]; i++) {
+          indices.push(faces.data[i * 3], faces.data[i * 3 + 1], faces.data[i * 3 + 2]);
+        }
+        
+        // Left hand - blue
+        const leftGeom = new THREE.BufferGeometry();
+        leftGeom.setIndex(indices);
+        leftGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(778 * 3), 3));
+        const leftMat = new THREE.MeshPhongMaterial({
+          color: 0x3498db, transparent: true, 
+          opacity: parseFloat(document.getElementById('mesh-opacity').value),
+          side: THREE.DoubleSide
+        });
+        this.leftMesh = new THREE.Mesh(leftGeom, leftMat);
+        this.scene.add(this.leftMesh);
+        
+        // Right hand - orange
+        const rightGeom = new THREE.BufferGeometry();
+        rightGeom.setIndex(indices);
+        rightGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(778 * 3), 3));
+        const rightMat = new THREE.MeshPhongMaterial({
+          color: 0xe67e22, transparent: true,
+          opacity: parseFloat(document.getElementById('mesh-opacity').value),
+          side: THREE.DoubleSide
+        });
+        this.rightMesh = new THREE.Mesh(rightGeom, rightMat);
+        this.scene.add(this.rightMesh);
+      }
+      
+      updateFrame(idx) {
+        if (!this.data) return;
+        this.frame = idx;
+        document.getElementById('frame-num').textContent = idx;
+        document.getElementById('progress').style.width = `${(idx / (this.config.totalFrames - 1)) * 100}%`;
+        
+        this.updatePointCloud(idx);
+        this.updateMesh(idx, 'left', this.leftMesh, this.data.left_verts, this.data.left_valid);
+        this.updateMesh(idx, 'right', this.rightMesh, this.data.right_verts, this.data.right_valid);
+      }
+      
+      updatePointCloud(idx) {
+        const rgb = this.data.rgb_video;
+        const depthsRgb = this.data.depths_rgb;
+        const intrinsics = this.data.intrinsics;
+        
+        const W = this.config.resolution[0];
+        const H = this.config.resolution[1];
+        const numPx = W * H;
+        
+        // Get intrinsics for this frame
+        const kOffset = idx * 9;
+        const fx = intrinsics.data[kOffset], fy = intrinsics.data[kOffset + 4];
+        const cx = intrinsics.data[kOffset + 2], cy = intrinsics.data[kOffset + 5];
+        
+        const maxDepth = parseFloat(document.getElementById('max-depth').value);
+        const [minD, maxD] = this.config.depthRange;
+        
+        const positions = [];
+        const colors = [];
+        
+        const rgbOff = idx * numPx * 3;
+        const depthOff = idx * numPx * 3;
+        
+        for (let i = 0; i < numPx; i++) {
+          // Decode 16-bit depth from RGB
+          const d0 = depthsRgb.data[depthOff + i * 3];
+          const d1 = depthsRgb.data[depthOff + i * 3 + 1];
+          const depthEnc = d0 | (d1 << 8);
+          const depth = (depthEnc / 65535) * (maxD - minD) + minD;
+          
+          if (depth <= 0 || depth > maxDepth) continue;
+          
+          const x = i % W;
+          const y = Math.floor(i / W);
+          
+          const X = (x - cx) * depth / fx;
+          const Y = (y - cy) * depth / fy;
+          const Z = depth;
+          
+          // Three.js: Y-up, looking down -Z
+          positions.push(X, -Y, -Z);
+          colors.push(
+            rgb.data[rgbOff + i * 3] / 255,
+            rgb.data[rgbOff + i * 3 + 1] / 255,
+            rgb.data[rgbOff + i * 3 + 2] / 255
+          );
+        }
+        
+        this.pointCloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        this.pointCloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        this.pointCloud.geometry.attributes.position.needsUpdate = true;
+        this.pointCloud.geometry.attributes.color.needsUpdate = true;
+      }
+      
+      updateMesh(idx, side, mesh, vertsData, validData) {
+        const showCheck = document.getElementById(side === 'left' ? 'show-left' : 'show-right');
+        
+        if (!validData.data[idx]) {
+          mesh.visible = false;
+          return;
+        }
+        
+        mesh.visible = showCheck.checked;
+        
+        const numVerts = 778;
+        const off = idx * numVerts * 3;
+        const pos = mesh.geometry.attributes.position.array;
+        
+        for (let i = 0; i < numVerts; i++) {
+          const x = vertsData.data[off + i * 3];
+          const y = vertsData.data[off + i * 3 + 1];
+          const z = vertsData.data[off + i * 3 + 2];
+          // Convert to Three.js coords
+          pos[i * 3] = x;
+          pos[i * 3 + 1] = -y;
+          pos[i * 3 + 2] = -z;
+        }
+        
+        mesh.geometry.attributes.position.needsUpdate = true;
+        mesh.geometry.computeVertexNormals();
+      }
+      
+      togglePlay() {
+        this.playing = !this.playing;
+        document.getElementById('play-btn').textContent = this.playing ? '⏸' : '▶';
+        if (this.playing) this.lastTime = performance.now();
+      }
+      
+      cycleSpeed() {
+        const speeds = [0.5, 1, 2, 4];
+        this.speed = speeds[(speeds.indexOf(this.speed) + 1) % speeds.length];
+        document.getElementById('speed-btn').textContent = this.speed + 'x';
+      }
+      
+      seekTo(p) {
+        this.updateFrame(Math.floor(p * this.config.totalFrames));
+      }
+      
+      resetView() {
+        this.camera.position.set(0, 0, 0);
+        this.controls.target.set(0, 0, -1);  // Look down -Z axis
+        this.controls.update();
+      }
+      
+      updateVis() {
+        if (this.pointCloud) this.pointCloud.visible = document.getElementById('show-pc').checked;
+        this.updateFrame(this.frame);
+      }
+      
+      updatePointSize() {
+        if (this.pointCloud) this.pointCloud.material.size = parseFloat(document.getElementById('pt-size').value);
+      }
+      
+      updateMeshOpacity() {
+        const op = parseFloat(document.getElementById('mesh-opacity').value);
+        if (this.leftMesh) this.leftMesh.material.opacity = op;
+        if (this.rightMesh) this.rightMesh.material.opacity = op;
+      }
+      
+      animate() {
+        requestAnimationFrame(() => this.animate());
+        this.controls.update();
+        
+        if (this.playing && this.data) {
+          const now = performance.now();
+          const dt = (now - this.lastTime) / 1000;
+          const advance = Math.floor(dt * this.config.baseFrameRate * this.speed);
+          if (advance > 0) {
+            this.frame = (this.frame + advance) % this.config.totalFrames;
+            this.updateFrame(this.frame);
+            this.lastTime = now;
+          }
+        }
+        
+        this.renderer.render(this.scene, this.camera);
+      }
+    }
+    
+    window.onload = () => new WiLoRViz();
+  </script>
+</body>
+</html>

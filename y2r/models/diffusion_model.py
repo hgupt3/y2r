@@ -7,164 +7,148 @@ Diffusion Policy architecture. The model denoises trajectory outputs using DDIM 
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Optional, List, Dict, Tuple
 from diffusers.schedulers import DDIMScheduler, DDPMScheduler
 
-from y2r.models.blocks import EfficientUpdateFormer, Mlp
-from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
-from y2r.models.model_utils import extend_vit_to_rgbd
+from y2r.models.base_model import BaseIntentTracker
+from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid
+from y2r.models.model_config import ENCODING_DIMS
 
 
-class DiffusionIntentTracker(nn.Module):
+class DiffusionIntentTracker(BaseIntentTracker):
+    """
+    Diffusion-based Intent Tracker.
+    
+    This model uses diffusion/denoising to predict trajectory displacements.
+    During training, it learns to predict noise added to ground truth trajectories.
+    During inference, it iteratively denoises random noise using DDIM sampling.
+    
+    Architecture:
+    - ViT encoder extracts scene tokens from observation frames
+    - Track tokens include position + noisy state + temporal + diffusion timestep
+    - UpdateFormer processes tokens with cross-attention
+    - Linear heads predict noise to be removed
+    """
+    
     def __init__(
         self,
-        num_future_steps=10,
-        hidden_size=384,
-        model_resolution=(224, 224),
-        add_space_attn=True,
-        vit_model_name='dinov2_vits14',
-        vit_frozen=False,
-        time_depth=6,
-        space_depth=3,
-        num_heads=8,
-        mlp_ratio=4.0,
-        p_drop_attn=0.0,
-        frame_stack=1,
-        track_type='2d',
-        num_diffusion_steps=100,
-        beta_schedule='squaredcos_cap_v2',
-        cache_quantized_position_encoding=False,
-        disp_mean=None,  # (2,) or (3,) displacement mean for normalization
-        disp_std=None,   # (2,) or (3,) displacement std for normalization
-        from_pretrained=True,
+        model_size: str = 's',
+        num_future_steps: int = 10,
+        model_resolution: tuple = (256, 256),
+        add_space_attn: bool = True,
+        vit_frozen: bool = False,
+        p_drop_attn: float = 0.0,
+        frame_stack: int = 1,
+        track_type: str = '2d',
+        num_diffusion_steps: int = 100,
+        beta_schedule: str = 'squaredcos_cap_v2',
+        num_inference_steps: int = 10,
+        disp_mean: Optional[List[float]] = None,
+        disp_std: Optional[List[float]] = None,
+        from_pretrained: bool = True,
+        hand_mode: Optional[str] = None,
+        text_mode: bool = False,
     ):
-        super(DiffusionIntentTracker, self).__init__()
-        self.num_future_steps = num_future_steps
-        self.total_token_steps = num_future_steps + 1  # include conditioning slot
-        self.hidden_size = hidden_size
-        self.model_resolution = model_resolution
-        self.frame_stack = frame_stack
-        self.track_type = track_type
-        self.coord_dim = 3 if track_type == '3d' else 2
+        # Initialize base class (ViT, text encoder, temporal embeddings)
+        super().__init__(
+            model_size=model_size,
+            num_future_steps=num_future_steps,
+            model_resolution=model_resolution,
+            add_space_attn=add_space_attn,
+            vit_frozen=vit_frozen,
+            p_drop_attn=p_drop_attn,
+            frame_stack=frame_stack,
+            track_type=track_type,
+            from_pretrained=from_pretrained,
+            hand_mode=hand_mode,
+            text_mode=text_mode,
+        )
+        
+        # =========================================================================
+        # Diffusion-specific Configuration
+        # =========================================================================
+        self.total_token_steps = num_future_steps + 1  # Include conditioning slot at t=0
         self.num_diffusion_steps = num_diffusion_steps
-        self.cache_quantized_position_encoding = cache_quantized_position_encoding
+        self.default_num_inference_steps = num_inference_steps
         
         # Register displacement normalization stats as buffers
         if disp_mean is not None and disp_std is not None:
             self.register_buffer('disp_mean', torch.tensor(disp_mean, dtype=torch.float32))
             self.register_buffer('disp_std', torch.tensor(disp_std, dtype=torch.float32))
         else:
-            # Default values if not provided (will be set later)
             self.register_buffer('disp_mean', torch.zeros(self.coord_dim))
             self.register_buffer('disp_std', torch.ones(self.coord_dim))
-
-        # ViT encoder (provides all visual context)
-        if from_pretrained:
-            # Load pretrained weights from torch.hub (for training)
-            self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
-        else:
-            # Create model architecture without pretrained weights (for inference from checkpoint)
-            # Import from vendored dinov2 in thirdparty/ to avoid network dependency
-            import sys
-            from pathlib import Path
-            # Add vendored dinov2 to path
-            project_root = Path(__file__).parent.parent.parent
-            dinov2_path = project_root / 'thirdparty' / 'dinov2'
-            if str(dinov2_path) not in sys.path:
-                sys.path.insert(0, str(dinov2_path))
-            from dinov2.hub.backbones import (
-                dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14,
-                dinov2_vits14_reg, dinov2_vitb14_reg, dinov2_vitl14_reg, dinov2_vitg14_reg
-            )
-            # Map model name to function
-            model_map = {
-                'dinov2_vits14': dinov2_vits14,
-                'dinov2_vitb14': dinov2_vitb14,
-                'dinov2_vitl14': dinov2_vitl14,
-                'dinov2_vitg14': dinov2_vitg14,
-                'dinov2_vits14_reg': dinov2_vits14_reg,
-                'dinov2_vitb14_reg': dinov2_vitb14_reg,
-                'dinov2_vitl14_reg': dinov2_vitl14_reg,
-                'dinov2_vitg14_reg': dinov2_vitg14_reg,
-            }
-            if vit_model_name not in model_map:
-                raise ValueError(f"Unknown ViT model: {vit_model_name}")
-            # Create model without pretrained weights (pretrained=False)
-            self.vit = model_map[vit_model_name](pretrained=False)
         
-        # Extend ViT to handle RGBD input for 3D mode
-        if track_type == '3d':
-            extend_vit_to_rgbd(self.vit)
-        
-        self.vit.requires_grad_(not vit_frozen)
-        
-        # Embedding dimensions
-        self.position_dim = 384  # Sin/cos encoding of absolute positions
-        self.traj_dim = 96      # Linear projection of normalized noisy displacement
-        self.temporal_dim = 96
-        self.diffusion_timestep_dim = 96
-        
-        # Temporal embeddings for future predictions
+        # Override time embedding to include conditioning slot (T+1 timesteps)
+        # Note: squeeze to get (T+1, temporal_dim) instead of (1, T+1, temporal_dim)
         time_grid = torch.linspace(0, self.total_token_steps - 1, self.total_token_steps).reshape(
             1, self.total_token_steps, 1
         )
-        self.register_buffer(
-            "time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, time_grid[0])
-        )
-
-        # Observation temporal embeddings for past frames
-        # Frames at relative times: [-frame_stack+1, ..., -1, 0]
-        obs_time_grid = torch.linspace(-(frame_stack - 1), 0, frame_stack).reshape(
-            1, frame_stack, 1
-        )
-        self.register_buffer(
-            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
-        )
+        time_emb = get_1d_sincos_pos_embed_from_grid(self.enc_dims['temporal'], time_grid[0])
+        self.register_buffer("time_emb", time_emb.squeeze(0))  # (T+1, temporal_dim)
         
-        # Diffusion timestep embedding (for encoding which diffusion step we're at)
-        # We'll create embeddings for timesteps 0 to num_diffusion_steps
+        # Diffusion timestep embedding
         diffusion_time_grid = torch.linspace(0, num_diffusion_steps - 1, num_diffusion_steps).reshape(
             1, num_diffusion_steps, 1
         )
-        self.register_buffer(
-            "diffusion_time_emb", get_1d_sincos_pos_embed_from_grid(self.diffusion_timestep_dim, diffusion_time_grid[0])
+        diffusion_time_emb = get_1d_sincos_pos_embed_from_grid(
+            self.enc_dims['diffusion_timestep'], diffusion_time_grid[0]
         )
+        self.register_buffer("diffusion_time_emb", diffusion_time_emb.squeeze(0))  # (num_diffusion_steps, diffusion_dim)
         
-        # Trajectory embedding: project normalized noisy displacement
-        self.traj_embed = nn.Linear(self.coord_dim, self.traj_dim)
+        # =========================================================================
+        # Track Token Encoder (Diffusion: includes state + diffusion timestep)
+        # =========================================================================
+        # Track state projection: noisy displacement -> track_state dim
+        self.track_state_proj = nn.Linear(self.coord_dim, self.enc_dims['track_state'])
         
-        # MLP to combine position, trajectory, temporal, and diffusion timestep encodings
-        # Input: position_dim + traj_dim + temporal_dim + diffusion_timestep_dim
-        self.encoding_combiner = Mlp(
-            in_features=self.position_dim + self.traj_dim + self.temporal_dim + self.diffusion_timestep_dim,
-            hidden_features=hidden_size,
-            out_features=hidden_size,
-            act_layer=nn.GELU,
-            drop=0.0
-        )
-
-        # Transformer (predicts noise instead of direct displacements)
-        self.updateformer = EfficientUpdateFormer(
-            depth=time_depth,
-            input_dim=hidden_size,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            output_dim=self.coord_dim,   # Predict noise (2D or 3D)
-            mlp_ratio=mlp_ratio,
-            add_space_attn=add_space_attn,
-            p_drop_attn=p_drop_attn,
-            linear_layer_for_vis_conf=False,
-        )
+        # Track token: concat(position, state, temporal, diffusion_t) -> MLP -> hidden_size
+        track_input_dim = (self.enc_dims['track_position'] + 
+                         self.enc_dims['track_state'] + 
+                         self.enc_dims['temporal'] +
+                         self.enc_dims['diffusion_timestep'])
+        self.track_encoder = self._create_track_encoder(track_input_dim)
         
-        # Diffusion scheduler (DDPM for training)
+        # =========================================================================
+        # Hand Token Encoder (Optional, with state + diffusion timestep)
+        # =========================================================================
+        if hand_mode is not None:
+            # Hand rotation projection: 6D -> hand_rotation dim
+            self.hand_rot_proj = nn.Linear(6, self.enc_dims['hand_rotation'])
+            # Hand state projection: 9D (noisy UVD + rotation) -> hand_state dim
+            self.hand_state_proj = nn.Linear(9, self.enc_dims['hand_state'])
+            
+            # Hand: concat(position, rotation, state, temporal, diffusion_t) -> MLP -> hidden_size
+            hand_input_dim = (self.enc_dims['hand_position'] + 
+                            self.enc_dims['hand_rotation'] + 
+                            self.enc_dims['hand_state'] +
+                            self.enc_dims['temporal'] +
+                            self.enc_dims['diffusion_timestep'])
+            self.hand_encoder = self._create_hand_encoder(hand_input_dim)
+            
+            # Hand output head: hidden_size -> 9 (predicts noise for 3 UVD + 6 rotation)
+            self.hand_head = nn.Linear(self.hidden_size, 9)
+        
+        # =========================================================================
+        # Transformer and Output Heads
+        # =========================================================================
+        self.updateformer = self._create_updateformer()
+        
+        # Track output head: hidden_size -> coord_dim (predicts noise)
+        self.track_head = nn.Linear(self.hidden_size, self.coord_dim)
+        
+        # =========================================================================
+        # Diffusion Schedulers
+        # =========================================================================
+        # DDPM scheduler for training
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_diffusion_steps,
             beta_schedule=beta_schedule,
-            clip_sample=False,  # Don't clip, we're in normalized space
-            prediction_type='epsilon',  # Predict noise
+            clip_sample=False,
+            prediction_type='epsilon',
         )
         
-        # Inference scheduler (DDIM for fast sampling)
+        # DDIM scheduler for fast inference
         self.inference_scheduler = DDIMScheduler(
             num_train_timesteps=num_diffusion_steps,
             beta_schedule=beta_schedule,
@@ -172,252 +156,427 @@ class DiffusionIntentTracker(nn.Module):
             prediction_type='epsilon',
         )
     
-    def extract_vit_features(self, frame, depth=None):
+    def _build_track_tokens(
+        self, 
+        query_coords: torch.Tensor, 
+        noisy_traj: torch.Tensor, 
+        diffusion_timestep: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Extract DINOv2 patch features from frames with temporal encoding.
+        Build track tokens for all query points and timesteps.
         
         Args:
-            frame: (B, T_obs, 3, 224, 224) - RGB images where T_obs = frame_stack
-                   (ImageNet normalized in dataloader)
-            depth: (B, T_obs, 1, 224, 224) - Depth maps for 3D mode, None for 2D
+            query_coords: (B, N, coord_dim) - Query positions in [0, 1]
+            noisy_traj: (B, N, T+1, coord_dim) - Noisy trajectory (includes t=0 conditioning)
+            diffusion_timestep: (B,) - Current diffusion timestep
             
         Returns:
-            scene_tokens: (B, T_obs*num_patches, feature_dim) - ViT patch embeddings 
-                         with temporal encoding, concatenated across frames
+            track_tokens: (B, N, T+1, hidden_size)
         """
-        B, T_obs, C, H, W = frame.shape
-        assert T_obs == self.frame_stack, f"Expected {self.frame_stack} frames, got {T_obs}"
+        B, N, T_total, _ = noisy_traj.shape
         
-        # Concatenate RGB + Depth for 3D mode -> RGBD
-        if self.track_type == '3d' and depth is not None:
-            frame = torch.cat([frame, depth], dim=2)  # (B, T_obs, 4, H, W)
+        # Encode query positions -> (B, N, pos_dim)
+        pos_emb = self._encode_position(query_coords, coord_type='track')
+        # Expand for all timesteps: (B, N, T+1, pos_dim)
+        pos_emb = pos_emb.unsqueeze(2).expand(B, N, T_total, -1)
         
-        # Flatten temporal dimension: (B, T_obs, C, H, W) -> (B*T_obs, C, H, W)
-        frame_flat = frame.view(B * T_obs, -1, H, W)
+        # Encode noisy state -> (B, N, T+1, state_dim)
+        state_emb = self.track_state_proj(noisy_traj)
         
-        # Process all frames through ViT
-        vit_output = self.vit.forward_features(frame_flat)
-        scene_tokens = vit_output['x_norm_patchtokens']  # (B*T_obs, num_patches, feature_dim)
+        # Get temporal embeddings: (T+1, temporal_dim) -> (1, 1, T+1, temporal_dim)
+        time_emb = self.time_emb.unsqueeze(0).unsqueeze(0)
+        time_emb = time_emb.expand(B, N, T_total, -1)
         
-        # Get dimensions
-        num_patches = scene_tokens.shape[1]
-        feature_dim = scene_tokens.shape[2]
+        # Get diffusion timestep embedding: (B, diffusion_dim) -> (B, 1, 1, diffusion_dim)
+        diff_time_emb = self.diffusion_time_emb[diffusion_timestep]  # (B, diffusion_dim)
+        diff_time_emb = diff_time_emb.unsqueeze(1).unsqueeze(1).expand(B, N, T_total, -1)
         
-        # Reshape to separate batch and temporal dimensions
-        scene_tokens = scene_tokens.view(B, T_obs, num_patches, feature_dim)  # (B, T_obs, num_patches, feature_dim)
+        # Concatenate all embeddings
+        token_input = torch.cat([pos_emb, state_emb, time_emb, diff_time_emb], dim=-1)
         
-        # Add temporal encoding to distinguish frames
-        # obs_time_emb: (1, T_obs, feature_dim) - has extra batch dim from get_1d_sincos_pos_embed_from_grid
-        # Reshape to (1, T_obs, 1, feature_dim) to broadcast over batch and patches
-        obs_time_encoding = self.obs_time_emb.unsqueeze(2)  # (1, T_obs, 1, feature_dim)
-        scene_tokens = scene_tokens + obs_time_encoding  # (B, T_obs, num_patches, feature_dim)
+        # Encode through MLP: (B, N, T+1, hidden_size)
+        track_tokens = self.track_encoder(token_input)
         
-        # Concatenate tokens from all frames: (B, T_obs, num_patches, feature_dim) -> (B, T_obs*num_patches, feature_dim)
-        scene_tokens = scene_tokens.view(B, T_obs * num_patches, feature_dim)
-        
-        return scene_tokens
+        return track_tokens
     
-    def forward(self, frames, query_coords, noisy_traj, timestep, scene_tokens=None, depth=None):
+    def _build_hand_tokens(
+        self,
+        hand_query_uvd: torch.Tensor,
+        hand_query_rot: torch.Tensor,
+        noisy_hand_traj: torch.Tensor,
+        diffusion_timestep: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Forward pass: predict noise in noisy trajectory tokens (conditioned slot + future steps).
-        OPTIMIZED: Supports cached vision features for efficiency.
+        Build hand tokens for all hands and timesteps.
         
         Args:
-            frames: (B, frame_stack, 3, 224, 224) - RGB frames (ImageNet normalized)
-                   Can be None if scene_tokens is provided.
-            query_coords: (B, N, 2) or (B, N, 3) - Initial positions in [0, 1]
-            noisy_traj: (B, N, T+1, coord_dim) - Noisy tokens (t=0 conditioned slot + T future steps)
-            timestep: (B,) - Diffusion timestep for each sample in batch
-            scene_tokens: (B, T_obs*num_patches, H) - Optional pre-computed ViT features.
-                         If provided, frames can be None. If not provided, computed from frames.
-            depth: (B, frame_stack, 1, 224, 224) - Depth maps for 3D mode, None for 2D
+            hand_query_uvd: (B, H, 3) - Hand UVD positions
+            hand_query_rot: (B, H, 6) - Hand 6D rotations
+            noisy_hand_traj: (B, H, T+1, 9) - Noisy hand trajectory (UVD + rot)
+            diffusion_timestep: (B,) - Current diffusion timestep
             
         Returns:
-            predicted_noise: (B, N, T+1, coord_dim) - Predicted noise for each token
+            hand_tokens: (B, H, T+1, hidden_size)
         """
-        B = noisy_traj.shape[0]
-        N = noisy_traj.shape[1]
-        T_tokens = self.total_token_steps
+        B, H, T_total, _ = noisy_hand_traj.shape
         
-        # 1. Extract or use cached ViT scene features
+        # Encode hand positions -> (B, H, hand_position_dim)
+        pos_emb = self._encode_position(hand_query_uvd, coord_type='hand')
+        pos_emb = pos_emb.unsqueeze(2).expand(B, H, T_total, -1)
+        
+        # Project rotation -> (B, H, hand_rotation_dim)
+        rot_emb = self.hand_rot_proj(hand_query_rot)
+        rot_emb = rot_emb.unsqueeze(2).expand(B, H, T_total, -1)
+        
+        # Encode noisy state -> (B, H, T+1, hand_state_dim)
+        state_emb = self.hand_state_proj(noisy_hand_traj)
+        
+        # Get temporal embeddings
+        time_emb = self.time_emb.unsqueeze(0).unsqueeze(0)
+        time_emb = time_emb.expand(B, H, T_total, -1)
+        
+        # Get diffusion timestep embedding
+        diff_time_emb = self.diffusion_time_emb[diffusion_timestep]
+        diff_time_emb = diff_time_emb.unsqueeze(1).unsqueeze(1).expand(B, H, T_total, -1)
+        
+        # Concatenate all embeddings
+        token_input = torch.cat([pos_emb, rot_emb, state_emb, time_emb, diff_time_emb], dim=-1)
+        
+        # Encode through MLP: (B, H, T+1, hidden_size)
+        hand_tokens = self.hand_encoder(token_input)
+        
+        return hand_tokens
+    
+    def forward(
+        self,
+        frames: Optional[torch.Tensor] = None,
+        query_coords: Optional[torch.Tensor] = None,
+        noisy_traj: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+        scene_tokens: Optional[torch.Tensor] = None,
+        depth: Optional[torch.Tensor] = None,
+        hand_query_uvd: Optional[torch.Tensor] = None,
+        hand_query_rot: Optional[torch.Tensor] = None,
+        noisy_hand_traj: Optional[torch.Tensor] = None,
+        text: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Noise prediction forward pass.
+        
+        Args:
+            frames: (B, frame_stack, C, H, W) - Observation frames
+            query_coords: (B, N, coord_dim) - Query positions
+            noisy_traj: (B, N, T+1, coord_dim) - Noisy trajectory with t=0 conditioning
+            timestep: (B,) - Diffusion timestep
+            scene_tokens: Pre-computed scene tokens (optional)
+            depth: (B, frame_stack, 1, H, W) - Depth maps (3D mode)
+            hand_query_uvd: (B, H, 3) - Hand initial UVD
+            hand_query_rot: (B, H, 6) - Hand initial 6D rotation
+            noisy_hand_traj: (B, H, T+1, 9) - Noisy hand trajectory
+            text: List[str] - Text descriptions
+            
+        Returns:
+            Dict with 'track_noise', optionally 'hand_noise'
+        """
+        # Get scene tokens
         if scene_tokens is None:
-            scene_tokens = self.extract_vit_features(frames, depth=depth)  # (B, frame_stack*256, H)
+            assert frames is not None, "Either frames or scene_tokens must be provided"
+            scene_tokens = self.extract_vit_features(frames, depth)
         
-        # 2. Encode absolute positions with high-frequency sin/cos
-        # Only use (x, y) for positional encoding, even in 3D mode
-        disp_mean = self.disp_mean.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
-        disp_std = self.disp_std.to(dtype=noisy_traj.dtype, device=noisy_traj.device)
-        noisy_disp_denorm = noisy_traj * disp_std + disp_mean  # (B, N, T+1, coord_dim)
-        query_coords_xy = query_coords[..., :2]  # (B, N, 2)
-        noisy_disp_xy = noisy_disp_denorm[..., :2]  # (B, N, T+1, 2)
-        current_pos = (query_coords_xy.unsqueeze(2) + noisy_disp_xy).clamp(0.0, 1.0)
-        pos_grid = current_pos.reshape(B * N * T_tokens, 2).permute(1, 0)  # (2, B*N*T_tokens)
-        pos_encoding = get_2d_sincos_pos_embed_from_grid(self.position_dim, pos_grid)
-        pos_encoding = pos_encoding.squeeze(0).reshape(B, N, T_tokens, self.position_dim)
+        # Add text tokens if text_mode is enabled
+        if self.text_mode and text is not None:
+            text_tokens = self.encode_text(text)
+            scene_tokens = torch.cat([text_tokens, scene_tokens], dim=1)
         
-        # 3. Trajectory embedding: direct noisy displacement signal
-        traj_embedding = self.traj_embed(noisy_traj)  # (B, N, T+1, traj_dim)
+        B, N, T_total, _ = noisy_traj.shape
         
-        # 4. Prepare temporal encoding for all token steps (including conditioned slot)
-        temporal_encoding = self.time_emb.view(1, 1, T_tokens, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T+1, temporal_dim)
+        # Build track tokens: (B, N, T+1, hidden_size)
+        track_tokens = self._build_track_tokens(query_coords, noisy_traj, timestep)
         
-        # 5. Prepare diffusion timestep encoding
-        timestep_encoding = self.diffusion_time_emb[0, timestep, :]  # (B, diffusion_timestep_dim)
-        timestep_encoding = timestep_encoding.view(B, 1, 1, self.diffusion_timestep_dim).expand(-1, N, T_tokens, -1)  # (B, N, T+1, diffusion_timestep_dim)
+        # Build hand tokens if available
+        hand_tokens = None
+        num_hands = 0
+        if self.hand_mode is not None and hand_query_uvd is not None and noisy_hand_traj is not None:
+            num_hands = hand_query_uvd.shape[1]
+            hand_tokens = self._build_hand_tokens(
+                hand_query_uvd, hand_query_rot, noisy_hand_traj, timestep
+            )
         
-        # 6. Combine all encodings using MLP
-        combined_encoding = torch.cat([pos_encoding, traj_embedding, temporal_encoding, timestep_encoding], dim=-1)
-        # Shape: (B, N, T+1, position_dim + traj_dim + temporal_dim + diffusion_timestep_dim)
+        # Combine track and hand tokens
+        if hand_tokens is not None:
+            all_tokens = torch.cat([track_tokens, hand_tokens], dim=1)
+        else:
+            all_tokens = track_tokens
         
-        # Pass through MLP to combine into single hidden representation
-        transformer_input = self.encoding_combiner(combined_encoding)
-        # Shape: (B, N, T+1, H)
+        # Process through transformer
+        transformer_output = self.updateformer(all_tokens, scene_tokens)
         
-        # 6. Transformer predicts noise via cross-attention to scene
-        predicted_noise = self.updateformer(
-            transformer_input, 
-            scene_tokens, 
-            add_space_attn=True
-        )
-        # Shape: (B, N, T+1, coord_dim) - noise prediction
+        # Extract track output and predict noise
+        track_output = transformer_output[:, :N, :, :]  # (B, N, T+1, hidden_size)
+        track_noise = self.track_head(track_output)  # (B, N, T+1, coord_dim)
         
-        return predicted_noise
+        outputs = {'track_noise': track_noise}
+        
+        # Process hand outputs
+        if num_hands > 0:
+            hand_output = transformer_output[:, N:, :, :]  # (B, H, T+1, hidden_size)
+            hand_noise = self.hand_head(hand_output)  # (B, H, T+1, 9)
+            outputs['hand_noise'] = hand_noise
+        
+        return outputs
     
-    def compute_loss(self, batch):
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Compute diffusion loss for training.
+        Compute diffusion training loss.
         
         Args:
-            batch: dict with keys:
-                - 'frames': (B, frame_stack, 3, H, W) - RGB frames
-                - 'query_coords': (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
-                - 'gt_disp_normalized': (B, N, T, coord_dim) - GT displacements (normalized)
-                - 'depth': (B, frame_stack, 1, H, W) - depth maps (3D mode only)
-        
+            batch: Dict containing training data
+            
         Returns:
-            loss: scalar tensor (MSE between predicted and actual noise)
+            Dict with 'total_loss', 'track_loss', 'hand_uvd_loss', 'hand_rot_loss'
         """
         frames = batch['frames']
         query_coords = batch['query_coords']
-        gt_disp_normalized = batch['gt_disp_normalized']
-        depth = batch.get('depth', None)
+        gt_disp = batch['gt_disp_normalized']  # (B, N, T, coord_dim)
+        depth = batch.get('depth')
+        text = batch.get('text')
         
-        B, N, T, _ = gt_disp_normalized.shape
-        device = gt_disp_normalized.device
-        total_steps = self.total_token_steps
+        B, N, T, _ = gt_disp.shape
+        device = gt_disp.device
         
-        # Build x0 = [zero displacement (normalized), future displacements (normalized)]
-        zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=gt_disp_normalized.dtype)
-        x0 = torch.zeros(B, N, total_steps, self.coord_dim, device=device, dtype=gt_disp_normalized.dtype)
-        x0[:, :, 0, :] = zero_disp_normalized
-        x0[:, :, 1:, :] = gt_disp_normalized
+        # Create conditioning slot (t=0): zero displacement
+        zero_slot = torch.zeros(B, N, 1, self.coord_dim, device=device)
+        gt_traj = torch.cat([zero_slot, gt_disp], dim=2)  # (B, N, T+1, coord_dim)
         
-        # Condition mask (True where values must stay fixed)
-        condition_mask = torch.zeros_like(x0, dtype=torch.bool)
+        # Sample random diffusion timesteps
+        timestep = torch.randint(0, self.num_diffusion_steps, (B,), device=device, dtype=torch.long)
+        
+        # Sample noise
+        noise = torch.randn_like(gt_traj)
+        
+        # Create conditioning mask (don't noise t=0)
+        condition_mask = torch.zeros(B, N, T + 1, self.coord_dim, device=device, dtype=torch.bool)
         condition_mask[:, :, 0, :] = True
         
-        # Sample random diffusion timestep for each sample in batch
-        timestep = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (B,), device=device
-        ).long()
-        
-        # Sample noise for full tensor
-        noise = torch.randn_like(x0)
-        
-        # Add noise using scheduler, then reapply conditioning mask (Diffusion Policy style)
-        noisy_traj = self.noise_scheduler.add_noise(x0, noise, timestep)
-        noisy_traj = torch.where(condition_mask, x0, noisy_traj)
+        # Add noise (respecting conditioning)
+        noisy_traj = self.noise_scheduler.add_noise(gt_traj, noise, timestep)
+        noisy_traj = torch.where(condition_mask, gt_traj, noisy_traj)
         noise = torch.where(condition_mask, torch.zeros_like(noise), noise)
         
-        # Predict the noise
-        predicted_noise = self(frames, query_coords, noisy_traj, timestep, depth=depth)
+        # Handle hand data
+        num_hands = 0
+        noisy_hand_traj = None
+        hand_noise = None
+        gt_hand_traj = None
+        hand_condition_mask = None
         
-        # Compute loss only on unconditioned slots
-        loss_mask = (~condition_mask).float()
-        masked_pred = predicted_noise * loss_mask
-        masked_target = noise * loss_mask
-        num_elements = loss_mask.sum().clamp_min(1.0)
-        loss = F.mse_loss(masked_pred, masked_target, reduction='sum') / num_elements
+        if self.hand_mode is not None:
+            hand_query_uvd = batch.get('hand_query_uvd')
+            hand_query_rot = batch.get('hand_query_rot')
+            gt_hand_uvd = batch.get('gt_hand_uvd_disp')
+            gt_hand_rot = batch.get('gt_hand_rot_disp')
+            
+            if hand_query_uvd is not None and gt_hand_uvd is not None:
+                num_hands = hand_query_uvd.shape[1]
+                
+                # Combine UVD and rotation displacements
+                if gt_hand_rot is not None:
+                    gt_hand_disp = torch.cat([gt_hand_uvd, gt_hand_rot], dim=-1)  # (B, H, T, 9)
+                else:
+                    gt_hand_disp = torch.cat([gt_hand_uvd, torch.zeros(B, num_hands, T, 6, device=device)], dim=-1)
+                
+                # Create conditioning slot for hands
+                hand_zero_slot = torch.zeros(B, num_hands, 1, 9, device=device)
+                gt_hand_traj = torch.cat([hand_zero_slot, gt_hand_disp], dim=2)  # (B, H, T+1, 9)
+                
+                # Sample hand noise
+                hand_noise = torch.randn_like(gt_hand_traj)
+                
+                # Create hand conditioning mask
+                hand_condition_mask = torch.zeros(B, num_hands, T + 1, 9, device=device, dtype=torch.bool)
+                hand_condition_mask[:, :, 0, :] = True
+                
+                # Add noise to hand trajectory
+                noisy_hand_traj = self.noise_scheduler.add_noise(gt_hand_traj, hand_noise, timestep)
+                noisy_hand_traj = torch.where(hand_condition_mask, gt_hand_traj, noisy_hand_traj)
+                hand_noise = torch.where(hand_condition_mask, torch.zeros_like(hand_noise), hand_noise)
         
-        return loss
+        # Forward pass
+        outputs = self(
+            frames=frames,
+            query_coords=query_coords,
+            noisy_traj=noisy_traj,
+            timestep=timestep,
+            depth=depth,
+            hand_query_uvd=batch.get('hand_query_uvd'),
+            hand_query_rot=batch.get('hand_query_rot'),
+            noisy_hand_traj=noisy_hand_traj,
+            text=text,
+        )
+        
+        # Compute track loss (MSE on noise prediction)
+        predicted_noise = outputs['track_noise']
+        
+        # Create loss mask (exclude t=0)
+        track_loss_mask = torch.ones(B, N, T + 1, device=device)
+        track_loss_mask[:, :, 0] = 0.0
+        
+        track_mse = (predicted_noise - noise) ** 2  # (B, N, T+1, coord_dim)
+        masked_track_mse = track_mse * track_loss_mask.unsqueeze(-1)
+        track_loss = masked_track_mse.sum() / (track_loss_mask.sum() * self.coord_dim).clamp_min(1.0)
+        
+        total_loss = track_loss
+        hand_uvd_loss = torch.tensor(0.0, device=device)
+        hand_rot_loss = torch.tensor(0.0, device=device)
+        
+        # Hand loss
+        if num_hands > 0 and 'hand_noise' in outputs:
+            predicted_hand_noise = outputs['hand_noise']
+            
+            hand_loss_mask = torch.ones(B, num_hands, T + 1, device=device)
+            hand_loss_mask[:, :, 0] = 0.0
+            
+            hand_uvd_weight = 1.0
+            hand_rot_weight = 0.5
+            
+            # UVD loss
+            hand_uvd_mse = (predicted_hand_noise[..., :3] - hand_noise[..., :3]) ** 2
+            masked_uvd_mse = hand_uvd_mse * hand_loss_mask.unsqueeze(-1)
+            hand_uvd_loss = masked_uvd_mse.sum() / (hand_loss_mask.sum() * 3).clamp_min(1.0)
+            
+            # Rotation loss
+            hand_rot_mse = (predicted_hand_noise[..., 3:] - hand_noise[..., 3:]) ** 2
+            masked_rot_mse = hand_rot_mse * hand_loss_mask.unsqueeze(-1)
+            hand_rot_loss = masked_rot_mse.sum() / (hand_loss_mask.sum() * 6).clamp_min(1.0)
+            
+            total_loss = track_loss + hand_uvd_weight * hand_uvd_loss + hand_rot_weight * hand_rot_loss
+        
+        return {
+            'total_loss': total_loss,
+            'track_loss': track_loss,
+            'hand_uvd_loss': hand_uvd_loss,
+            'hand_rot_loss': hand_rot_loss,
+        }
     
     @torch.no_grad()
-    def predict(self, frames, query_coords, depth=None, num_inference_steps=10, return_intermediate=False):
+    def predict(
+        self,
+        frames: torch.Tensor,
+        query_coords: torch.Tensor,
+        depth: Optional[torch.Tensor] = None,
+        num_inference_steps: Optional[int] = None,
+        return_intermediate: bool = False,
+        hand_query_uvd: Optional[torch.Tensor] = None,
+        hand_query_rot: Optional[torch.Tensor] = None,
+        text: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Predict clean trajectories using DDIM sampling with cached vision features.
+        DDIM sampling for inference.
         
         Args:
-            frames: (B, frame_stack, 3, H, W) - RGB frames
-            query_coords: (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
-            depth: (B, frame_stack, 1, H, W) - depth maps (3D mode only)
-            num_inference_steps: int - number of denoising steps (default 10)
-            return_intermediate: bool - if True, return intermediate predictions
-        
+            frames: (B, frame_stack, C, H, W) - Observation frames
+            query_coords: (B, N, coord_dim) - Query positions
+            depth: (B, frame_stack, 1, H, W) - Depth maps (3D mode)
+            num_inference_steps: Number of DDIM steps (default: self.default_num_inference_steps)
+            return_intermediate: Whether to return intermediate denoising steps
+            hand_query_uvd: (B, H, 3) - Hand initial UVD
+            hand_query_rot: (B, H, 6) - Hand initial 6D rotation
+            text: List[str] - Text descriptions
+            
         Returns:
-            clean_disp: (B, N, T, coord_dim) - final clean displacements (normalized)
-            intermediate: list of (B, N, T, coord_dim) tensors at each step (if return_intermediate=True)
+            Dict with 'track_disp', optionally 'hand_uvd_disp', 'hand_rot_disp'
+            If return_intermediate, returns (outputs, intermediate_list)
         """
-        B = frames.shape[0]
-        N = query_coords.shape[1]
+        if num_inference_steps is None:
+            num_inference_steps = self.default_num_inference_steps
+        
+        B, N, _ = query_coords.shape
         T = self.num_future_steps
-        total_steps = self.total_token_steps
-        device = frames.device
+        device = query_coords.device
         
-        # OPTIMIZATION: Extract vision features ONCE (not at every diffusion step)
-        scene_tokens = self.extract_vit_features(frames, depth=depth)  # (B, frame_stack*256, H)
+        # Pre-compute scene tokens
+        scene_tokens = self.extract_vit_features(frames, depth)
         
-        # Conditioning tensors (slot 0 = zero displacement in normalized space)
-        zero_disp_normalized = (-self.disp_mean / self.disp_std).to(device=device, dtype=scene_tokens.dtype)
-        condition_data = torch.zeros(B, N, total_steps, self.coord_dim, device=device, dtype=scene_tokens.dtype)
-        condition_data[:, :, 0, :] = zero_disp_normalized
-        condition_mask = torch.zeros_like(condition_data, dtype=torch.bool)
+        # Add text tokens if text_mode is enabled
+        if self.text_mode and text is not None:
+            text_tokens = self.encode_text(text)
+            scene_tokens = torch.cat([text_tokens, scene_tokens], dim=1)
+        
+        # Initialize noisy trajectory from random noise
+        noisy_traj = torch.randn(B, N, T + 1, self.coord_dim, device=device)
+        
+        # Create conditioning data (t=0 is zero displacement)
+        condition_data = torch.zeros(B, N, T + 1, self.coord_dim, device=device)
+        condition_mask = torch.zeros(B, N, T + 1, self.coord_dim, device=device, dtype=torch.bool)
         condition_mask[:, :, 0, :] = True
         
-        # Set the number of inference timesteps
-        self.inference_scheduler.set_timesteps(num_inference_steps, device=device)
+        # Handle hand data
+        num_hands = 0
+        noisy_hand_traj = None
+        hand_condition_data = None
+        hand_condition_mask = None
         
-        # Start from pure noise but respect conditioning mask
-        noisy_traj = torch.randn_like(condition_data)
-        noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
+        if self.hand_mode is not None and hand_query_uvd is not None:
+            num_hands = hand_query_uvd.shape[1]
+            noisy_hand_traj = torch.randn(B, num_hands, T + 1, 9, device=device)
+            hand_condition_data = torch.zeros(B, num_hands, T + 1, 9, device=device)
+            hand_condition_mask = torch.zeros(B, num_hands, T + 1, 9, device=device, dtype=torch.bool)
+            hand_condition_mask[:, :, 0, :] = True
         
-        # Store intermediate predictions if requested (only unconditioned slots)
+        # Set inference scheduler timesteps
+        self.inference_scheduler.set_timesteps(num_inference_steps)
+        
         intermediate = [] if return_intermediate else None
         
-        # DDIM sampling loop with cached vision features
+        # DDIM sampling loop
         for t in self.inference_scheduler.timesteps:
-            # Create timestep tensor for batch
             timestep = torch.full((B,), t, device=device, dtype=torch.long)
             
-            # Ensure conditioned slots stay clean before network evaluation
+            # Apply conditioning
             noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
+            if noisy_hand_traj is not None:
+                noisy_hand_traj = torch.where(hand_condition_mask, hand_condition_data, noisy_hand_traj)
             
-            # Predict noise using cached scene tokens (pass scene_tokens to skip re-extraction)
-            predicted_noise = self(
-                frames=None,  # Not needed since we have scene_tokens
+            # Forward pass to predict noise
+            outputs = self(
+                frames=None,
                 query_coords=query_coords,
                 noisy_traj=noisy_traj,
                 timestep=timestep,
-                scene_tokens=scene_tokens  # Use cached features
+                scene_tokens=scene_tokens,
+                hand_query_uvd=hand_query_uvd,
+                hand_query_rot=hand_query_rot,
+                noisy_hand_traj=noisy_hand_traj,
             )
             
-            # Denoise using scheduler
-            noisy_traj = self.inference_scheduler.step(
-                predicted_noise, t, noisy_traj
-            ).prev_sample
-            
-            # Reapply conditioning after the update
+            # Denoise track trajectory
+            predicted_track_noise = outputs['track_noise']
+            noisy_traj = self.inference_scheduler.step(predicted_track_noise, t, noisy_traj).prev_sample
             noisy_traj = torch.where(condition_mask, condition_data, noisy_traj)
             
-            # Store intermediate result if requested (drop conditioned slot)
+            # Denoise hand trajectory
+            if noisy_hand_traj is not None and 'hand_noise' in outputs:
+                predicted_hand_noise = outputs['hand_noise']
+                noisy_hand_traj = self.inference_scheduler.step(predicted_hand_noise, t, noisy_hand_traj).prev_sample
+                noisy_hand_traj = torch.where(hand_condition_mask, hand_condition_data, noisy_hand_traj)
+            
+            # Store intermediate
             if return_intermediate:
-                intermediate.append(noisy_traj[:, :, 1:, :].clone())
+                step_result = {'track_disp': noisy_traj[:, :, 1:, :].clone()}
+                if noisy_hand_traj is not None:
+                    step_result['hand_uvd_disp'] = noisy_hand_traj[:, :, 1:, :3].clone()
+                    step_result['hand_rot_disp'] = noisy_hand_traj[:, :, 1:, 3:].clone()
+                intermediate.append(step_result)
         
-        clean_traj = noisy_traj
-        clean_disp = clean_traj[:, :, 1:, :]
+        # Extract final predictions (skip conditioning slot)
+        clean_disp = noisy_traj[:, :, 1:, :]  # (B, N, T, coord_dim)
+        result = {'track_disp': clean_disp}
+        
+        if num_hands > 0 and noisy_hand_traj is not None:
+            clean_hand_traj = noisy_hand_traj[:, :, 1:, :]  # (B, H, T, 9)
+            result['hand_uvd_disp'] = clean_hand_traj[..., :3]
+            result['hand_rot_disp'] = clean_hand_traj[..., 3:]
         
         if return_intermediate:
-            return clean_disp, intermediate
-        else:
-            return clean_disp
-
+            return result, intermediate
+        return result

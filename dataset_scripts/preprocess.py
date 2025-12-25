@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import time
-import yaml
+from omegaconf import OmegaConf
 import shutil
 
 # Setup paths
@@ -139,10 +139,8 @@ def process_video(video_path, output_folder, video_index, target_width=512, targ
     return saved_frame_count
 
 def load_config(config_path="config.yaml"):
-    """Load configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """Load configuration from YAML file using OmegaConf"""
+    return OmegaConf.load(config_path)
 
 def main():
     # Load configuration from config file

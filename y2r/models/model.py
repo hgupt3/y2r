@@ -1,264 +1,357 @@
+"""
+Direct prediction Intent Tracker model.
+
+This module implements a direct (non-autoregressive, non-diffusion) model
+for trajectory prediction. Given observation frames and query coordinates,
+it directly predicts all future displacements in a single forward pass.
+"""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Optional, List, Dict
 
-from y2r.models.blocks import EfficientUpdateFormer, Mlp
-from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_sincos_pos_embed_from_grid
-from y2r.models.model_utils import extend_vit_to_rgbd
+from y2r.models.base_model import BaseIntentTracker
+from y2r.models.model_config import ENCODING_DIMS
 
-class IntentTracker(nn.Module):
+
+class IntentTracker(BaseIntentTracker):
+    """
+    Direct prediction Intent Tracker.
+    
+    This model predicts all future trajectory displacements in a single forward pass,
+    without iterative refinement (autoregressive) or denoising (diffusion).
+    
+    Architecture:
+    - ViT encoder extracts scene tokens from observation frames
+    - Track tokens are built from query positions + temporal encodings
+    - UpdateFormer processes scene + track tokens with cross-attention
+    - Linear heads predict displacement outputs
+    """
+    
     def __init__(
         self,
-        num_future_steps=10,
-        hidden_size=384,
-        model_resolution=(224, 224),
-        add_space_attn=True,
-        vit_model_name='dinov2_vits14',
-        vit_frozen=False,
-        time_depth=6,
-        space_depth=3,
-        num_heads=8,
-        mlp_ratio=4.0,
-        p_drop_attn=0.0,
-        frame_stack=1,
-        track_type='2d',
-        cache_quantized_position_encoding=False,
-        from_pretrained=True,
+        model_size: str = 's',
+        num_future_steps: int = 10,
+        model_resolution: tuple = (256, 256),
+        add_space_attn: bool = True,
+        vit_frozen: bool = False,
+        p_drop_attn: float = 0.0,
+        frame_stack: int = 1,
+        track_type: str = '2d',
+        from_pretrained: bool = True,
+        hand_mode: Optional[str] = None,
+        text_mode: bool = False,
     ):
-        super(IntentTracker, self).__init__()
-        self.num_future_steps = num_future_steps
-        self.hidden_size = hidden_size
-        self.model_resolution = model_resolution
-        self.frame_stack = frame_stack
-        self.track_type = track_type
-        self.coord_dim = 3 if track_type == '3d' else 2
-        self.cache_quantized_position_encoding = cache_quantized_position_encoding
-
-        # ViT encoder (provides all visual context)
-        if from_pretrained:
-            # Load pretrained weights from torch.hub (for training)
-            self.vit = torch.hub.load('facebookresearch/dinov2', vit_model_name)
-        else:
-            # Create model architecture without pretrained weights (for inference from checkpoint)
-            # Import from vendored dinov2 in thirdparty/ to avoid network dependency
-            import sys
-            from pathlib import Path
-            # Add vendored dinov2 to path
-            project_root = Path(__file__).parent.parent.parent
-            dinov2_path = project_root / 'thirdparty' / 'dinov2'
-            if str(dinov2_path) not in sys.path:
-                sys.path.insert(0, str(dinov2_path))
-            from dinov2.hub.backbones import (
-                dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14,
-                dinov2_vits14_reg, dinov2_vitb14_reg, dinov2_vitl14_reg, dinov2_vitg14_reg
-            )
-            # Map model name to function
-            model_map = {
-                'dinov2_vits14': dinov2_vits14,
-                'dinov2_vitb14': dinov2_vitb14,
-                'dinov2_vitl14': dinov2_vitl14,
-                'dinov2_vitg14': dinov2_vitg14,
-                'dinov2_vits14_reg': dinov2_vits14_reg,
-                'dinov2_vitb14_reg': dinov2_vitb14_reg,
-                'dinov2_vitl14_reg': dinov2_vitl14_reg,
-                'dinov2_vitg14_reg': dinov2_vitg14_reg,
-            }
-            if vit_model_name not in model_map:
-                raise ValueError(f"Unknown ViT model: {vit_model_name}")
-            # Create model without pretrained weights (pretrained=False)
-            self.vit = model_map[vit_model_name](pretrained=False)
-        
-        # Extend ViT to handle RGBD input for 3D mode
-        if track_type == '3d':
-            extend_vit_to_rgbd(self.vit)
-        
-        self.vit.requires_grad_(not vit_frozen)
-        
-        # Embedding dimensions (following modern diffusion literature like DiT)
-        # Query (2D spatial) = ~50% of model dim for explicit localization
-        # Temporal (1D discrete) = ~50% of model dim
-        self.query_dim = hidden_size
-        self.temporal_dim = hidden_size
-        
-        # Temporal embeddings for future predictions
-        time_grid = torch.linspace(0, num_future_steps - 1, num_future_steps).reshape(
-            1, num_future_steps, 1
-        )
-        self.register_buffer(
-            "time_emb", get_1d_sincos_pos_embed_from_grid(self.temporal_dim, time_grid[0])
-        )
-
-        # Observation temporal embeddings for past frames
-        # Frames at relative times: [-frame_stack+1, ..., -1, 0]
-        # NOTE: This is ADDED to ViT features, so it must be hidden_size (384), not temporal_dim
-        obs_time_grid = torch.linspace(-(frame_stack - 1), 0, frame_stack).reshape(
-            1, frame_stack, 1
-        )
-        self.register_buffer(
-            "obs_time_emb", get_1d_sincos_pos_embed_from_grid(hidden_size, obs_time_grid[0])
-        )
-
-        # Transformer
-        self.updateformer = EfficientUpdateFormer(
-            depth=time_depth,
-            input_dim=hidden_size,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            output_dim=self.coord_dim,   # 2 for 2D (Δx, Δy), 3 for 3D (Δx, Δy, Δz)
-            mlp_ratio=mlp_ratio,
+        # Initialize base class (ViT, text encoder, temporal embeddings)
+        super().__init__(
+            model_size=model_size,
+            num_future_steps=num_future_steps,
+            model_resolution=model_resolution,
             add_space_attn=add_space_attn,
+            vit_frozen=vit_frozen,
             p_drop_attn=p_drop_attn,
-            linear_layer_for_vis_conf=False,
+            frame_stack=frame_stack,
+            track_type=track_type,
+            from_pretrained=from_pretrained,
+            hand_mode=hand_mode,
+            text_mode=text_mode,
         )
+        
+        # =========================================================================
+        # Track Token Encoder (Direct model: no state encoding needed)
+        # =========================================================================
+        # Track token: concat(position, temporal) -> MLP -> hidden_size
+        track_input_dim = self.enc_dims['track_position'] + self.enc_dims['temporal']
+        self.track_encoder = self._create_track_encoder(track_input_dim)
+        
+        # =========================================================================
+        # Hand Token Encoder (Optional)
+        # =========================================================================
+        if hand_mode is not None:
+            # Hand: concat(position, rotation, temporal) -> MLP -> hidden_size
+            hand_input_dim = (self.enc_dims['hand_position'] + 
+                            self.enc_dims['hand_rotation'] + 
+                            self.enc_dims['temporal'])
+            self.hand_encoder = self._create_hand_encoder(hand_input_dim)
+            
+            # Linear projection for 6D rotation -> hand_rotation dim
+            self.hand_rot_proj = nn.Linear(6, self.enc_dims['hand_rotation'])
+            
+            # Hand output head: hidden_size -> 9 (3 UVD + 6 rotation)
+            self.hand_head = nn.Linear(self.hidden_size, 9)
+        
+        # =========================================================================
+        # Transformer and Output Heads
+        # =========================================================================
+        self.updateformer = self._create_updateformer()
+        
+        # Track output head: hidden_size -> coord_dim (3 for 3D UVD, 2 for 2D)
+        self.track_head = nn.Linear(self.hidden_size, self.coord_dim)
     
-    def extract_vit_features(self, frame, depth=None):
+    def _build_track_tokens(
+        self, 
+        query_coords: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Extract DINOv2 patch features from frames with temporal encoding.
+        Build track tokens for all query points and timesteps.
         
         Args:
-            frame: (B, T_obs, 3, 224, 224) - RGB images where T_obs = frame_stack
-                   (ImageNet normalized in dataloader)
-            depth: (B, T_obs, 1, 224, 224) - Depth maps for 3D mode, None for 2D
+            query_coords: (B, N, coord_dim) - Query positions in [0, 1]
             
         Returns:
-            scene_tokens: (B, T_obs*num_patches, feature_dim) - ViT patch embeddings 
-                         with temporal encoding, concatenated across frames
+            track_tokens: (B, N, T, hidden_size)
         """
-        B, T_obs, C, H, W = frame.shape
-        assert T_obs == self.frame_stack, f"Expected {self.frame_stack} frames, got {T_obs}"
-        
-        # Concatenate RGB + Depth for 3D mode -> RGBD
-        if self.track_type == '3d' and depth is not None:
-            frame = torch.cat([frame, depth], dim=2)  # (B, T_obs, 4, H, W)
-        
-        # Flatten temporal dimension: (B, T_obs, C, H, W) -> (B*T_obs, C, H, W)
-        frame_flat = frame.view(B * T_obs, -1, H, W)
-        
-        # Process all frames through ViT
-        vit_output = self.vit.forward_features(frame_flat)
-        scene_tokens = vit_output['x_norm_patchtokens']  # (B*T_obs, num_patches, feature_dim)
-        
-        # Get dimensions
-        num_patches = scene_tokens.shape[1]
-        feature_dim = scene_tokens.shape[2]
-        
-        # Reshape to separate batch and temporal dimensions
-        scene_tokens = scene_tokens.view(B, T_obs, num_patches, feature_dim)  # (B, T_obs, num_patches, feature_dim)
-        
-        # Add temporal encoding to distinguish frames
-        # obs_time_emb: (1, T_obs, feature_dim) - has extra batch dim from get_1d_sincos_pos_embed_from_grid
-        # Reshape to (1, T_obs, 1, feature_dim) to broadcast over batch and patches
-        obs_time_encoding = self.obs_time_emb.unsqueeze(2)  # (1, T_obs, 1, feature_dim)
-        scene_tokens = scene_tokens + obs_time_encoding  # (B, T_obs, num_patches, feature_dim)
-        
-        # Concatenate tokens from all frames: (B, T_obs, num_patches, feature_dim) -> (B, T_obs*num_patches, feature_dim)
-        scene_tokens = scene_tokens.view(B, T_obs * num_patches, feature_dim)
-        
-        return scene_tokens
-    
-    def forward(self, frame, query_coords, depth=None):
-        """
-        Predict future point trajectories from observation frames.
-        Tokens are purely positional + temporal, all visual info from ViT via cross-attention.
-
-        Args:
-            frame: (B, frame_stack, 3, 224, 224) - RGB frames (ImageNet normalized in dataloader)
-            query_coords: (B, N, 2) or (B, N, 3) - Initial positions in [0, 1] normalized coordinates
-                          For 3D, only (x, y) are used for positional encoding
-            depth: (B, frame_stack, 1, 224, 224) - Depth maps for 3D mode, None for 2D
-            
-        Returns:
-            displacements: (B, N, T, coord_dim) - Cumulative displacements (2D or 3D)
-        """
-        B = frame.shape[0]
-        N = query_coords.shape[1]
+        B, N, _ = query_coords.shape
         T = self.num_future_steps
         
-        # 1. Extract ViT scene features with temporal encoding (provides ALL visual context)
-        scene_tokens = self.extract_vit_features(frame, depth=depth)  # (B, frame_stack*256, H)
+        # Encode query positions -> (B, N, pos_dim)
+        pos_emb = self._encode_position(query_coords, coord_type='track')
         
-        # 2. Query encoding: encode initial query coordinates (where trajectories start)
-        # Use 2D sinusoidal positional encoding for spatial localization
-        # Only use (x, y) for positional encoding, even in 3D mode
-        coords_xy = query_coords[..., :2]  # (B, N, 2)
-        coords_pixel = coords_xy * 224.0  # (B, N, 2) -> [0, 224]
-        grid = coords_pixel.permute(2, 0, 1)  # (2, B, N)
-        query_encoding = get_2d_sincos_pos_embed_from_grid(self.query_dim, grid)  # (1, B*N, query_dim)
-        query_encoding = query_encoding.squeeze(0).reshape(B, N, self.query_dim)
-        # Expand to all future timesteps
-        query_encoding_expanded = query_encoding.unsqueeze(2).expand(-1, -1, T, -1)  # (B, N, T, query_dim)
+        # Expand for all timesteps: (B, N, 1, pos_dim) -> (B, N, T, pos_dim)
+        pos_emb = pos_emb.unsqueeze(2).expand(B, N, T, -1)
         
-        # 3. Prepare temporal encoding
-        # time_emb shape: (1, T, temporal_dim), we need (B, N, T, temporal_dim)
-        temporal_encoding = self.time_emb.view(1, 1, T, self.temporal_dim).expand(B, N, -1, -1)  # (B, N, T, temporal_dim)
+        # Get temporal embeddings: (T, temporal_dim) -> (1, 1, T, temporal_dim)
+        time_emb = self.time_emb.unsqueeze(0).unsqueeze(0)
+        time_emb = time_emb.expand(B, N, T, -1)
         
-        # 4. Combine query and temporal encodings using MLP
-        # Add query and temporal encodings
-        transformer_input = query_encoding_expanded + temporal_encoding
-        # Shape: (B, N, T, H) - combined query/temporal tokens
+        # Concatenate: (B, N, T, pos_dim + temporal_dim)
+        token_input = torch.cat([pos_emb, time_emb], dim=-1)
         
-        # 5. Transformer queries scene via cross-attention for all visual info
-        displacements = self.updateformer(
-            transformer_input, 
-            scene_tokens, 
-            add_space_attn=True
-        )
-        # Shape: (B, N, T, coord_dim) - direct prediction
+        # Encode through MLP: (B, N, T, hidden_size)
+        track_tokens = self.track_encoder(token_input)
         
-        return displacements  # Cumulative displacements (0→1, 0→2, ..., 0→T)
+        return track_tokens
     
-    def compute_loss(self, batch):
+    def _build_hand_tokens(
+        self,
+        hand_query_uvd: torch.Tensor,
+        hand_query_rot: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Compute loss for training. Encapsulates loss computation within the model.
+        Build hand tokens for all hands and timesteps.
         
         Args:
-            batch: dict with keys:
-                - 'frames': (B, frame_stack, 3, H, W) - RGB frames
-                - 'query_coords': (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
-                - 'gt_disp_normalized': (B, N, T, coord_dim) - GT displacements (normalized)
-                - 'depth': (B, frame_stack, 1, H, W) - depth maps (3D mode only)
-        
+            hand_query_uvd: (B, H, 3) - Hand UVD positions in [0, 1]
+            hand_query_rot: (B, H, 6) - Hand 6D rotations
+            
         Returns:
-            loss: scalar tensor
+            hand_tokens: (B, H, T, hidden_size)
         """
-        frames = batch['frames']
-        query_coords = batch['query_coords']
-        gt_disp_normalized = batch['gt_disp_normalized']
-        depth = batch.get('depth', None)
+        B, H, _ = hand_query_uvd.shape
+        T = self.num_future_steps
         
-        # Forward pass
-        pred_disp = self(frames, query_coords, depth=depth)  # (B, N, T, coord_dim)
+        # Encode hand positions -> (B, H, hand_position_dim)
+        pos_emb = self._encode_position(hand_query_uvd, coord_type='hand')
         
-        # L2 distance in normalized space
-        error = torch.norm(pred_disp - gt_disp_normalized, dim=-1)  # (B, N, T)
+        # Project rotation -> (B, H, hand_rotation_dim)
+        rot_emb = self.hand_rot_proj(hand_query_rot)
         
-        # Mask out t=0 (should always be zero displacement)
-        loss_mask = torch.ones_like(error)
-        loss_mask[:, :, 0] = 0.0  # Don't compute loss for t=0
+        # Expand for all timesteps
+        pos_emb = pos_emb.unsqueeze(2).expand(B, H, T, -1)  # (B, H, T, pos_dim)
+        rot_emb = rot_emb.unsqueeze(2).expand(B, H, T, -1)  # (B, H, T, rot_dim)
         
-        masked_error = error * loss_mask
-        loss = masked_error.sum() / loss_mask.sum()
+        # Get temporal embeddings
+        time_emb = self.time_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, T, temporal_dim)
+        time_emb = time_emb.expand(B, H, T, -1)
         
-        return loss
+        # Concatenate: (B, H, T, pos_dim + rot_dim + temporal_dim)
+        token_input = torch.cat([pos_emb, rot_emb, time_emb], dim=-1)
+        
+        # Encode through MLP: (B, H, T, hidden_size)
+        hand_tokens = self.hand_encoder(token_input)
+        
+        return hand_tokens
     
-    def predict(self, frames, query_coords, depth=None, return_intermediate=False):
+    def forward(
+        self,
+        frames: torch.Tensor,
+        query_coords: torch.Tensor,
+        depth: Optional[torch.Tensor] = None,
+        hand_query_uvd: Optional[torch.Tensor] = None,
+        hand_query_rot: Optional[torch.Tensor] = None,
+        text: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Prediction method for inference. Wrapper around forward for API consistency.
+        Forward pass for direct prediction.
+        
+        Args:
+            frames: (B, frame_stack, 3, H, W) - RGB observation frames
+            query_coords: (B, N, coord_dim) - Query positions in [0, 1]
+            depth: (B, frame_stack, 1, H, W) - Depth maps (3D mode only)
+            hand_query_uvd: (B, H, 3) - Hand initial UVD positions
+            hand_query_rot: (B, H, 6) - Hand initial 6D rotations
+            text: List[str] of length B - Text descriptions
+            
+        Returns:
+            Dict with:
+                'track_disp': (B, N, T, coord_dim) - Predicted displacements
+                'hand_uvd_disp': (B, H, T, 3) - Hand UVD displacements (if hand_mode)
+                'hand_rot_disp': (B, H, T, 6) - Hand rotation displacements (if hand_mode)
+        """
+        B, N, _ = query_coords.shape
+        T = self.num_future_steps
+        
+        # Extract visual features from observation frames
+        scene_tokens = self.extract_vit_features(frames, depth)  # (B, num_scene_tokens, hidden_size)
+        
+        # Add text tokens if text_mode is enabled
+        if self.text_mode and text is not None:
+            text_tokens = self.encode_text(text)  # (B, 1, hidden_size)
+            scene_tokens = torch.cat([text_tokens, scene_tokens], dim=1)
+        
+        # Build track tokens: (B, N, T, hidden_size)
+        track_tokens = self._build_track_tokens(query_coords)
+        
+        # Build hand tokens if hand_mode is set
+        hand_tokens = None
+        num_hands = 0
+        if self.hand_mode is not None and hand_query_uvd is not None:
+            hand_tokens = self._build_hand_tokens(hand_query_uvd, hand_query_rot)
+            num_hands = hand_tokens.shape[1]
+        
+        # Combine track and hand tokens for transformer
+        # Shape: (B, N+H, T, hidden_size)
+        if hand_tokens is not None:
+            all_tokens = torch.cat([track_tokens, hand_tokens], dim=1)
+        else:
+            all_tokens = track_tokens
+        
+        # Process through UpdateFormer
+        # Input: (B, N+H, T, hidden_size) query tokens + (B, S, hidden_size) scene tokens
+        transformer_output = self.updateformer(all_tokens, scene_tokens)  # (B, N+H, T, hidden_size)
+        
+        # Split outputs back into track and hand
+        track_output = transformer_output[:, :N, :, :]  # (B, N, T, hidden_size)
+        
+        # Apply track head to get displacements
+        track_disp = self.track_head(track_output)  # (B, N, T, coord_dim)
+        
+        outputs = {'track_disp': track_disp}
+        
+        # Process hand outputs if available
+        if num_hands > 0:
+            hand_output = transformer_output[:, N:, :, :]  # (B, H, T, hidden_size)
+            hand_pred = self.hand_head(hand_output)  # (B, H, T, 9)
+            
+            outputs['hand_uvd_disp'] = hand_pred[..., :3]  # (B, H, T, 3)
+            outputs['hand_rot_disp'] = hand_pred[..., 3:]  # (B, H, T, 6)
+        
+        return outputs
+    
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Compute training loss.
+        
+        Args:
+            batch: Dict containing:
+                - 'frames': (B, frame_stack, 3, H, W)
+                - 'query_coords': (B, N, coord_dim)
+                - 'gt_disp_normalized': (B, N, T, coord_dim) - Ground truth displacements
+                - 'depth': (B, frame_stack, 1, H, W) - Optional
+                - 'hand_query_uvd': (B, H, 3) - Optional
+                - 'hand_query_rot': (B, H, 6) - Optional
+                - 'gt_hand_uvd_disp': (B, H, T, 3) - Optional
+                - 'gt_hand_rot_disp': (B, H, T, 6) - Optional
+                - 'text': List[str] - Optional
+                
+        Returns:
+            Dict with 'total_loss', 'track_loss', 'hand_uvd_loss', 'hand_rot_loss'
+        """
+        # Forward pass
+        outputs = self(
+            frames=batch['frames'],
+            query_coords=batch['query_coords'],
+            depth=batch.get('depth'),
+            hand_query_uvd=batch.get('hand_query_uvd'),
+            hand_query_rot=batch.get('hand_query_rot'),
+            text=batch.get('text'),
+        )
+        
+        # Track loss (L1 with t=0 masked out)
+        pred_track_disp = outputs['track_disp']
+        gt_track_disp = batch['gt_disp_normalized']
+        
+        track_error = torch.abs(pred_track_disp - gt_track_disp)  # (B, N, T, coord_dim)
+        
+        # Mask out t=0 (displacement at t=0 should be zero by definition)
+        loss_mask = torch.ones_like(track_error[..., 0])  # (B, N, T)
+        loss_mask[:, :, 0] = 0.0
+        
+        masked_track_error = track_error * loss_mask.unsqueeze(-1)
+        track_loss = masked_track_error.sum() / (loss_mask.sum() * self.coord_dim)
+        
+        total_loss = track_loss
+        hand_uvd_loss = torch.tensor(0.0, device=track_loss.device)
+        hand_rot_loss = torch.tensor(0.0, device=track_loss.device)
+        
+        # Hand loss (if hand_mode is set)
+        if self.hand_mode is not None and 'hand_uvd_disp' in outputs:
+            pred_hand_uvd = outputs['hand_uvd_disp']
+            pred_hand_rot = outputs['hand_rot_disp']
+            gt_hand_uvd = batch.get('gt_hand_uvd_disp')
+            gt_hand_rot = batch.get('gt_hand_rot_disp')
+            
+            hand_uvd_weight = 1.0
+            hand_rot_weight = 0.5
+            
+            if gt_hand_uvd is not None:
+                hand_uvd_error = torch.abs(pred_hand_uvd - gt_hand_uvd)
+                hand_uvd_mask = torch.ones_like(hand_uvd_error[..., 0])
+                hand_uvd_mask[:, :, 0] = 0.0
+                masked_hand_uvd_error = hand_uvd_error * hand_uvd_mask.unsqueeze(-1)
+                hand_uvd_loss = masked_hand_uvd_error.sum() / (hand_uvd_mask.sum() * 3).clamp_min(1.0)
+            
+            if gt_hand_rot is not None:
+                hand_rot_error = torch.abs(pred_hand_rot - gt_hand_rot)
+                hand_rot_mask = torch.ones_like(hand_rot_error[..., 0])
+                hand_rot_mask[:, :, 0] = 0.0
+                masked_hand_rot_error = hand_rot_error * hand_rot_mask.unsqueeze(-1)
+                hand_rot_loss = masked_hand_rot_error.sum() / (hand_rot_mask.sum() * 6).clamp_min(1.0)
+            
+            total_loss = track_loss + hand_uvd_weight * hand_uvd_loss + hand_rot_weight * hand_rot_loss
+        
+        return {
+            'total_loss': total_loss,
+            'track_loss': track_loss,
+            'hand_uvd_loss': hand_uvd_loss,
+            'hand_rot_loss': hand_rot_loss,
+        }
+    
+    def predict(
+        self,
+        frames: torch.Tensor,
+        query_coords: torch.Tensor,
+        depth: Optional[torch.Tensor] = None,
+        hand_query_uvd: Optional[torch.Tensor] = None,
+        hand_query_rot: Optional[torch.Tensor] = None,
+        text: Optional[List[str]] = None,
+        return_intermediate: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Inference-time prediction.
         
         Args:
             frames: (B, frame_stack, 3, H, W) - RGB frames
-            query_coords: (B, N, 2) or (B, N, 3) - initial positions in [0, 1]
-            depth: (B, frame_stack, 1, H, W) - depth maps (3D mode only)
-            return_intermediate: bool - ignored for direct model (for API compatibility)
+            query_coords: (B, N, coord_dim) - Initial positions in [0, 1]
+            depth: (B, frame_stack, 1, H, W) - Depth maps (3D mode only)
+            hand_query_uvd: (B, H, 3) - Hand initial positions
+            hand_query_rot: (B, H, 6) - Hand initial rotations
+            text: List[str] - Text descriptions
+            return_intermediate: bool - Ignored for direct model (API compatibility)
         
         Returns:
-            pred_disp: (B, N, T, coord_dim) - predicted displacements (normalized)
-            (If return_intermediate=True, returns only pred_disp since no intermediate steps)
+            Dict with predictions (same as forward())
+            If return_intermediate=True, returns (outputs, []) for API compatibility
         """
-        pred_disp = self(frames, query_coords, depth=depth)
+        outputs = self(
+            frames=frames,
+            query_coords=query_coords,
+            depth=depth,
+            hand_query_uvd=hand_query_uvd,
+            hand_query_rot=hand_query_rot,
+            text=text,
+        )
         
-        # For API compatibility with diffusion model
-        # Direct model has no intermediate steps, so just return final prediction
         if return_intermediate:
-            return pred_disp, []  # Empty list for intermediate
-        return pred_disp
+            return outputs, []
+        return outputs
