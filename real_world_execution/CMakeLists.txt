@@ -15,7 +15,11 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/QueryPoints.msg"
   "msg/PredictedTracks.msg"
+  "msg/HandPoses.msg"
+  "msg/PredictedHandPoses.msg"
   "srv/ResetTracking.srv"
+  "srv/SetPrompt.srv"
+  "srv/SetPredictionPrompt.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

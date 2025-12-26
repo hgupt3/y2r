@@ -497,7 +497,14 @@ class CrossAttnBlock(nn.Module):
 class EfficientUpdateFormer(nn.Module):
     """
     Transformer model that updates track estimates.
-    Modified for future prediction with joint space-time attention and scene cross-attention.
+    Modified for future prediction with factorized space-time attention and scene cross-attention.
+    
+    Uses factorized attention for memory efficiency:
+    1. Cross-attention to scene tokens
+    2. Spatial self-attention (tokens at same timestep attend to each other)
+    3. Temporal self-attention (same position across timesteps attend to each other)
+    
+    Memory: O(NT(N+T)) instead of O((NT)²) for joint attention
     """
 
     def __init__(
@@ -508,7 +515,7 @@ class EfficientUpdateFormer(nn.Module):
         num_heads=8,
         output_dim=130,
         mlp_ratio=4.0,
-        add_space_attn=True,  # Kept for backward compatibility, but ignored
+        add_space_attn=True,  # Controls whether to include spatial attention
         p_drop_attn=0.0,
         linear_layer_for_vis_conf=False,
         # Legacy parameters for backward compatibility
@@ -524,6 +531,7 @@ class EfficientUpdateFormer(nn.Module):
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.depth = depth
+        self.add_space_attn = add_space_attn  # Store for forward pass
         self.input_transform = torch.nn.Linear(input_dim, hidden_size, bias=True) if input_dim != hidden_size else nn.Identity()
         if linear_layer_for_vis_conf:
             self.flow_head = torch.nn.Linear(hidden_size, output_dim - 2, bias=True)
@@ -544,16 +552,30 @@ class EfficientUpdateFormer(nn.Module):
             for _ in range(depth)
         ])
         
-        # Joint space-time attention blocks (self-attention across all N*T tokens)
-        self.blocks = nn.ModuleList([
-                AttnBlock(
-                    hidden_size,
-                    num_heads,
-                    mlp_ratio=mlp_ratio,
-                    attn_class=Attention,
-                    drop=p_drop_attn,
-                )
-                for _ in range(depth)
+        # Spatial attention blocks (tokens at same timestep attend to each other)
+        # Memory: O(N²) per timestep, total O(N²T)
+        self.space_blocks = nn.ModuleList([
+            AttnBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                attn_class=Attention,
+                drop=p_drop_attn,
+            )
+            for _ in range(depth)
+        ])
+        
+        # Temporal attention blocks (same position across timesteps attend to each other)
+        # Memory: O(T²) per position, total O(T²N)
+        self.time_blocks = nn.ModuleList([
+            AttnBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                attn_class=Attention,
+                drop=p_drop_attn,
+            )
+            for _ in range(depth)
         ])
         
         self.initialize_weights()
@@ -571,55 +593,60 @@ class EfficientUpdateFormer(nn.Module):
 
         self.apply(_basic_init)
 
-    def forward(self, input_tensor, scene_tokens, mask=None, add_space_attn=True, causal_time=False):
+    def forward(self, input_tensor, scene_tokens, mask=None, add_space_attn=None, causal_time=False):
         """
-        Forward pass with scene cross-attention and joint space-time attention.
+        Forward pass with scene cross-attention and factorized space-time attention.
+        
+        Uses factorized attention for memory efficiency:
+        - Spatial: (B, N, T, C) → (B*T, N, C) - N×N attention per timestep
+        - Temporal: (B, N, T, C) → (B*N, T, C) - T×T attention per position
         
         Args:
             input_tensor: (B, N, T, input_dim) - point features with temporal encoding
             scene_tokens: (B, num_patches, hidden_size) - ViT scene features
             mask: optional attention mask (ignored in new implementation)
-            add_space_attn: kept for backward compatibility (ignored)
-            causal_time: if True, apply causal mask so time t can only attend to time ≤ t
+            add_space_attn: if provided, overrides self.add_space_attn
+            causal_time: if True, apply causal mask for temporal attention
                         Used for autoregressive training with teacher forcing
         
         Returns:
             flow: (B, N, T, output_dim) - predicted displacements
         """
         tokens = self.input_transform(input_tensor)  # (B, N, T, hidden_size)
-        B, N, T, _ = tokens.shape
+        B, N, T, C = tokens.shape
         
-        # Create causal mask if needed (for autoregressive parallel training)
-        causal_mask = None
+        use_space_attn = add_space_attn if add_space_attn is not None else self.add_space_attn
+        
+        # Create causal mask for temporal attention if needed
+        time_causal_mask = None
         if causal_time and T > 1:
-            # Tokens flattened as (B, N*T, C) with order: [p0t0, p0t1, ..., p0tT-1, p1t0, ...]
-            # Token index i: point = i // T, time = i % T
-            # Causal: token i attends to j if time(j) <= time(i), i.e., j%T <= i%T
-            NT = N * T
-            indices = torch.arange(NT, device=tokens.device)
-            time_i = indices % T  # (NT,)
-            time_j = indices % T  # (NT,)
-            # mask[i,j] = True if token i CAN attend to token j
-            causal_mask = time_j.unsqueeze(0) <= time_i.unsqueeze(1)  # (NT, NT)
+            # (T, T) mask where position i can attend to positions <= i
+            time_causal_mask = torch.tril(torch.ones(T, T, device=tokens.device, dtype=torch.bool))
         
-        # Main transformer loop: Cross-Attn (scene) → Joint Space-Time Self-Attn
-        # Order rationale: First ground to visual context, then coordinate among tokens
+        # Main transformer loop: Cross-Attn (scene) → Spatial Self-Attn → Temporal Self-Attn
         for i in range(self.depth):
-            # 1. CROSS-ATTENTION TO SCENE: points attend to ViT scene tokens (+ text)
-            # Each track/hand token queries the visual scene for grounding
+            # 1. CROSS-ATTENTION TO SCENE: all tokens attend to ViT scene tokens (+ text)
             # Reshape: (B, N, T, C) → (B, N*T, C) for cross-attention
-            cross_tokens = tokens.contiguous().view(B, N * T, -1)
+            cross_tokens = tokens.contiguous().view(B, N * T, C)
             cross_tokens = self.scene_cross_attn_blocks[i](
                 cross_tokens, scene_tokens, mask=None
             )
-            tokens = cross_tokens.contiguous().view(B, N, T, -1)  # (B, N, T, C)
+            tokens = cross_tokens.contiguous().view(B, N, T, C)
             
-            # 2. JOINT SPACE-TIME SELF-ATTENTION: tokens coordinate among themselves
-            # Track ↔ Track, Hand ↔ Hand, Track ↔ Hand across all timesteps
-            # Reshape: (B, N, T, C) → (B, N*T, C) for joint attention
-            joint_tokens = tokens.contiguous().view(B, N * T, -1)
-            joint_tokens = self.blocks[i](joint_tokens, mask=causal_mask)
-            tokens = joint_tokens.contiguous().view(B, N, T, -1)  # (B, N, T, C)
+            # 2. SPATIAL SELF-ATTENTION: tokens at same timestep attend to each other
+            # Reshape: (B, N, T, C) → (B*T, N, C) - batch over timesteps
+            # Memory: O(N²) per timestep instead of O((NT)²) for joint
+            if use_space_attn:
+                space_tokens = tokens.permute(0, 2, 1, 3).contiguous().view(B * T, N, C)
+                space_tokens = self.space_blocks[i](space_tokens, mask=None)
+                tokens = space_tokens.view(B, T, N, C).permute(0, 2, 1, 3).contiguous()
+            
+            # 3. TEMPORAL SELF-ATTENTION: same position across timesteps attend to each other
+            # Reshape: (B, N, T, C) → (B*N, T, C) - batch over spatial positions
+            # Memory: O(T²) per position instead of O((NT)²) for joint
+            time_tokens = tokens.view(B * N, T, C)
+            time_tokens = self.time_blocks[i](time_tokens, mask=time_causal_mask)
+            tokens = time_tokens.view(B, N, T, C)
         
         # Output head
         flow = self.flow_head(tokens)

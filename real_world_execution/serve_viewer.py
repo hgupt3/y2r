@@ -34,31 +34,35 @@ def get_local_ip():
         return "localhost"
 
 
-def get_viewer_mode():
-    """Read visualization mode from config file."""
+def get_viewer_config():
+    """Read visualization config from config file."""
     config_path = Path(__file__).parent / 'config' / 'tracker_params.yaml'
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
-        return config.get('visualization', {}).get('mode', '2d')
+        mode = config.get('visualization', {}).get('mode', '2d')
+        text_prompt = config.get('perception', {}).get('text_prompt', None)
+        return mode, text_prompt
     except:
-        return '2d'
+        return '2d', None
 
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     
-    # Detect mode from config
-    mode = get_viewer_mode()
+    # Detect mode and prompt from config
+    mode, text_prompt = get_viewer_config()
     viewer_file = 'viewer_3d.html' if mode == '3d' else 'viewer_2d.html'
     
     # Change to viewer directory
     viewer_dir = Path(__file__).parent / 'viewer'
     os.chdir(viewer_dir)
     
-    # Write config.js for index.html to read
+    # Write config.js for viewers to read
+    prompt_js = f'"{text_prompt}"' if text_prompt else 'null'
     with open('config.js', 'w') as f:
-        f.write(f'window.VIEWER_MODE = "{mode}";')
+        f.write(f'window.VIEWER_MODE = "{mode}";\n')
+        f.write(f'window.DEFAULT_PROMPT = {prompt_js};\n')
     
     handler = http.server.SimpleHTTPRequestHandler
     local_ip = get_local_ip()

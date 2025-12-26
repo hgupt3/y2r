@@ -287,7 +287,55 @@ def compute_wrist_rotations(query_rot_6d, rot_displacements, norm_stats=None):
     return rotations
 
 
-def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=None, vis_scale=2):
+def draw_text_overlay(frame, text, max_width=60):
+    """
+    Draw text description at the bottom of the frame with word wrapping.
+    
+    Args:
+        frame: RGB frame as numpy array (H, W, 3)
+        text: Text string to overlay
+        max_width: Maximum characters per line before wrapping
+    
+    Returns:
+        Modified frame with text overlay
+    """
+    import textwrap
+    
+    frame = np.ascontiguousarray(frame)
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    
+    # Word wrap the text
+    wrapped_lines = textwrap.wrap(text, width=max_width)
+    if len(wrapped_lines) > 3:
+        wrapped_lines = wrapped_lines[:3]
+        wrapped_lines[-1] = wrapped_lines[-1][:max_width-3] + "..."
+    
+    # Font settings
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    line_height = 20
+    padding = 8
+    
+    # Calculate background rectangle size
+    h, w = frame_bgr.shape[:2]
+    num_lines = len(wrapped_lines)
+    bg_height = num_lines * line_height + padding * 2
+    
+    # Draw semi-transparent background at bottom
+    overlay = frame_bgr.copy()
+    cv2.rectangle(overlay, (0, h - bg_height), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame_bgr, 0.3, 0, frame_bgr)
+    
+    # Draw text lines
+    for i, line in enumerate(wrapped_lines):
+        y_pos = h - bg_height + padding + (i + 1) * line_height - 5
+        cv2.putText(frame_bgr, line, (padding, y_pos), font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+    
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+
+def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=None, vis_scale=2, text=None):
     """
     Visualize a sample with 2D trajectory overlay.
     
@@ -298,6 +346,7 @@ def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=Non
         img_size: Image size
         norm_stats: NormalizationStats for denormalizing displacements
         vis_scale: Scale factor for visualization
+        text: Optional text description to overlay on the image
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -363,6 +412,10 @@ def visualize_sample_2d(sample, sample_idx, output_dir, img_size, norm_stats=Non
     
     # Draw wrist trajectories if present
     rendered_frame = draw_wrist_trajectories_2d(rendered_frame, sample, vis_size, norm_stats)
+    
+    # Draw text overlay if present
+    if text:
+        rendered_frame = draw_text_overlay(rendered_frame, text)
     
     # Save
     output_path = output_dir / f"sample_{sample_idx:03d}_2d.png"
@@ -479,7 +532,7 @@ def draw_wrist_trajectories_2d(frame, sample, vis_size, norm_stats=None):
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
-def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, norm_stats=None):
+def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, norm_stats=None, text=None):
     """
     Create 3D visualization using the same system as process_tapip3d.py.
     
@@ -490,6 +543,7 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
         intrinsics: (3, 3) camera intrinsics matrix
         img_size: Image size for coordinate unprojection
         norm_stats: NormalizationStats for denormalizing data
+        text: Optional text description to display in the 3D viewer
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -584,7 +638,7 @@ def visualize_sample_3d(sample, sample_idx, output_dir, intrinsics, img_size, no
     create_3d_viz_data(
         points_3d, frame_np, intrinsics, img_size,
         output_dir, sample_idx, depth_frame=depth_frame, camera_poses=camera_poses,
-        wrist_data=wrist_data
+        wrist_data=wrist_data, text=text
     )
     
     return output_dir / f"sample_{sample_idx:03d}_3d.html"
@@ -625,7 +679,7 @@ def add_navigation_to_3d_html(output_dir, all_sample_indices):
             f.write(html)
 
 
-def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None, camera_poses=None, wrist_data=None):
+def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, sample_idx, depth_frame=None, camera_poses=None, wrist_data=None, text=None):
     """
     Create visualization data using the same format as process_tapip3d.py.
     
@@ -639,6 +693,7 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         depth_frame: (H, W) optional depth frame in meters
         camera_poses: (T, 4, 4) optional camera poses for each timestep
         wrist_data: Dict with 'left' and/or 'right' keys, each containing 'positions' (T, 3) and 'rotations' (T, 3, 3)
+        text: Optional text description to display in the viewer
     """
     T, N, _ = points_3d.shape
     H, W = frame_rgb.shape[:2]
@@ -778,10 +833,10 @@ def create_3d_viz_data(points_3d, frame_rgb, intrinsics, img_size, output_dir, s
         f.write(compressed_blob)
     
     # Create HTML that uses this data file
-    create_sample_viz_html(output_dir, sample_idx, N, T, has_left_wrist, has_right_wrist)
+    create_sample_viz_html(output_dir, sample_idx, N, T, has_left_wrist, has_right_wrist, text=text)
 
 
-def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps, has_left_wrist=False, has_right_wrist=False):
+def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps, has_left_wrist=False, has_right_wrist=False, text=None):
     """
     Create HTML visualization using the TAPIP3D viz.html as template.
     This reuses the exact same viewer as process_tapip3d.py.
@@ -1235,9 +1290,19 @@ def create_sample_viz_html(output_dir, sample_idx, num_points, num_timesteps, ha
     if has_right_wrist:
         wrist_info += " | Right wrist: ✓"
     
+    # Prepare text for HTML (escape special chars and truncate)
+    text_html = ""
+    if text:
+        import html as html_module
+        escaped_text = html_module.escape(text)
+        # Truncate long text
+        if len(escaped_text) > 150:
+            escaped_text = escaped_text[:150] + "..."
+        text_html = f'<div style="margin-top:6px;padding-top:6px;border-top:1px solid #444;max-width:400px;line-height:1.4;">{escaped_text}</div>'
+    
     # Add info overlay (bottom-left, navigation will be added top-right later)
     info_html = f'''<div style="position:fixed;bottom:10px;left:10px;z-index:1000;background:rgba(0,0,0,0.8);padding:8px 12px;border-radius:8px;font-family:system-ui;color:#eee;font-size:12px;">
-Points: {num_points} | Timesteps: {num_timesteps}{wrist_info}
+<div>Points: {num_points} | Timesteps: {num_timesteps}{wrist_info}</div>{text_html}
 </div>'''
     html = html.replace('<body>', '<body>' + info_html)
     
@@ -1247,8 +1312,17 @@ Points: {num_points} | Timesteps: {num_timesteps}{wrist_info}
         f.write(html)
 
 
-def create_vis_index_html(vis_dir, sample_indices, track_type):
-    """Create an index.html for easy navigation of visualizations."""
+def create_vis_index_html(vis_dir, sample_indices, track_type, sample_texts=None):
+    """Create an index.html for easy navigation of visualizations.
+    
+    Args:
+        vis_dir: Directory containing visualizations
+        sample_indices: List of sample indices
+        track_type: '2d' or '3d'
+        sample_texts: Optional dict mapping sample index to text description
+    """
+    import html as html_module
+    
     html = '''<!DOCTYPE html>
 <html>
 <head>
@@ -1278,6 +1352,14 @@ def create_vis_index_html(vis_dir, sample_indices, track_type):
             box-shadow: 0 8px 24px rgba(167, 139, 250, 0.2);
         }
         .card h3 { margin: 0 0 12px 0; color: #a78bfa; }
+        .card .text { 
+            font-size: 12px; 
+            color: #aaa; 
+            margin-bottom: 12px; 
+            line-height: 1.4;
+            max-height: 60px;
+            overflow: hidden;
+        }
         .card a { 
             display: inline-block;
             padding: 8px 16px; 
@@ -1305,9 +1387,18 @@ def create_vis_index_html(vis_dir, sample_indices, track_type):
 '''
     
     for idx in sorted(sample_indices):
+        # Get and escape text
+        text_div = ""
+        if sample_texts and idx in sample_texts and sample_texts[idx]:
+            escaped_text = html_module.escape(sample_texts[idx])
+            if len(escaped_text) > 100:
+                escaped_text = escaped_text[:100] + "..."
+            text_div = f'<div class="text">{escaped_text}</div>'
+        
         html += f'''        <div class="card">
             <h3>Sample {idx}</h3>
             <img src="sample_{idx:03d}_2d.png" alt="2D visualization">
+            {text_div}
             <div>
                 <a href="sample_{idx:03d}_2d.png" target="_blank">2D Image</a>
 '''
@@ -1353,12 +1444,15 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
     track_type = config.get('track_type', '2d')
     hand_mode = config.get('hand_mode', None)
     
+    text_mode = config.get('text_mode', False)
+    
     print(f"\n{'='*70}")
     print("TESTING DATALOADER WITH H5 DATASET")
     print(f"{'='*70}")
     print(f"Dataset directory: {dataset_dir}")
     print(f"Track type: {track_type}")
     print(f"Hand mode: {hand_mode}")
+    print(f"Text mode: {text_mode}")
     print(f"Image size: {img_size}x{img_size}")
     print(f"Frame stack: {frame_stack}")
     print(f"Downsample factor: {downsample_factor}x")
@@ -1384,6 +1478,7 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         'cache_all': config.get('cache_all', True),
         'cache_image': config.get('cache_image', True),
         'num_demos': None,
+        'text_mode': text_mode,
     }
     
     # Create dataset
@@ -1424,6 +1519,13 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
             print(f"  depth: {sample['depth'].shape}")
         if sample.get('poses') is not None:
             print(f"  poses: {sample['poses'].shape}")
+        if 'text' in sample:
+            text = sample['text']
+            if text:
+                text_preview = text[:100] + "..." if len(text) > 100 else text
+                print(f"  text: \"{text_preview}\"")
+            else:
+                print(f"  text: (empty)")
         
         # Print hand data if present
         for side in ['left', 'right']:
@@ -1536,6 +1638,7 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
         sample_indices = random.sample(range(len(dataset)), num_to_vis)
         
         visualized_samples = []
+        sample_texts = {}  # Collect texts for index page
         for i, idx in enumerate(sample_indices):
             sample = dataset[idx]
             
@@ -1557,6 +1660,9 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
                         batch_gpu[f'{prefix}_query_rot_6d'] = sample[f'{prefix}_query_rot_6d'].unsqueeze(0).cuda()
                         batch_gpu[f'{prefix}_rot_displacements'] = sample[f'{prefix}_rot_displacements'].unsqueeze(0).cuda()
                 
+                # Save text before augmentation (not a tensor, so not in batch_gpu)
+                original_text = sample.get('text')
+                
                 batch_gpu = gpu_augmenter(batch_gpu)
                 
                 # Move back to CPU
@@ -1566,6 +1672,7 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
                     'displacements': batch_gpu['displacements'][0].cpu(),
                     'depth': batch_gpu['depth'][0].cpu() if batch_gpu.get('depth') is not None else None,
                     'poses': sample.get('poses'),  # Poses are not augmented
+                    'text': original_text,  # Preserve text through augmentation
                 }
                 # Extract augmented hand data
                 for side in ['left', 'right']:
@@ -1576,21 +1683,26 @@ def test_dataloader(config, visualize=False, num_samples=5, test_augmentations=F
                         sample[f'{prefix}_query_rot_6d'] = batch_gpu[f'{prefix}_query_rot_6d'][0].cpu()
                         sample[f'{prefix}_rot_displacements'] = batch_gpu[f'{prefix}_rot_displacements'][0].cpu()
             
+            # Get text from sample if available (handle augmented sample case where text may be lost)
+            sample_text = sample.get('text', None)
+            if sample_text:
+                sample_texts[idx] = sample_text
+            
             # 2D visualization (pass norm_stats for denormalization)
             path_2d = visualize_sample_2d(sample, idx, vis_dir, img_size, 
-                                            norm_stats=dataset.norm_stats, vis_scale=2)
+                                            norm_stats=dataset.norm_stats, vis_scale=2, text=sample_text)
             print(f"  ✓ Sample {idx}: 2D saved to {path_2d.name}")
             
             # 3D visualization (if 3D mode and intrinsics available)
             if track_type == '3d' and intrinsics is not None:
                 path_3d = visualize_sample_3d(sample, idx, vis_dir, intrinsics, img_size,
-                                                norm_stats=dataset.norm_stats)
+                                                norm_stats=dataset.norm_stats, text=sample_text)
                 print(f"           3D saved to {path_3d.name}")
             
             visualized_samples.append(idx)
         
         # Create index.html for easy navigation
-        create_vis_index_html(vis_dir, visualized_samples, track_type)
+        create_vis_index_html(vis_dir, visualized_samples, track_type, sample_texts=sample_texts)
         
         # Add navigation to 3D HTML files
         if track_type == '3d' and visualized_samples:

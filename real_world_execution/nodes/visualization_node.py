@@ -26,8 +26,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Polygon
-from std_srvs.srv import Trigger
-from tracker_interfaces.msg import PredictedTracks
+from tracker_interfaces.msg import PredictedTracks, HandPoses, PredictedHandPoses
+from tracker_interfaces.srv import SetPrompt, SetPredictionPrompt
 import numpy as np
 import cv2
 import torch
@@ -57,16 +57,13 @@ class VisualizationNode(Node):
         from rcl_interfaces.msg import ParameterDescriptor
         self.declare_parameter('trajectory_color_stops', [], ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter('trajectory_line_thickness', 2)
-        
-        # Camera intrinsics (for 3D unprojection)
         self.declare_parameter('fx', 615.0)
         self.declare_parameter('fy', 615.0)
         self.declare_parameter('cx', 320.0)
         self.declare_parameter('cy', 240.0)
-        
-        # Depth range (for 3D mode)
         self.declare_parameter('depth_min', 0.1)
         self.declare_parameter('depth_max', 2.5)
+        self.declare_parameter('train_config_path', '')  # Path to model training config
         
         # Get parameters
         self.mode = self.get_parameter('mode').value
@@ -99,6 +96,8 @@ class VisualizationNode(Node):
         self.latest_contours = None
         self.latest_trajectories = None
         self.trail_history = deque(maxlen=50)
+        self.latest_hand_poses = None
+        self.latest_predicted_hand_poses = None
         
         # Camera resolution (set on first frame)
         self.cam_width = None
@@ -107,6 +106,17 @@ class VisualizationNode(Node):
         # Depth range for encoding (meters) - read from parameters
         self.depth_min = self.get_parameter('depth_min').value
         self.depth_max = self.get_parameter('depth_max').value
+        
+        # Load model's text_mode from training config
+        train_config_path = self.get_parameter('train_config_path').value
+        if not train_config_path:
+            raise ValueError('train_config_path must be set in config!')
+        
+        import yaml
+        with open(train_config_path, 'r') as f:
+            train_cfg = yaml.safe_load(f)
+        self.prediction_text_mode = train_cfg['model']['text_mode']
+        self.get_logger().info(f'Model text_mode: {self.prediction_text_mode}')
         
         # GPU blur kernel for depth fill
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -139,8 +149,21 @@ class VisualizationNode(Node):
             PredictedTracks, '/predicted_tracks', self.trajectory_callback, 1
         )
         
-        # Service client for reset tracking
-        self.reset_client = self.create_client(Trigger, '/reset_tracking')
+        # Subscribe to hand poses from hand estimation
+        self.hand_pose_sub = self.create_subscription(
+            HandPoses, '/hand_poses', self.hand_pose_callback, 1
+        )
+        
+        # Subscribe to predicted hand poses from predictor
+        self.predicted_hand_pose_sub = self.create_subscription(
+            PredictedHandPoses, '/predicted_hand_poses', self.predicted_hand_pose_callback, 1
+        )
+        
+        # Service client for setting detection prompt
+        self.set_prompt_client = self.create_client(SetPrompt, '/set_prompt')
+        
+        # Service client for setting prediction prompt
+        self.set_prediction_prompt_client = self.create_client(SetPredictionPrompt, '/set_prediction_prompt')
         
         # Start WebSocket server
         if WEBSOCKETS_AVAILABLE:
@@ -166,11 +189,15 @@ class VisualizationNode(Node):
                 self.get_logger().info(f'Client connected: {websocket.remote_address}')
                 try:
                     async for message in websocket:
-                        # Handle incoming messages (e.g., reset command)
+                        # Handle incoming messages (e.g., set_prompt command)
                         try:
                             data = json.loads(message)
-                            if data.get('command') == 'reset':
-                                self._call_reset_service()
+                            if data.get('command') == 'set_prompt':
+                                prompt = data.get('prompt', '')
+                                self._call_set_prompt_service(prompt)
+                            elif data.get('command') == 'set_prediction_prompt':
+                                prompt = data.get('prompt', '')
+                                self._call_set_prediction_prompt_service(prompt)
                         except json.JSONDecodeError:
                             pass
                 except websockets.exceptions.ConnectionClosed:
@@ -239,12 +266,25 @@ class VisualizationNode(Node):
         if hasattr(self, 'ws_thread') and self.ws_thread.is_alive():
             self.ws_thread.join(timeout=2.0)
     
-    def _call_reset_service(self):
-        """Call reset tracking service."""
-        if not self.reset_client.wait_for_service(timeout_sec=0.5):
+    def _call_set_prompt_service(self, prompt):
+        """Call set_prompt service to update detection target."""
+        if not self.set_prompt_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn('set_prompt service not available')
             return
-        request = Trigger.Request()
-        self.reset_client.call_async(request)
+        request = SetPrompt.Request()
+        request.prompt = prompt
+        self.get_logger().info(f'Setting detection prompt: "{prompt}"')
+        self.set_prompt_client.call_async(request)
+    
+    def _call_set_prediction_prompt_service(self, prompt):
+        """Call set_prediction_prompt service to update prediction text."""
+        if not self.set_prediction_prompt_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn('set_prediction_prompt service not available')
+            return
+        request = SetPredictionPrompt.Request()
+        request.prompt = prompt
+        self.get_logger().info(f'Setting prediction prompt: "{prompt}"')
+        self.set_prediction_prompt_client.call_async(request)
     
     def contour_callback(self, msg):
         """Store latest contours. Multiple contours are separated by NaN points."""
@@ -328,6 +368,62 @@ class VisualizationNode(Node):
         while self.trail_history and (current_time - self.trail_history[0]['timestamp']) > self.trail_history_sec:
             self.trail_history.popleft()
     
+    def hand_pose_callback(self, msg):
+        """Store latest hand poses."""
+        try:
+            hand_poses = {}
+            
+            if msg.left_valid:
+                hand_poses['left'] = {
+                    'u': float(msg.left_u),
+                    'v': float(msg.left_v),
+                    'depth': float(msg.left_depth),
+                    'rotation': [float(x) for x in msg.left_rotation],
+                    'valid': True
+                }
+            
+            if msg.right_valid:
+                hand_poses['right'] = {
+                    'u': float(msg.right_u),
+                    'v': float(msg.right_v),
+                    'depth': float(msg.right_depth),
+                    'rotation': [float(x) for x in msg.right_rotation],
+                    'valid': True
+                }
+            
+            self.latest_hand_poses = hand_poses if hand_poses else None
+        except Exception as e:
+            self.get_logger().error(f'Error processing hand poses: {e}')
+    
+    def predicted_hand_pose_callback(self, msg):
+        """Store latest predicted hand poses."""
+        try:
+            predicted_hand_poses = {
+                'num_timesteps': msg.num_timesteps,
+                'left_valid': msg.left_valid,
+                'right_valid': msg.right_valid,
+            }
+            
+            if msg.left_valid:
+                predicted_hand_poses['left'] = {
+                    'trajectory_u': [float(x) for x in msg.left_trajectory_u],
+                    'trajectory_v': [float(x) for x in msg.left_trajectory_v],
+                    'trajectory_d': [float(x) for x in msg.left_trajectory_d],
+                    'final_rotation': [float(x) for x in msg.left_final_rotation],
+                }
+            
+            if msg.right_valid:
+                predicted_hand_poses['right'] = {
+                    'trajectory_u': [float(x) for x in msg.right_trajectory_u],
+                    'trajectory_v': [float(x) for x in msg.right_trajectory_v],
+                    'trajectory_d': [float(x) for x in msg.right_trajectory_d],
+                    'final_rotation': [float(x) for x in msg.right_final_rotation],
+                }
+            
+            self.latest_predicted_hand_poses = predicted_hand_poses
+        except Exception as e:
+            self.get_logger().error(f'Error processing predicted hand poses: {e}')
+    
     def image_callback(self, msg):
         """Process incoming camera frame and broadcast to clients."""
         try:
@@ -352,6 +448,8 @@ class VisualizationNode(Node):
             # Draw overlays for 2D mode
             if self.mode == '2d':
                 self._draw_2d_overlays(img_bgr)
+                self._draw_hand_poses_2d(img_bgr)
+                self._draw_predicted_hand_poses_2d(img_bgr)
             
             # Encode frame as JPEG (80% quality for good balance of size/quality)
             _, jpeg_data = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -365,7 +463,16 @@ class VisualizationNode(Node):
                 'width': width,
                 'height': height,
                 'frame': frame_b64,
+                'prediction_text_mode': self.prediction_text_mode,  # Whether model needs text prompt
             }
+            
+            # Include hand poses for both 2D and 3D modes
+            if self.latest_hand_poses:
+                message['hand_poses'] = self.latest_hand_poses
+            
+            # Include predicted hand poses if available
+            if self.latest_predicted_hand_poses:
+                message['predicted_hand_poses'] = self.latest_predicted_hand_poses
             
             # For 3D mode, include trajectory data, intrinsics, and point cloud
             if self.mode == '3d':
@@ -480,6 +587,145 @@ class VisualizationNode(Node):
             pt1 = (int(traj_x[i]), int(traj_y[i]))
             pt2 = (int(traj_x[i + 1]), int(traj_y[i + 1]))
             cv2.line(img, pt1, pt2, color, self.traj_line_thickness, cv2.LINE_AA)
+    
+    def _draw_hand_poses_2d(self, img):
+        """Draw hand wrist position and orientation axes on image for 2D mode."""
+        if not self.latest_hand_poses:
+            return
+        
+        axis_length = 0.05  # 5cm axis length
+        fx = self.intrinsics['fx']
+        fy = self.intrinsics['fy']
+        cx = self.intrinsics['cx']
+        cy = self.intrinsics['cy']
+        
+        for side, hand_data in self.latest_hand_poses.items():
+            if not hand_data.get('valid', False):
+                continue
+            
+            u = hand_data['u']
+            v = hand_data['v']
+            depth = hand_data['depth']
+            rotation = hand_data['rotation']
+            
+            # Skip if depth is invalid
+            if depth is None or np.isnan(depth) or depth <= 0:
+                continue
+            
+            # Draw wrist point
+            wrist_pt = (int(u), int(v))
+            color = (0, 255, 255) if side == 'left' else (255, 0, 255)  # Yellow for left, Magenta for right
+            cv2.circle(img, wrist_pt, 8, (0, 0, 0), -1)  # Black outline
+            cv2.circle(img, wrist_pt, 6, color, -1)  # Colored fill
+            
+            # Backproject wrist to 3D
+            wrist_x = (u - cx) * depth / fx
+            wrist_y = (v - cy) * depth / fy
+            wrist_z = depth
+            wrist_3d = np.array([wrist_x, wrist_y, wrist_z])
+            
+            # Reshape rotation matrix
+            rot = np.array(rotation).reshape(3, 3)
+            
+            # Draw coordinate axes
+            # X axis = Red, Y axis = Green, Z axis = Blue
+            axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR
+            
+            for i, axis_color in enumerate(axis_colors):
+                # Get axis direction in camera frame
+                axis_dir = rot[:, i]  # Column i of rotation matrix
+                
+                # End point of axis in 3D
+                axis_end_3d = wrist_3d + axis_length * axis_dir
+                
+                # Project to 2D
+                if axis_end_3d[2] > 0:
+                    axis_end_u = fx * axis_end_3d[0] / axis_end_3d[2] + cx
+                    axis_end_v = fy * axis_end_3d[1] / axis_end_3d[2] + cy
+                    axis_end_pt = (int(axis_end_u), int(axis_end_v))
+                    
+                    # Draw axis line with arrow
+                    cv2.arrowedLine(img, wrist_pt, axis_end_pt, axis_color, 2, tipLength=0.3)
+    
+    def _draw_predicted_hand_poses_2d(self, img):
+        """Draw predicted hand trajectories and final rotation on image for 2D mode."""
+        if not self.latest_predicted_hand_poses:
+            return
+        
+        axis_length = 0.05  # 5cm axis length for final rotation
+        fx = self.intrinsics['fx']
+        fy = self.intrinsics['fy']
+        cx = self.intrinsics['cx']
+        cy = self.intrinsics['cy']
+        
+        # Colors for predicted trajectories (cyan-to-white for left, magenta-to-white for right)
+        # Format: (start_color_BGR, end_color_BGR)
+        traj_colors = {
+            'left': ((255, 255, 0), (255, 255, 255)),   # Cyan to white
+            'right': ((255, 0, 255), (255, 255, 255)),  # Magenta to white
+        }
+        
+        for side in ['left', 'right']:
+            valid_key = f'{side}_valid'
+            if not self.latest_predicted_hand_poses.get(valid_key, False):
+                continue
+            
+            if side not in self.latest_predicted_hand_poses:
+                continue
+            
+            hand_data = self.latest_predicted_hand_poses[side]
+            traj_u = hand_data['trajectory_u']  # Camera pixels
+            traj_v = hand_data['trajectory_v']
+            traj_d = hand_data['trajectory_d']  # Meters
+            final_rotation = hand_data['final_rotation']
+            
+            T = len(traj_u)
+            if T == 0:
+                continue
+            
+            start_color, end_color = traj_colors[side]
+            
+            # Draw trajectory line with gradient
+            for t in range(T - 1):
+                # Interpolate color
+                alpha = t / max(1, T - 1)
+                color = tuple(int(start_color[c] * (1 - alpha) + end_color[c] * alpha) for c in range(3))
+                
+                pt1 = (int(traj_u[t]), int(traj_v[t]))
+                pt2 = (int(traj_u[t + 1]), int(traj_v[t + 1]))
+                cv2.line(img, pt1, pt2, color, 2, cv2.LINE_AA)
+            
+            # Draw endpoint marker
+            end_pt = (int(traj_u[-1]), int(traj_v[-1]))
+            end_depth = traj_d[-1]
+            
+            # Draw endpoint circle
+            cv2.circle(img, end_pt, 6, (0, 0, 0), -1)  # Black outline
+            cv2.circle(img, end_pt, 4, end_color, -1)
+            
+            # Draw rotation axes at endpoint (if depth is valid)
+            if end_depth > 0:
+                # Backproject endpoint to 3D
+                end_x = (traj_u[-1] - cx) * end_depth / fx
+                end_y = (traj_v[-1] - cy) * end_depth / fy
+                end_z = end_depth
+                end_3d = np.array([end_x, end_y, end_z])
+                
+                # Reshape final rotation matrix
+                rot = np.array(final_rotation).reshape(3, 3)
+                
+                # Draw coordinate axes (X=Red, Y=Green, Z=Blue)
+                axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR
+                
+                for i, axis_color in enumerate(axis_colors):
+                    axis_dir = rot[:, i]
+                    axis_end_3d = end_3d + axis_length * axis_dir
+                    
+                    if axis_end_3d[2] > 0:
+                        axis_end_u = fx * axis_end_3d[0] / axis_end_3d[2] + cx
+                        axis_end_v = fy * axis_end_3d[1] / axis_end_3d[2] + cy
+                        axis_end_pt = (int(axis_end_u), int(axis_end_v))
+                        cv2.arrowedLine(img, end_pt, axis_end_pt, axis_color, 2, tipLength=0.3)
     
     def _load_color_stops(self, stops_param):
         """Parse color stops from parameter."""

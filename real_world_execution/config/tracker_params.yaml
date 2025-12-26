@@ -1,18 +1,16 @@
 # Configuration for Real-Time Tracker System
 
+# Model configuration (shared by all nodes)
+train_config_path: "/home/harsh/sam/configs/train_direct.yaml"  # Path to training config YAML (contains model+dataset params)
+
 # Camera settings (passed to RealSense launch)
 camera:
-  # Color camera (RGB)
   fps: 60
   width: 640
   height: 480
-  
-  # Depth camera (separate settings - depth sensor has different supported resolutions)
   depth_fps: 60
   depth_width: 640
   depth_height: 480
-  
-  # Camera intrinsics (RealSense D435i @ 640x480)
   fx: 615.0
   fy: 615.0
   cx: 320.0
@@ -21,12 +19,8 @@ camera:
 # Visualization settings
 visualization:
   mode: "3d"  # "2d" or "3d"
-  
-  # WebSocket server settings
   websocket_host: "0.0.0.0"
   websocket_port: 8765
-  
-  # Display settings
   window_name: "Real-Time Tracker"
   display_scale: 1  # Scale factor for display (1 = native camera resolution)
   trail_history_sec: 0.25  # Duration (seconds) of trajectory history to keep
@@ -46,26 +40,26 @@ visualization:
 perception:
   enabled: true
   device: "cuda"
-  
-  # Detection model (runs once on first frame)
-  detection_model: "grounding-dino"  # "florence-2" or "grounding-dino"
-  text_prompt: "small red t-shaped block."  # Object to track
-  
-  # Query point sampling
-  num_query_points: 16  # Number of points to sample per frame
+  detection_model: "florence-2"  # "florence-2" or "grounding-dino"
+  text_prompt: 'red t-shaped block.'  # null = wait for prompt from viewer UI, or set a string to auto-detect
   mask_erosion_pixels: 3  # Erode mask by X pixels before sampling query points (avoid edge instability)
   sampling_strategy: "random"  # Options: "random", "fps" (farthest point sampling)
-  
-  # Performance
   target_fps: 0.0  # 0.0 or null = full throughput, or set to number to throttle
 
 # Predictor node settings
 predictor:
   enabled: true
-  train_config_path: "/home/harsh/sam/configs/train_direct.yaml"  # Path to training config YAML (contains model+dataset params)
-  checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-12-05_03-58-25/best.pth"    # Path to model checkpoint (.pth file)
+  checkpoint_path: "/home/harsh/sam/checkpoints/direct/2025-12-25_22-00-48/best.pth"  # Path to model checkpoint (.pth file)
   device: "cuda"
   depth_min: 0.15   # meters - clip depth before normalization
-  depth_max: 2.5   # meters - clip depth before normalization 
+  depth_max: 2.5   # meters - clip depth before normalization
+  text_prompt: "push the red t-shaped block into the black outline."  # null = wait for UI input, or set a string to auto-use (only used if model has text_mode enabled)
+
+# Hand estimation node settings 
+hand_estimation:
+  enabled: true
+  device: "cuda"
+  detection_confidence: 0.5  # YOLO hand detection threshold
+  wrist_depth_offset: 0.02    # Offset in meters (wrist joint is ~2cm inside skin surface)
 
 

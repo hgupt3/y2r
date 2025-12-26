@@ -107,10 +107,10 @@ def _draw_gradient_trajectory(ax, traj_x, traj_y, cmap, linewidth=3, alpha=0.85)
     ax.add_collection(lc)
 
 
-def _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, axis_length_px=40, linewidth=2):
+def _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, axis_length_px=18, linewidth=2):
     """
-    Draw wrist trajectory line + rotation axes at ALL timesteps.
-    Same style as misc/test_dataloader.py.
+    Draw wrist trajectory line + rotation axes at START and END only.
+    Clean visualization with small orientation markers.
     
     Args:
         ax: matplotlib axis
@@ -130,14 +130,21 @@ def _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, axis_length_px=
     # Draw trajectory line (no markers)
     ax.plot(wrist_px_x, wrist_px_y, color=color, linewidth=linewidth, alpha=0.85)
     
-    # Draw rotation axes at ALL timesteps
+    # Draw small circle markers at start (hollow) and end (filled)
+    ax.scatter(wrist_px_x[0], wrist_px_y[0], s=60, c='none', edgecolors=color, linewidths=2, zorder=5)  # Start: hollow
+    ax.scatter(wrist_px_x[-1], wrist_px_y[-1], s=60, c=color, edgecolors=color, linewidths=1, zorder=5)  # End: filled
+    
+    # Draw rotation axes at START and END only (cleaner than all timesteps)
     if rotations is not None:
         axis_colors = {'x': '#FF0000', 'y': '#00FF00', 'z': '#0000FF'}  # RGB for XYZ axes
         
-        for t in range(T):
+        for t_idx, t in enumerate([0, T-1]):  # Only first and last
             wrist_pos_x = wrist_px_x[t]
             wrist_pos_y = wrist_px_y[t]
             R_t = rotations[t]
+            
+            # Use slightly different alpha for start vs end
+            alpha = 0.6 if t_idx == 0 else 0.9
             
             # Draw each axis (X=red, Y=green, Z=blue)
             for axis_idx, axis_name in enumerate(['x', 'y', 'z']):
@@ -151,9 +158,9 @@ def _draw_wrist_trajectory(ax, wrist_uv, rotations, H, W, color, axis_length_px=
                 end_x = wrist_pos_x + axis_2d_x * axis_length_px
                 end_y = wrist_pos_y + axis_2d_y * axis_length_px
                 
-                # Draw axis line
+                # Draw axis line (thinner than before)
                 ax.plot([wrist_pos_x, end_x], [wrist_pos_y, end_y], 
-                       color=axis_colors[axis_name], linewidth=2, alpha=0.8)
+                       color=axis_colors[axis_name], linewidth=1.5, alpha=alpha)
 
 
 def visualize_tracks_on_frame(
@@ -308,7 +315,7 @@ def fig_to_wandb_image(fig):
     return wandb_img
 
 
-def visualize_predictions(vis_data, disp_stats, epoch):
+def visualize_predictions(vis_data, disp_stats, epoch, hand_mode=None):
     """
     Create W&B visualization of predictions vs GT.
     Overlay tracks on the first frame.
@@ -328,6 +335,7 @@ def visualize_predictions(vis_data, disp_stats, epoch):
             - 'hand_query_rot': (H, 6) tensor - query hand 6D rotation
         disp_stats: dict with 'displacement_mean' and 'displacement_std'
         epoch: int - current epoch number
+        hand_mode: 'left', 'right', 'both', or None - determines which hand(s) are in the data
         
     Returns:
         List of wandb.Image objects for logging
@@ -337,11 +345,21 @@ def visualize_predictions(vis_data, disp_stats, epoch):
     mean = disp_stats['displacement_mean']
     std = disp_stats['displacement_std']
     
-    # Hand stats if available
-    hand_uvd_mean = np.array(disp_stats.get('hand_uvd_displacement_mean', [0, 0, 0]))
-    hand_uvd_std = np.array(disp_stats.get('hand_uvd_displacement_std', [1, 1, 1]))
-    hand_rot_mean = np.array(disp_stats.get('hand_rot_displacement_mean', [0]*6))
-    hand_rot_std = np.array(disp_stats.get('hand_rot_displacement_std', [1]*6))
+    # Hand stats if available (use correct key names from normalization_stats.yaml)
+    hand_uvd_mean = np.array(disp_stats.get('hand_uvd_disp_mean', [0, 0, 0]))
+    hand_uvd_std = np.array(disp_stats.get('hand_uvd_disp_std', [1, 1, 1]))
+    hand_rot_mean = np.array(disp_stats.get('hand_rot_disp_mean', [0]*6))
+    hand_rot_std = np.array(disp_stats.get('hand_rot_disp_std', [1]*6))
+    
+    # Determine which sides are present based on hand_mode
+    if hand_mode == 'left':
+        hand_sides = ['left']
+    elif hand_mode == 'right':
+        hand_sides = ['right']
+    elif hand_mode == 'both':
+        hand_sides = ['left', 'right']
+    else:
+        hand_sides = []
     
     for idx, sample in enumerate(vis_data):
         # Use the last (most recent) frame for visualization
@@ -382,7 +400,8 @@ def visualize_predictions(vis_data, disp_stats, epoch):
                 
                 wrist_data['gt'] = {}
                 H = gt_hand_uvd_disp.shape[0]
-                sides = ['left', 'right'][:H]  # Map H hands to sides
+                # Use hand_sides from hand_mode (correct mapping)
+                sides = hand_sides[:H] if hand_sides else ['left', 'right'][:H]
                 
                 for h, side in enumerate(sides):
                     # Denormalize UVD displacement
@@ -413,7 +432,8 @@ def visualize_predictions(vis_data, disp_stats, epoch):
                 
                 wrist_data['pred'] = {}
                 H = pred_hand_uvd_disp.shape[0]
-                sides = ['left', 'right'][:H]
+                # Use hand_sides from hand_mode (correct mapping)
+                sides = hand_sides[:H] if hand_sides else ['left', 'right'][:H]
                 
                 for h, side in enumerate(sides):
                     # Denormalize UVD displacement

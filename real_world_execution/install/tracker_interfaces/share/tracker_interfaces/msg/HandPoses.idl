@@ -1,0 +1,56 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from tracker_interfaces/msg/HandPoses.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+
+module tracker_interfaces {
+  module msg {
+    typedef float float__9[9];
+    struct HandPoses {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "Left hand" "\n"
+        "Wrist u in camera pixels")
+      float left_u;
+
+      @verbatim (language="comment", text=
+        "Wrist v in camera pixels")
+      float left_v;
+
+      @verbatim (language="comment", text=
+        "Wrist depth in meters")
+      float left_depth;
+
+      @verbatim (language="comment", text=
+        "Flattened 3x3 rotation matrix (row-major)")
+      float__9 left_rotation;
+
+      @verbatim (language="comment", text=
+        "True if left hand detected")
+      boolean left_valid;
+
+      @verbatim (language="comment", text=
+        "Right hand" "\n"
+        "Wrist u in camera pixels")
+      float right_u;
+
+      @verbatim (language="comment", text=
+        "Wrist v in camera pixels")
+      float right_v;
+
+      @verbatim (language="comment", text=
+        "Wrist depth in meters")
+      float right_depth;
+
+      @verbatim (language="comment", text=
+        "Flattened 3x3 rotation matrix (row-major)")
+      float__9 right_rotation;
+
+      @verbatim (language="comment", text=
+        "True if right hand detected")
+      boolean right_valid;
+    };
+  };
+};

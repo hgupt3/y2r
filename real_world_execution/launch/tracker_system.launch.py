@@ -56,6 +56,7 @@ def generate_launch_description():
     visualization_script = os.path.join(nodes_dir, 'visualization_node.py')
     perception_script = os.path.join(nodes_dir, 'perception_node.py')
     predictor_script = os.path.join(nodes_dir, 'predictor_node.py')
+    hand_estimation_script = os.path.join(nodes_dir, 'hand_estimation_node.py')
     
     # Visualization Node
     # trajectory_color_stops is a nested list which ROS2 command line can't handle,
@@ -80,14 +81,13 @@ def generate_launch_description():
                 'trail_alpha_floor': config["visualization"]["trail_alpha_floor"],
                 'trajectory_color_stops': color_stops_flat,  # Flattened: [B,G,R,B,G,R,...]
                 'trajectory_line_thickness': config["visualization"]["trajectory_line_thickness"],
-                # Camera intrinsics for 3D mode
                 'fx': config["camera"]["fx"],
                 'fy': config["camera"]["fy"],
                 'cx': config["camera"]["cx"],
                 'cy': config["camera"]["cy"],
-                # Depth range (from predictor config)
                 'depth_min': config["predictor"]["depth_min"],
                 'depth_max': config["predictor"]["depth_max"],
+                'train_config_path': config["train_config_path"],  # For reading model's text_mode
             }
         }
     }
@@ -104,7 +104,7 @@ def generate_launch_description():
     
     # Perception Node
     perception_node = ExecuteProcess(
-        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {perception_script} --ros-args -p device:={config["perception"]["device"]} -p detection_model:={config["perception"]["detection_model"]} -p "text_prompt:={config["perception"]["text_prompt"]}" -p num_query_points:={config["perception"]["num_query_points"]} -p mask_erosion_pixels:={config["perception"]["mask_erosion_pixels"]} -p sampling_strategy:={config["perception"]["sampling_strategy"]} -p target_fps:={config["perception"]["target_fps"]}'],
+        cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {perception_script} --ros-args -p device:={config["perception"]["device"]} -p detection_model:={config["perception"]["detection_model"]} -p "text_prompt:={config["perception"]["text_prompt"]}" -p train_config_path:={config["train_config_path"]} -p mask_erosion_pixels:={config["perception"]["mask_erosion_pixels"]} -p sampling_strategy:={config["perception"]["sampling_strategy"]} -p target_fps:={config["perception"]["target_fps"]}'],
         name='perception_node',
         output='screen',
         shell=False
@@ -113,9 +113,22 @@ def generate_launch_description():
     # Predictor Node (conditionally launched based on config)
     predictor_node = None
     if config.get("predictor", {}).get("enabled", False):
+        # Handle text_prompt - convert None to empty string for ROS param
+        text_prompt = config["predictor"].get("text_prompt") or ""
         predictor_node = ExecuteProcess(
-            cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {predictor_script} --ros-args -p enabled:={config["predictor"]["enabled"]} -p train_config_path:={config["predictor"]["train_config_path"]} -p checkpoint_path:={config["predictor"]["checkpoint_path"]} -p device:={config["predictor"]["device"]} -p depth_min:={config["predictor"]["depth_min"]} -p depth_max:={config["predictor"]["depth_max"]}'],
+            cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {predictor_script} --ros-args -p enabled:={config["predictor"]["enabled"]} -p train_config_path:={config["train_config_path"]} -p checkpoint_path:={config["predictor"]["checkpoint_path"]} -p device:={config["predictor"]["device"]} -p depth_min:={config["predictor"]["depth_min"]} -p depth_max:={config["predictor"]["depth_max"]} -p "text_prompt:={text_prompt}"'],
             name='predictor_node',
+            output='screen',
+            shell=False
+        )
+    
+    # Hand Estimation Node (conditionally launched based on config)
+    hand_estimation_node = None
+    if config.get("hand_estimation", {}).get("enabled", False):
+        hand_cfg = config["hand_estimation"]
+        hand_estimation_node = ExecuteProcess(
+            cmd=['bash', '-c', f'. {install_dir}/setup.bash && python3 {hand_estimation_script} --ros-args -p enabled:={hand_cfg["enabled"]} -p device:={hand_cfg["device"]} -p detection_confidence:={hand_cfg["detection_confidence"]} -p wrist_depth_offset:={hand_cfg["wrist_depth_offset"]} -p train_config_path:={config["train_config_path"]} -p fx:={config["camera"]["fx"]} -p fy:={config["camera"]["fy"]} -p cx:={config["camera"]["cx"]} -p cy:={config["camera"]["cy"]}'],
+            name='hand_estimation_node',
             output='screen',
             shell=False
         )
@@ -130,6 +143,10 @@ def generate_launch_description():
     # Add predictor node if enabled
     if predictor_node is not None:
         launch_list.append(predictor_node)
+    
+    # Add hand estimation node if enabled
+    if hand_estimation_node is not None:
+        launch_list.append(hand_estimation_node)
     
     return LaunchDescription(launch_list)
 

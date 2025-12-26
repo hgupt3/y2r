@@ -251,7 +251,7 @@ def load_normalization_stats(stats_path):
     return stats
 
 
-def load_model(checkpoint_path, cfg, disp_stats, device, text_mode=False):
+def load_model(checkpoint_path, cfg, disp_stats, device):
     """Load trained model from checkpoint."""
     print(f"Loading checkpoint from: {checkpoint_path}")
     # Load to CPU first to avoid CUDA memory issues
@@ -261,7 +261,7 @@ def load_model(checkpoint_path, cfg, disp_stats, device, text_mode=False):
     model_type = getattr(cfg.model, 'model_type', 'direct')
     is_diffusion = (model_type == 'diffusion')
     
-    model = create_model(cfg, disp_stats=disp_stats, device=device, text_mode=text_mode)
+    model = create_model(cfg, disp_stats=disp_stats, device=device)
     
     # Load state dict (handle both EMA and regular checkpoints)
     if 'ema_model_state_dict' in checkpoint:
@@ -1480,7 +1480,7 @@ def main():
     
     # Get track type and text_mode from config
     track_type = getattr(cfg.dataset_cfg, 'track_type', '2d')
-    text_mode = getattr(cfg.dataset_cfg, 'text_mode', False)
+    text_mode = getattr(cfg.model, 'text_mode', False)
     print(f"Track type: {track_type}")
     print(f"Text mode: {text_mode}")
     
@@ -1500,7 +1500,7 @@ def main():
     print(f"Using device: {device}")
     
     # Load model
-    model, is_diffusion, epoch = load_model(args.checkpoint, cfg, disp_stats, device, text_mode=text_mode)
+    model, is_diffusion, epoch = load_model(args.checkpoint, cfg, disp_stats, device)
     model_type = getattr(cfg.model, 'model_type', 'diffusion' if is_diffusion else 'direct')
     
     # Create output directory

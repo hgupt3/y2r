@@ -29,8 +29,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point, Polygon, Point32
 from std_msgs.msg import Header
-from std_srvs.srv import Trigger
 from tracker_interfaces.msg import QueryPoints
+from tracker_interfaces.srv import SetPrompt
 import numpy as np
 import cv2
 import torch
@@ -56,7 +56,7 @@ class PerceptionNode(Node):
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('detection_model', 'florence-2')
         self.declare_parameter('text_prompt', 'block')
-        self.declare_parameter('num_query_points', 10)
+        self.declare_parameter('train_config_path', '')  # Path to model training config (for num_query_points)
         self.declare_parameter('mask_erosion_pixels', 5)
         self.declare_parameter('sampling_strategy', 'fps')  # 'random' or 'fps'
         self.declare_parameter('target_fps', 0.0)  # 0.0 = full throughput
@@ -64,8 +64,32 @@ class PerceptionNode(Node):
         # Get parameters
         self.device = self.get_parameter('device').value
         self.detection_model = self.get_parameter('detection_model').value
-        self.text_prompt = self.get_parameter('text_prompt').value
-        self.num_query_points = self.get_parameter('num_query_points').value
+        text_prompt_param = self.get_parameter('text_prompt').value
+        # Handle None/null/empty/"None" as waiting for prompt from UI
+        if text_prompt_param and text_prompt_param.strip() and text_prompt_param.lower() not in ('none', 'null', ''):
+            self.text_prompt = text_prompt_param
+            self.waiting_for_prompt = False
+        else:
+            self.text_prompt = None
+            self.waiting_for_prompt = True
+        
+        # Load num_query_points from model config (num_track_ids in dataset_cfg)
+        train_config_path = self.get_parameter('train_config_path').value
+        if not train_config_path:
+            raise ValueError('train_config_path must be set in config!')
+        
+        import yaml
+        from pathlib import Path
+        with open(train_config_path, 'r') as f:
+            train_cfg = yaml.safe_load(f)
+        
+        # Load dataset config to get num_track_ids
+        dataset_config_path = train_cfg['dataset_config']
+        config_dir = Path(train_config_path).parent
+        dataset_config_full = config_dir / dataset_config_path
+        with open(dataset_config_full, 'r') as f:
+            dataset_cfg = yaml.safe_load(f)
+        self.num_query_points = dataset_cfg['num_track_ids']
         self.mask_erosion_pixels = self.get_parameter('mask_erosion_pixels').value
         self.sampling_strategy = self.get_parameter('sampling_strategy').value
         target_fps_param = self.get_parameter('target_fps').value
@@ -73,8 +97,8 @@ class PerceptionNode(Node):
         self.target_fps = target_fps_param if target_fps_param and target_fps_param > 0 else None
         
         # Hardcoded settings (from gsam_video defaults)
-        self.box_threshold = 0.5
-        self.text_threshold = 0.5
+        self.box_threshold = 0.3  # Lower threshold for more sensitive detection
+        self.text_threshold = 0.3
         self.sam2_config = 'configs/sam2.1/sam2.1_hiera_t_512'  # Tiny model at 512 res (optimized for speed)
         self.sam2_checkpoint = 'thirdparty/sam2/checkpoints/sam2.1_hiera_tiny.pt'
         self.sampling_method = 'random'  # Always use random sampling
@@ -83,6 +107,8 @@ class PerceptionNode(Node):
         self.tracking_initialized = False
         self.current_frame_idx = 0
         self.frame_lock = False
+        self.last_detection_attempt = 0
+        self.detection_cooldown = 1.0  # Retry detection every 1 second on failure
         
         # For throttled mode only
         if self.target_fps is not None:
@@ -105,7 +131,10 @@ class PerceptionNode(Node):
         self.get_logger().info('Perception Node initializing...')
         self.get_logger().info(f'  Device: {self.device}')
         self.get_logger().info(f'  Detection model: {self.detection_model}')
-        self.get_logger().info(f'  Text prompt: {self.text_prompt}')
+        if self.waiting_for_prompt:
+            self.get_logger().info(f'  Text prompt: (waiting for UI input)')
+        else:
+            self.get_logger().info(f'  Text prompt: {self.text_prompt}')
         self.get_logger().info(f'  Query points: {self.num_query_points}')
         self.get_logger().info(f'  Mask erosion: {self.mask_erosion_pixels} pixels')
         self.get_logger().info(f'  Sampling strategy: {self.sampling_strategy}')
@@ -139,11 +168,11 @@ class PerceptionNode(Node):
             1  # Small queue - drop old contours
         )
         
-        # Service for resetting tracking
-        self.reset_service = self.create_service(
-            Trigger,
-            '/reset_tracking',
-            self.reset_tracking_callback
+        # Service for setting detection prompt (also resets tracking)
+        self.set_prompt_service = self.create_service(
+            SetPrompt,
+            '/set_prompt',
+            self.set_prompt_callback
         )
         
         # Timer for processing at target FPS (only if throttling enabled)
@@ -249,14 +278,25 @@ class PerceptionNode(Node):
     def process_frame_data(self, frame_array):
         """Core frame processing logic."""
         try:
+            # Skip processing if waiting for prompt from UI
+            if self.waiting_for_prompt:
+                return
+            
             if not self.tracking_initialized:
+                # Check cooldown to avoid spamming detection on failure
+                current_time = time.time()
+                if current_time - self.last_detection_attempt < self.detection_cooldown:
+                    return  # Skip this frame, wait for cooldown
+                
+                self.last_detection_attempt = current_time
+                
                 # First frame: run detection and initialize tracking
-                self.get_logger().info('Initializing tracking on first frame...')
+                self.get_logger().info('Initializing tracking...')
                 success = self.initialize_tracking(frame_array)
                 if success:
                     self.get_logger().info('✓ Tracking initialized successfully')
                 else:
-                    self.get_logger().warn('Failed to initialize tracking, will retry next frame...')
+                    self.get_logger().warn(f'No objects detected. Will retry in {self.detection_cooldown}s...')
                     return
             else:
                 # Subsequent frames: propagate and sample
@@ -638,23 +678,34 @@ class PerceptionNode(Node):
         
         self.publisher.publish(msg)
     
-    def reset_tracking_callback(self, request, response):
-        """Reset tracking state (service callback)"""
-        self.get_logger().info('Resetting tracking...')
+    def set_prompt_callback(self, request, response):
+        """Set detection prompt and reset tracking (service callback)"""
+        prompt = request.prompt.strip() if request.prompt else ''
+        
+        if not prompt:
+            response.success = False
+            response.message = 'Empty prompt provided'
+            self.get_logger().warn('Received empty prompt, ignoring')
+            return response
+        
+        self.get_logger().info(f'Setting prompt to: "{prompt}"')
         
         try:
-            # Clear tracking state
+            # Update prompt and reset tracking state
+            self.text_prompt = prompt
+            self.waiting_for_prompt = False
             self.tracking_initialized = False
             self.current_frame_idx = 0
             self.detected_objects = {}
             self.initial_boxes = {}
+            self.last_detection_attempt = 0  # Reset cooldown so detection runs immediately
             
             response.success = True
-            response.message = 'Tracking reset successfully'
-            self.get_logger().info('✓ Tracking reset complete')
+            response.message = f'Prompt set to: {prompt}'
+            self.get_logger().info(f'✓ Prompt updated, will detect on next frame')
             
         except Exception as e:
-            self.get_logger().error(f'Error resetting tracking: {e}')
+            self.get_logger().error(f'Error setting prompt: {e}')
             response.success = False
             response.message = f'Error: {str(e)}'
         

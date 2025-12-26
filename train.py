@@ -454,19 +454,8 @@ def save_checkpoint(model, optimizer, scheduler, ema_model, epoch, best_val_erro
 
 def main():
     parser = argparse.ArgumentParser(description="Train IntentTracker model")
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to configuration file"
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from"
-    )
-    
+    parser.add_argument("--config", type=str, required=True, help="Path to configuration file")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
     # Load config
@@ -525,7 +514,7 @@ def main():
     val_seed = getattr(cfg.dataset_cfg, 'val_seed', 42)
     track_type = getattr(cfg.model, 'track_type', '2d')
     hand_mode = getattr(cfg.model, 'hand_mode', None)
-    text_mode = getattr(cfg.dataset_cfg, 'text_mode', False)
+    text_mode = getattr(cfg.model, 'text_mode', False)
     sample_stride = getattr(cfg.dataset_cfg, 'sample_stride', 1)
     
     # Encoder unfreezing schedule (percentage of training when encoders should be unfrozen)
@@ -635,7 +624,7 @@ def main():
     model_type = getattr(cfg.model, 'model_type', 'direct')
     is_diffusion = (model_type == 'diffusion')
     
-    model = create_model(cfg, disp_stats=disp_stats, device=device, text_mode=text_mode)
+    model = create_model(cfg, disp_stats=disp_stats, device=device)
     
     # Apply initial encoder freezing if unfreeze_after is set
     # The model starts with encoders frozen, then unfreezes at unfreeze_after% of training
@@ -769,7 +758,7 @@ def main():
             
             # Log visualizations
             if len(vis_data) > 0:
-                images = visualize_predictions(vis_data, disp_stats, epoch + 1)
+                images = visualize_predictions(vis_data, disp_stats, epoch + 1, hand_mode=hand_mode)
                 wandb.log({'val/predictions': images}, step=global_step)
                 
                 # For diffusion models, also visualize the denoising process

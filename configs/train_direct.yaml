@@ -10,7 +10,8 @@ model:
   model_size: 's'               # 's' (small), 'b' (base), or 'l' (large) - sets hidden_size, num_heads, time_depth, vit_model
   track_type: '3d'              # '2d' or '3d' - must match dataset_config.yaml
   hand_mode: 'right'            # 'left', 'right', 'both', or null - must match dataset_config.yaml
-  # Note: num_future_steps, frame_stack, text_mode are derived from dataset_config
+  text_mode: true               # Enable text/language conditioning
+  # Note: num_future_steps, frame_stack are derived from dataset_config
   model_resolution: [256, 256]
   add_space_attn: true
   vit_frozen: false             # Fine-tune ViT (when unfreeze_after=0, this controls initial state)
@@ -27,9 +28,9 @@ training:
   device: 'cuda:0'                # Device to use: 'cuda', 'cuda:0', 'cuda:1', 'cpu', etc.
   
   # Training loop
-  num_epochs: 150
-  batch_size: 64                # Batch size (adjust based on GPU memory)
-  num_workers: 12                # DataLoader workers (adjust based on CPU cores)
+  num_epochs: 100
+  batch_size: 32                # Batch size (adjust based on GPU memory)
+  num_workers: 4                # DataLoader workers (adjust based on CPU cores)
   
   # Optimizer
   lr: 1.0e-4
@@ -42,7 +43,7 @@ training:
   ema_decay: 0.999              # Model EMA
   
   # Encoder unfreezing schedule (curriculum learning for ViT + SigLIP)
-  unfreeze_after: 0.3           # Unfreeze encoders at 30% of training (0.0 = always unfrozen)
+  unfreeze_after: 0.0           # Unfreeze encoders at 30% of training (0.0 = always unfrozen)
   
   # Learning rate schedule (cosine with warmup)
   lr_schedule: "cosine"

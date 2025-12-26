@@ -12,7 +12,7 @@ from y2r.models.autoreg_model import AutoregressiveIntentTracker
 from y2r.models.model_config import MODEL_SIZE_CONFIGS
 
 
-def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True, text_mode=None):
+def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
     """
     Factory function to create models based on configuration.
     
@@ -24,6 +24,7 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True, text
         cfg: Configuration namespace with model parameters. Must have:
             - cfg.model.model_type: str, one of 'direct', 'diffusion', 'autoreg'
             - cfg.model.model_size: str, one of 's', 'b', 'l'
+            - cfg.model.text_mode: bool, whether to enable text conditioning
             - cfg.model.*: other model parameters
         disp_stats: Optional dict with displacement statistics:
             - 'displacement_mean': list/array of length 2 or 3
@@ -32,8 +33,6 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True, text
         device: str or torch.device, device to place model on (default: 'cuda')
         from_pretrained: bool, if True loads ViT pretrained weights, if False skips
             (for loading from checkpoint). Default: True for backward compatibility.
-        text_mode: bool or None, whether to enable text conditioning. If None, reads
-            from cfg.dataset_cfg.text_mode or cfg.model.text_mode.
     
     Returns:
         model: Instantiated model moved to specified device.
@@ -46,19 +45,12 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True, text
         >>> cfg = load_config('configs/train_direct.yaml')
         >>> model = create_model(cfg, device='cuda:0')
     """
-    # Extract model type, model size, track type, and hand_mode
+    # Extract model type, model size, track type, hand_mode, and text_mode from config
     model_type = getattr(cfg.model, 'model_type', 'direct')
     model_size = getattr(cfg.model, 'model_size', 's')
     track_type = getattr(cfg.model, 'track_type', '2d')
     hand_mode = getattr(cfg.model, 'hand_mode', None)
-    
-    # Determine text_mode: explicit arg > model config > dataset config > False
-    if text_mode is None:
-        text_mode = getattr(cfg.model, 'text_mode', None)
-        if text_mode is None and hasattr(cfg, 'dataset_cfg'):
-            text_mode = getattr(cfg.dataset_cfg, 'text_mode', False)
-        if text_mode is None:
-            text_mode = False
+    text_mode = getattr(cfg.model, 'text_mode', False)
     
     # Validate model_size
     if model_size not in MODEL_SIZE_CONFIGS:

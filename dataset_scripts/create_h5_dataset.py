@@ -1052,41 +1052,36 @@ def main():
         # Output path
         output_h5_path = output_h5_dir / f"{video_folder.name}.hdf5"
         
-        try:
-            vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
-            hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
-            
-            # Get text description for this clip
-            clip_id = int(video_folder.name)  # Folder name is clip_id (e.g., "00042" -> 42)
-            text_description = clip_to_text.get(clip_id, "")
-            
-            stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file, hand_poses_file, text_description)
-            
-            if stats is not None:
-                all_stats.append(stats)
-                total_videos_processed += 1
-                
-                # Collect data for statistics
-                if 'displacements' in stats:
-                    all_displacements.extend(stats['displacements'])
-                if 'depth_values' in stats:
-                    all_depth_values.extend(stats['depth_values'])
-                if 'poses_9d' in stats:
-                    all_poses_9d.extend(stats['poses_9d'])
-                if 'hand_uvd_displacements' in stats:
-                    all_hand_uvd_displacements.extend(stats['hand_uvd_displacements'])
-                if 'hand_rot_displacements' in stats:
-                    all_hand_rot_displacements.extend(stats['hand_rot_displacements'])
-                
-                video_elapsed = time.time() - video_start_time
-                print(f"\n  Completed in {video_elapsed:.2f}s")
-            else:
-                print(f"\n  Skipped due to missing data")
+        vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
+        hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
         
-        except Exception as e:
-            print(f"  Error processing {video_folder.name}: {str(e)}")
-            import traceback
-            traceback.print_exc()
+        # Get text description for this clip
+        clip_id = int(video_folder.name)  # Folder name is clip_id (e.g., "00042" -> 42)
+        text_description = clip_to_text.get(clip_id, "")
+        
+        stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file, hand_poses_file, text_description)
+        
+        if stats is not None:
+            all_stats.append(stats)
+            total_videos_processed += 1
+            
+            # Collect data for statistics
+            if 'displacements' in stats:
+                all_displacements.extend(stats['displacements'])
+            if 'depth_values' in stats:
+                all_depth_values.extend(stats['depth_values'])
+            if 'poses_9d' in stats:
+                all_poses_9d.extend(stats['poses_9d'])
+            if 'hand_uvd_displacements' in stats:
+                all_hand_uvd_displacements.extend(stats['hand_uvd_displacements'])
+            if 'hand_rot_displacements' in stats:
+                all_hand_rot_displacements.extend(stats['hand_rot_displacements'])
+            
+            video_elapsed = time.time() - video_start_time
+            print(f"\n  Completed in {video_elapsed:.2f}s")
+        else:
+            print(f"\n  Skipped due to missing data")
+        
     
     # =========================================================================
     # COMPUTE STATISTICS

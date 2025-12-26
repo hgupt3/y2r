@@ -1,0 +1,8 @@
+# SetPrompt service - set the detection prompt for object tracking
+# Request
+string prompt
+---
+# Response
+bool success
+string message
+

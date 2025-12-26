@@ -1,0 +1,48 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from tracker_interfaces/msg/PredictedHandPoses.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+
+module tracker_interfaces {
+  module msg {
+    typedef float float__9[9];
+    struct PredictedHandPoses {
+      std_msgs::msg::Header header;
+
+      int32 num_timesteps;
+
+      @verbatim (language="comment", text=
+        "Left hand")
+      boolean left_valid;
+
+      @verbatim (language="comment", text=
+        "(T,) camera pixel u")
+      sequence<float> left_trajectory_u;
+
+      @verbatim (language="comment", text=
+        "(T,) camera pixel v")
+      sequence<float> left_trajectory_v;
+
+      @verbatim (language="comment", text=
+        "(T,) depth in meters")
+      sequence<float> left_trajectory_d;
+
+      @verbatim (language="comment", text=
+        "Final 3x3 rotation (flattened)")
+      float__9 left_final_rotation;
+
+      @verbatim (language="comment", text=
+        "Right hand")
+      boolean right_valid;
+
+      sequence<float> right_trajectory_u;
+
+      sequence<float> right_trajectory_v;
+
+      sequence<float> right_trajectory_d;
+
+      float__9 right_final_rotation;
+    };
+  };
+};

@@ -30,7 +30,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header
-from tracker_interfaces.msg import QueryPoints, PredictedTracks
+from tracker_interfaces.msg import QueryPoints, PredictedTracks, HandPoses, PredictedHandPoses
+from tracker_interfaces.srv import SetPredictionPrompt
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -51,6 +52,7 @@ class PredictorNode(Node):
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('depth_min', 0.1)  # meters
         self.declare_parameter('depth_max', 2.5)  # meters
+        self.declare_parameter('text_prompt', '')  # Empty string = null in yaml
         
         # Get parameters
         self.enabled = self.get_parameter('enabled').value
@@ -59,6 +61,7 @@ class PredictorNode(Node):
         self.device = self.get_parameter('device').value
         self.depth_min = self.get_parameter('depth_min').value
         self.depth_max = self.get_parameter('depth_max').value
+        text_prompt_param = self.get_parameter('text_prompt').value
         
         if not self.enabled:
             self.get_logger().info('Predictor Node disabled in config')
@@ -78,23 +81,33 @@ class PredictorNode(Node):
         self.train_cfg = self.load_config(train_config_path)
         self.frame_stack = self.train_cfg.model.frame_stack
         self.num_future_steps = self.train_cfg.model.num_future_steps
-        self.model_type = getattr(self.train_cfg.model, 'model_type', 'direct')
+        self.model_type = self.train_cfg.model.model_type
         self.is_diffusion = (self.model_type == 'diffusion')
         
         # Get track type (2d or 3d)
-        self.track_type = getattr(self.train_cfg.model, 'track_type', '2d')
+        self.track_type = self.train_cfg.model.track_type
         self.is_3d = (self.track_type == '3d')
         
         # Get model resolution from config
-        model_res = getattr(self.train_cfg.model, 'model_resolution', [224, 224])
+        model_res = self.train_cfg.model.model_resolution
         self.model_size = model_res[0]  # Assume square
         
         # Get dataset FPS for frame sampling
-        self.dataset_fps = getattr(self.train_cfg.dataset_cfg, 'target_fps', 12.0)
+        self.dataset_fps = self.train_cfg.dataset_cfg.target_fps
         self.frame_dt = 1.0 / self.dataset_fps
+        
+        # Get hand mode from model config (left/right/both or None to disable)
+        self.hand_mode = self.train_cfg.model.hand_mode  # Can be None if disabled
+        
+        # Get text mode from model config
+        self.text_mode = self.train_cfg.model.text_mode
+        # Use text_prompt from config param if provided, otherwise None (wait for UI input)
+        self.text_prompt = text_prompt_param if text_prompt_param else None
         
         self.get_logger().info(f'  Model type: {self.model_type}')
         self.get_logger().info(f'  Track type: {self.track_type}')
+        self.get_logger().info(f'  Hand mode: {self.hand_mode}')
+        self.get_logger().info(f'  Text mode: {self.text_mode}')
         self.get_logger().info(f'  Model resolution: {self.model_size}x{self.model_size}')
         self.get_logger().info(f'  Frame stack: {self.frame_stack}')
         self.get_logger().info(f'  Future steps: {self.num_future_steps}')
@@ -132,6 +145,9 @@ class PredictorNode(Node):
         # Latest query points (in normalized [0,1] camera space)
         self.latest_query_points = None
         self.query_lock = False
+        
+        # Latest hand poses (from hand_estimation_node)
+        self.latest_hand_poses = None  # Dict with 'left' and/or 'right' keys
         
         # FPS tracking
         self.fps_start_time = time.time()
@@ -183,6 +199,32 @@ class PredictorNode(Node):
             '/predicted_tracks',
             1
         )
+        
+        # Subscribe to hand poses if hand_mode is set
+        if self.hand_mode is not None:
+            self.hand_poses_sub = self.create_subscription(
+                HandPoses,
+                '/hand_poses',
+                self.hand_poses_callback,
+                1
+            )
+            self.get_logger().info(f'  Subscribed to /hand_poses (hand_mode={self.hand_mode})')
+            
+            # Publisher for predicted hand poses
+            self.hand_publisher = self.create_publisher(
+                PredictedHandPoses,
+                '/predicted_hand_poses',
+                1
+            )
+        
+        # Create service for setting prediction prompt (if text_mode is enabled)
+        if self.text_mode:
+            self.set_prediction_prompt_srv = self.create_service(
+                SetPredictionPrompt,
+                '/set_prediction_prompt',
+                self.set_prediction_prompt_callback
+            )
+            self.get_logger().info(f'  Text mode enabled, prompt: "{self.text_prompt or "(waiting for UI)"}"')
         
         self.get_logger().info('Predictor Node ready!')
     
@@ -386,6 +428,121 @@ class PredictorNode(Node):
         
         return torch.stack([cam_x, cam_y], dim=-1)
     
+    def cam_pixel_to_model_hand_coords(self, u_px, v_px, depth_m):
+        """
+        Transform hand position from camera pixels to normalized model space.
+        
+        Input:  (u_px, v_px, depth_m) - camera pixels + meters
+        Output: (u_model, v_model, d_normalized) - model normalized [0,1] space
+        """
+        # Step 1: Apply crop offset and scale to get model pixels
+        model_px_u = (u_px - self.crop_x) * self.scale
+        model_px_v = (v_px - self.crop_y) * self.scale
+        
+        # Step 2: Normalize to [0, 1] in model space
+        u_model = model_px_u / self.model_size
+        v_model = model_px_v / self.model_size
+        
+        # Step 3: Clip to valid range (hand might be outside crop region)
+        u_model = np.clip(u_model, 0.0, 1.0)
+        v_model = np.clip(v_model, 0.0, 1.0)
+        
+        # Step 4: Normalize depth using same stats as track depth
+        d_normalized = self.norm_stats.normalize_depth(np.array([depth_m]))[0]
+        
+        return u_model, v_model, d_normalized
+    
+    def model_to_cam_pixel_hand_coords(self, u_model, v_model, d_normalized):
+        """
+        Transform predicted hand position from model space back to camera.
+        
+        Input:  (u_model, v_model, d_normalized) - model normalized (can be tensors)
+        Output: (u_px, v_px, depth_m) - camera pixels + meters
+        """
+        # Step 1: Convert normalized to model pixels
+        model_px_u = u_model * self.model_size
+        model_px_v = v_model * self.model_size
+        
+        # Step 2: Inverse scale and add crop offset
+        u_px = (model_px_u / self.scale) + self.crop_x
+        v_px = (model_px_v / self.scale) + self.crop_y
+        
+        # Step 3: Denormalize depth
+        if isinstance(d_normalized, torch.Tensor):
+            depth_m = self.norm_stats.denormalize_depth_torch(d_normalized)
+        else:
+            depth_m = self.norm_stats.denormalize_depth(d_normalized)
+        
+        return u_px, v_px, depth_m
+    
+    @staticmethod
+    def rot_matrix_to_6d(R):
+        """Convert 3x3 rotation matrix to 6D representation (first two columns)."""
+        # R is (3, 3) - take first two columns
+        return np.concatenate([R[:, 0], R[:, 1]])  # (6,)
+    
+    @staticmethod
+    def rot_6d_to_matrix(rot_6d):
+        """Convert 6D back to 3x3 rotation matrix via Gram-Schmidt."""
+        r1 = rot_6d[:3]
+        r2 = rot_6d[3:6]
+        
+        # Normalize r1
+        r1_norm = np.linalg.norm(r1)
+        if r1_norm > 1e-8:
+            r1 = r1 / r1_norm
+        
+        # Orthogonalize r2 with respect to r1
+        r2 = r2 - np.dot(r1, r2) * r1
+        r2_norm = np.linalg.norm(r2)
+        if r2_norm > 1e-8:
+            r2 = r2 / r2_norm
+        
+        # Compute r3 as cross product
+        r3 = np.cross(r1, r2)
+        
+        return np.stack([r1, r2, r3], axis=1)  # (3, 3)
+    
+    def hand_poses_callback(self, msg):
+        """Store latest hand poses from hand_estimation_node."""
+        hand_poses = {}
+        
+        if msg.left_valid:
+            # Reshape rotation from flat array to 3x3 matrix (row-major)
+            left_rot = np.array(msg.left_rotation).reshape(3, 3)
+            hand_poses['left'] = {
+                'u': msg.left_u,      # camera pixels
+                'v': msg.left_v,      # camera pixels
+                'depth': msg.left_depth,  # meters
+                'rotation': left_rot,  # 3x3 matrix
+            }
+        
+        if msg.right_valid:
+            right_rot = np.array(msg.right_rotation).reshape(3, 3)
+            hand_poses['right'] = {
+                'u': msg.right_u,
+                'v': msg.right_v,
+                'depth': msg.right_depth,
+                'rotation': right_rot,
+            }
+        
+        self.latest_hand_poses = hand_poses if hand_poses else None
+    
+    def set_prediction_prompt_callback(self, request, response):
+        """Service callback to set the prediction text prompt."""
+        prompt = request.prompt.strip()
+        if prompt:
+            self.text_prompt = prompt
+            self.get_logger().info(f'Prediction prompt set to: "{prompt}"')
+            response.success = True
+            response.message = f'Prompt set to: {prompt}'
+        else:
+            self.text_prompt = None
+            self.get_logger().info('Prediction prompt cleared')
+            response.success = True
+            response.message = 'Prompt cleared'
+        return response
+    
     def depth_callback(self, msg):
         """Store latest depth frame."""
         height, width = msg.height, msg.width
@@ -554,7 +711,8 @@ class PredictorNode(Node):
                 depth = depth.to(self.device)
             
             # Get query coordinates and transform to model space
-            if self.latest_query_points is None:
+            # Model requires query points - skip inference if none available
+            if self.latest_query_points is None or len(self.latest_query_points) == 0:
                 return
             
             query_model = self.cam_to_model_coords(self.latest_query_points)  # (N, 2)
@@ -569,15 +727,85 @@ class PredictorNode(Node):
             
             query_coords = query_coords.unsqueeze(0)  # (1, N, coord_dim)
             
+            # Prepare hand query data if hand_mode is set
+            hand_query_uvd = None
+            hand_query_rot = None
+            hand_sides = []  # Track which sides are valid
+            
+            if self.hand_mode is not None and self.latest_hand_poses is not None:
+                hand_uvd_list = []
+                hand_rot_list = []
+                
+                # Determine which sides to process
+                sides_to_check = []
+                if self.hand_mode in ('left', 'both'):
+                    sides_to_check.append('left')
+                if self.hand_mode in ('right', 'both'):
+                    sides_to_check.append('right')
+                
+                for side in sides_to_check:
+                    if side in self.latest_hand_poses:
+                        hand_data = self.latest_hand_poses[side]
+                        
+                        # Skip if depth is invalid
+                        if hand_data['depth'] <= 0:
+                            continue
+                        
+                        # Transform to model space
+                        u_model, v_model, d_norm = self.cam_pixel_to_model_hand_coords(
+                            hand_data['u'], hand_data['v'], hand_data['depth']
+                        )
+                        
+                        # Convert rotation matrix to 6D
+                        rot_6d = self.rot_matrix_to_6d(hand_data['rotation'])
+                        
+                        hand_uvd_list.append([u_model, v_model, d_norm])
+                        hand_rot_list.append(rot_6d)
+                        hand_sides.append(side)
+                
+                if hand_uvd_list:
+                    # Stack and convert to tensors: (H, 3) and (H, 6)
+                    hand_query_uvd = torch.tensor(np.array(hand_uvd_list), dtype=torch.float32).to(self.device)
+                    hand_query_rot = torch.tensor(np.array(hand_rot_list), dtype=torch.float32).to(self.device)
+                    # Add batch dimension: (1, H, 3) and (1, H, 6)
+                    hand_query_uvd = hand_query_uvd.unsqueeze(0)
+                    hand_query_rot = hand_query_rot.unsqueeze(0)
+            
+            # If model requires hand input but no valid hand detected, skip inference entirely
+            # The model was trained with hand conditioning - without it, outputs are invalid
+            if self.hand_mode is not None and hand_query_uvd is None:
+                return  # Skip this frame - no valid hand input available
+            
+            # If model requires text input but no prompt set, skip inference entirely
+            if self.text_mode and not self.text_prompt:
+                return  # Skip this frame - no text prompt set yet
+            
+            # Prepare text input if text_mode is enabled
+            text_input = [self.text_prompt] if self.text_mode and self.text_prompt else None
+            
             # Run inference
             infer_start = time.time()
             with torch.no_grad(), autocast(device_type='cuda', enabled=True):
                 if self.is_diffusion:
-                    num_inference_steps = getattr(self.train_cfg.model, 'num_inference_steps', 10)
-                    pred_disp = self.model.predict(frames, query_coords, depth=depth, num_inference_steps=num_inference_steps)
+                    num_inference_steps = self.train_cfg.model.num_inference_steps
+                    outputs = self.model.predict(
+                        frames, query_coords, depth=depth, 
+                        num_inference_steps=num_inference_steps,
+                        hand_query_uvd=hand_query_uvd,
+                        hand_query_rot=hand_query_rot,
+                        text=text_input
+                    )
                 else:
-                    pred_disp = self.model.predict(frames, query_coords, depth=depth)
+                    outputs = self.model.predict(
+                        frames, query_coords, depth=depth,
+                        hand_query_uvd=hand_query_uvd,
+                        hand_query_rot=hand_query_rot,
+                        text=text_input
+                    )
             infer_time = (time.time() - infer_start) * 1000
+            
+            # Extract track displacements from model output
+            pred_disp = outputs['track_disp']
             
             # Denormalize displacements to get real changes
             pred_disp_denorm = self.norm_stats.denormalize_displacement_torch(pred_disp[0])
@@ -601,8 +829,14 @@ class PredictorNode(Node):
             
             total_time = (time.time() - total_start) * 1000
             
-            # Publish predictions
+            # Publish track predictions
             self.publish_predictions(pred_tracks_cam, pred_z)
+            
+            # Process and publish hand predictions if available
+            if self.hand_mode is not None and hand_sides and 'hand_uvd_disp' in outputs:
+                self.publish_hand_predictions(
+                    outputs, hand_query_uvd, hand_query_rot, hand_sides
+                )
             
             # Store timing
             self._last_infer_time = infer_time
@@ -643,6 +877,95 @@ class PredictorNode(Node):
         msg.num_timesteps = T
         
         self.track_publisher.publish(msg)
+    
+    def publish_hand_predictions(self, outputs, hand_query_uvd, hand_query_rot, hand_sides):
+        """
+        Process and publish predicted hand trajectories.
+        
+        Args:
+            outputs: Model output dict with 'hand_uvd_disp' and 'hand_rot_disp'
+            hand_query_uvd: (1, H, 3) initial hand positions in model space (normalized)
+            hand_query_rot: (1, H, 6) initial hand rotations in 6D
+            hand_sides: List of side names ('left', 'right') matching H dimension
+        """
+        msg = PredictedHandPoses()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        
+        # Extract predictions: (1, H, T, 3) and (1, H, T, 6)
+        hand_uvd_disp = outputs['hand_uvd_disp'][0]  # (H, T, 3)
+        hand_rot_disp = outputs['hand_rot_disp'][0]  # (H, T, 6)
+        
+        T = hand_uvd_disp.shape[1]
+        msg.num_timesteps = T
+        
+        # Process each hand
+        for h_idx, side in enumerate(hand_sides):
+            # Get query position (normalized)
+            query_uvd = hand_query_uvd[0, h_idx]  # (3,)
+            query_rot_6d = hand_query_rot[0, h_idx].cpu().numpy()  # (6,)
+            
+            # Denormalize UVD displacements
+            uvd_disp = hand_uvd_disp[h_idx]  # (T, 3)
+            uvd_disp_denorm = self.norm_stats.denormalize_hand_uvd_disp_torch(uvd_disp)
+            
+            # Extract query components
+            query_u = query_uvd[0].item()  # normalized [0,1]
+            query_v = query_uvd[1].item()  # normalized [0,1]
+            query_d_norm = query_uvd[2].item()  # normalized depth
+            
+            # Denormalize query depth to meters
+            query_d_m = self.norm_stats.denormalize_depth(np.array([query_d_norm]))[0]
+            
+            # Reconstruct trajectory: query + denormalized displacements
+            # u,v: [0,1] + small displacement ≈ [0,1]
+            # d: meters + meters = meters
+            pred_u = query_u + uvd_disp_denorm[:, 0].cpu()  # (T,) in [0,1]
+            pred_v = query_v + uvd_disp_denorm[:, 1].cpu()  # (T,) in [0,1]
+            pred_d_m = query_d_m + uvd_disp_denorm[:, 2].cpu().numpy()  # (T,) in meters
+            
+            # Transform u,v to camera pixels (depth already in meters)
+            traj_u_cam = []
+            traj_v_cam = []
+            traj_d_m = []
+            
+            for t in range(T):
+                # Convert model normalized u,v to camera pixels
+                model_px_u = pred_u[t].item() * self.model_size
+                model_px_v = pred_v[t].item() * self.model_size
+                u_cam = (model_px_u / self.scale) + self.crop_x
+                v_cam = (model_px_v / self.scale) + self.crop_y
+                
+                traj_u_cam.append(float(u_cam))
+                traj_v_cam.append(float(v_cam))
+                traj_d_m.append(float(pred_d_m[t]))
+            
+            # Compute final rotation at last timestep using proper rotation composition
+            # Ground truth was: R_rel = R_t @ R_0.T, so R_t = R_rel @ R_0
+            rot_disp = hand_rot_disp[h_idx]  # (T, 6)
+            rot_disp_denorm = self.norm_stats.denormalize_hand_rot_disp_torch(rot_disp).cpu().numpy()
+            
+            final_rot_6d = rot_disp_denorm[-1]  # (6,) - this is R_rel in 6D
+            R_0 = self.rot_6d_to_matrix(query_rot_6d)  # Initial rotation
+            R_rel = self.rot_6d_to_matrix(final_rot_6d)  # Relative rotation
+            R_final = R_rel @ R_0  # Proper composition: R_t = R_rel @ R_0
+            final_rotation = R_final.flatten().tolist()  # (9,) row-major
+            
+            # Store in message
+            if side == 'left':
+                msg.left_valid = True
+                msg.left_trajectory_u = traj_u_cam
+                msg.left_trajectory_v = traj_v_cam
+                msg.left_trajectory_d = traj_d_m
+                msg.left_final_rotation = final_rotation
+            else:
+                msg.right_valid = True
+                msg.right_trajectory_u = traj_u_cam
+                msg.right_trajectory_v = traj_v_cam
+                msg.right_trajectory_d = traj_d_m
+                msg.right_final_rotation = final_rotation
+        
+        self.hand_publisher.publish(msg)
 
 
 def main(args=None):

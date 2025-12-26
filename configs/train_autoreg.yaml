@@ -10,7 +10,8 @@ model:
   model_size: 's'                # 's' (small), 'b' (base), or 'l' (large) - sets hidden_size, num_heads, time_depth, vit_model
   track_type: '2d'               # '2d' or '3d' - must match dataset_config.yaml
   hand_mode: null                # 'left', 'right', 'both', or null - must match dataset_config.yaml
-  # Note: num_future_steps, frame_stack, text_mode are derived from dataset_config
+  text_mode: false               # Enable text/language conditioning
+  # Note: num_future_steps, frame_stack are derived from dataset_config
   model_resolution: [256, 256]
   add_space_attn: true
   vit_frozen: false              # Fine-tune ViT (when unfreeze_after=0, this controls initial state)

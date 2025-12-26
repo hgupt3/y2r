@@ -376,6 +376,276 @@ def gsam_video(
     # `object_dict`: e.g. {1: "apple", 2: "apple", 3: "pear", 4: "pear"}
     return masks_4d, object_dict
 
+
+def sam3_video(
+    frames_dir,
+    text_prompt,
+    key_frame_idx=0,
+    save_path=None,
+    video_name=None,
+    device="cuda",
+    fps=12,
+    sam3_predictor=None,
+):
+    """
+    Processes a folder of PNG frames using SAM 3's unified detection + segmentation model.
+    
+    SAM 3 has built-in text-based detection, so no separate detection model is needed.
+    It uses a session-based API for video segmentation with automatic object tracking.
+
+    Args:
+        frames_dir (str): Path to directory containing image frames (e.g., 00000/, 00001/, etc.)
+        text_prompt (str): Text prompt for object detection (e.g., "person", "apple").
+                          No trailing period needed (unlike Grounding DINO).
+        key_frame_idx (int, optional): Frame index for initial detection. 
+                                       0=first frame, -1=middle frame. Defaults to 0.
+        save_path (str, optional): Path to save the annotated video (e.g. ./save/).
+        video_name (str, optional): Name for the output video file.
+        device (str, optional): Device to run the model on ("cuda" or "cpu").
+        fps (float, optional): FPS for output visualization video. Defaults to 12.
+        sam3_predictor: Pre-loaded SAM3 video predictor (required).
+
+    Returns:
+        numpy.ndarray: 4D array of masks with shape (T, O, H, W) where O is the number of unique objects.
+        dict: Dictionary mapping object IDs to the text prompt used.
+    """
+    from pathlib import Path
+    
+    frames_path = Path(frames_dir)
+    
+    if not frames_path.exists():
+        print(f"Error: Directory not found: {frames_dir}")
+        return None, None
+    
+    if sam3_predictor is None:
+        raise ValueError("sam3_predictor must be provided. Use build_sam3_video_predictor() to create one.")
+    
+    # Strip trailing period from text prompt if present (SAM3 doesn't need it)
+    text_prompt_clean = text_prompt.rstrip('.')
+    
+    # Get frame files to determine dimensions and count
+    png_files = sorted(
+        list(frames_path.glob("*.png")) + 
+        list(frames_path.glob("*.jpg")) + 
+        list(frames_path.glob("*.jpeg")) +
+        list(frames_path.glob("*.PNG")) +
+        list(frames_path.glob("*.JPG")) +
+        list(frames_path.glob("*.JPEG"))
+    )
+    
+    if len(png_files) == 0:
+        print(f"No image files (PNG/JPG) found in {frames_dir}")
+        return None, None
+    
+    # Load first frame to get dimensions
+    first_frame = cv2.imread(str(png_files[0]))
+    if first_frame is None:
+        print("Failed to load first frame.")
+        return None, None
+    
+    T = len(png_files)  # Number of frames
+    H, W = first_frame.shape[:2]  # Frame height, width
+    
+    # Determine which frame to use for detection
+    if key_frame_idx == -1:
+        actual_key_frame_idx = T // 2
+    else:
+        actual_key_frame_idx = key_frame_idx
+    
+    # Ensure the key frame index is valid
+    if actual_key_frame_idx >= T or actual_key_frame_idx < 0:
+        print(f"Error: Key frame index {actual_key_frame_idx} is out of range (0-{T-1})")
+        return None, None
+    
+    # ------------------------------
+    # Step 1: Start SAM3 session
+    # ------------------------------
+    print(f"Starting SAM3 session for {frames_dir}...")
+    response = sam3_predictor.handle_request({
+        "type": "start_session",
+        "resource_path": str(frames_dir)
+    })
+    session_id = response["session_id"]
+    print(f"  Session ID: {session_id}")
+    
+    try:
+        # ------------------------------
+        # Step 2: Add text prompt
+        # ------------------------------
+        print(f"Running SAM3 detection on frame {actual_key_frame_idx} with prompt: '{text_prompt_clean}'...")
+        response = sam3_predictor.handle_request({
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": actual_key_frame_idx,
+            "text": text_prompt_clean
+        })
+        
+        # Check initial detection results
+        initial_outputs = response.get("outputs", {})
+        initial_obj_ids = initial_outputs.get("out_obj_ids", np.array([]))
+        
+        if len(initial_obj_ids) == 0:
+            print(f"No objects detected on frame {actual_key_frame_idx}.")
+            # Try middle frame if we weren't already using it
+            if actual_key_frame_idx != T // 2:
+                print(f"  Retrying with middle frame ({T // 2})...")
+                # Reset and try again
+                sam3_predictor.handle_request({
+                    "type": "reset_session",
+                    "session_id": session_id
+                })
+                response = sam3_predictor.handle_request({
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": T // 2,
+                    "text": text_prompt_clean
+                })
+                initial_outputs = response.get("outputs", {})
+                initial_obj_ids = initial_outputs.get("out_obj_ids", np.array([]))
+                
+                if len(initial_obj_ids) == 0:
+                    print("No objects detected after retry.")
+                    return None, None
+            else:
+                return None, None
+        
+        print(f"  Initial detection found {len(initial_obj_ids)} objects: {initial_obj_ids.tolist()}")
+        
+        # ------------------------------
+        # Step 3: Propagate through video
+        # ------------------------------
+        print(f"Propagating masks through video (direction=both)...")
+        outputs_per_frame = {}
+        
+        for response in sam3_predictor.handle_stream_request({
+            "type": "propagate_in_video",
+            "session_id": session_id,
+            "propagation_direction": "both"
+        }):
+            frame_idx = response["frame_index"]
+            outputs_per_frame[frame_idx] = response["outputs"]
+        
+        print(f"  Collected outputs for {len(outputs_per_frame)} frames")
+        
+        # ------------------------------
+        # Step 4: Convert outputs to (T, O, H, W) format
+        # ------------------------------
+        # Collect all unique object IDs across all frames
+        all_obj_ids = set()
+        for frame_idx, outputs in outputs_per_frame.items():
+            obj_ids = outputs.get("out_obj_ids", np.array([]))
+            all_obj_ids.update(obj_ids.tolist())
+        
+        if len(all_obj_ids) == 0:
+            print("No objects detected in any frame.")
+            return None, None
+        
+        # Create a sorted list of unique object IDs and a mapping
+        sorted_obj_ids = sorted(all_obj_ids)
+        num_objects = len(sorted_obj_ids)
+        obj_id_to_idx = {obj_id: idx for idx, obj_id in enumerate(sorted_obj_ids)}
+        
+        print(f"  Total unique objects: {num_objects}, IDs: {sorted_obj_ids}")
+        
+        # Create the output mask array
+        masks_4d = np.zeros((T, num_objects, H, W), dtype=bool)
+        
+        # Fill in masks for each frame
+        for frame_idx in range(T):
+            if frame_idx in outputs_per_frame:
+                outputs = outputs_per_frame[frame_idx]
+                obj_ids = outputs.get("out_obj_ids", np.array([]))
+                binary_masks = outputs.get("out_binary_masks", np.array([]))
+                
+                for i, obj_id in enumerate(obj_ids):
+                    if obj_id in obj_id_to_idx and i < len(binary_masks):
+                        idx = obj_id_to_idx[obj_id]
+                        mask = binary_masks[i]
+                        # Resize mask if dimensions don't match
+                        if mask.shape != (H, W):
+                            mask = cv2.resize(
+                                mask.astype(np.uint8), 
+                                (W, H), 
+                                interpolation=cv2.INTER_NEAREST
+                            ).astype(bool)
+                        masks_4d[frame_idx, idx] = mask
+        
+        # Build object dictionary (map object IDs to text prompt)
+        object_dict = {}
+        for obj_id in sorted_obj_ids:
+            idx = obj_id_to_idx[obj_id] + 1  # 1-based for consistency with gsam_video
+            object_dict[idx] = text_prompt_clean
+        
+        print(f"✓ SAM3 propagation complete")
+        print(f"  Masks shape: {masks_4d.shape}")
+        print(f"  Objects detected: {num_objects}")
+        
+        # ------------------------------
+        # Step 5 (Optional): Save annotated video
+        # ------------------------------
+        if save_path is not None:
+            output_filename = f'{video_name}.mp4' if video_name else 'sam3.mp4'
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_video = cv2.VideoWriter(os.path.join(save_path, output_filename), fourcc, fps, (W, H))
+            
+            for fidx in range(T):
+                frame_bgr = cv2.imread(str(png_files[fidx]))
+                frame_bgr_annot = frame_bgr.copy()
+                
+                # Collect all valid masks
+                valid_masks = []
+                valid_obj_ids = []
+                for obj_idx in range(num_objects):
+                    mask_bool = masks_4d[fidx, obj_idx]
+                    if mask_bool.any():
+                        valid_masks.append(mask_bool)
+                        valid_obj_ids.append(obj_idx + 1)  # 1-based
+                
+                if len(valid_masks) == 0:
+                    out_video.write(frame_bgr_annot)
+                    continue
+                
+                final_masks = np.stack(valid_masks, axis=0)
+                xyxy = sv.mask_to_xyxy(final_masks)
+                
+                detections = sv.Detections(
+                    xyxy=xyxy,
+                    mask=final_masks,
+                    class_id=np.array(valid_obj_ids, dtype=np.int32)
+                )
+                
+                box_annotator = sv.BoxAnnotator()
+                annotated_frame = box_annotator.annotate(scene=frame_bgr_annot, detections=detections)
+                
+                label_annotator = sv.LabelAnnotator()
+                label_texts = [object_dict[obj_id] for obj_id in valid_obj_ids]
+                annotated_frame = label_annotator.annotate(
+                    scene=annotated_frame,
+                    detections=detections,
+                    labels=label_texts
+                )
+                
+                mask_annotator = sv.MaskAnnotator()
+                annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+                
+                out_video.write(annotated_frame)
+            
+            out_video.release()
+            print(f"Annotated video saved at: {os.path.join(save_path, output_filename)}")
+        
+        return masks_4d, object_dict
+        
+    finally:
+        # ------------------------------
+        # Step 6: Close session to free GPU memory
+        # ------------------------------
+        sam3_predictor.handle_request({
+            "type": "close_session",
+            "session_id": session_id
+        })
+        print(f"  Session {session_id} closed")
+
+
 def gsam(
     video_path, 
     text, 

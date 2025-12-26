@@ -1,3 +1,7 @@
+msg/HandPoses.idl
+msg/HandPoses.msg
+msg/PredictedHandPoses.idl
+msg/PredictedHandPoses.msg
 msg/PredictedTracks.idl
 msg/PredictedTracks.msg
 msg/QueryPoints.idl
@@ -6,3 +10,11 @@ srv/ResetTracking.idl
 srv/ResetTracking.srv
 srv/ResetTracking_Request.msg
 srv/ResetTracking_Response.msg
+srv/SetPredictionPrompt.idl
+srv/SetPredictionPrompt.srv
+srv/SetPredictionPrompt_Request.msg
+srv/SetPredictionPrompt_Response.msg
+srv/SetPrompt.idl
+srv/SetPrompt.srv
+srv/SetPrompt_Request.msg
+srv/SetPrompt_Response.msg

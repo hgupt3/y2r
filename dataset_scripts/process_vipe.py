@@ -140,6 +140,32 @@ def convert_poses_to_extrinsics(poses: np.ndarray) -> np.ndarray:
     return np.linalg.inv(poses).astype(np.float32)
 
 
+def is_depth_flat(
+    depths: np.ndarray,
+    flat_std_threshold: float = 0.1,
+    max_flat_frame_pct: float = 20.0,
+) -> tuple[bool, float, float]:
+    """
+    Check if too many frames have flat depth (indicating ViPE failure).
+    
+    Args:
+        depths: (T, H, W) float depth maps
+        flat_std_threshold: A frame is "flat" if its std < this value (default 0.1)
+        max_flat_frame_pct: Discard if more than this % of frames are flat (default 20%)
+    
+    Returns:
+        Tuple of (should_discard, pct_flat_frames, overall_std)
+    """
+    T = depths.shape[0]
+    frame_stds = np.std(depths, axis=(1, 2))  # (T,) std per frame
+    num_flat = np.sum(frame_stds < flat_std_threshold)
+    pct_flat = (num_flat / T) * 100
+    overall_std = float(np.std(depths))
+    
+    should_discard = pct_flat > max_flat_frame_pct
+    return should_discard, pct_flat, overall_std
+
+
 def create_vipe_pipeline(
     pipeline_name="default",
     output_dir=None,
@@ -218,7 +244,9 @@ def run_vipe_on_video(
     frames_dir, 
     output_dir, 
     save_viz=False, 
-    vis_path=None, 
+    vis_path=None,
+    flat_std_threshold=0.1,
+    max_flat_frame_pct=20.0,
 ):
     """
     Run ViPE pipeline on a single video and save results as TAPIP3D-ready .npz file.
@@ -230,13 +258,16 @@ def run_vipe_on_video(
         output_dir: Directory to save outputs (.npz files)
         save_viz: Whether to save visualization video
         vis_path: Directory to save visualization videos (if different from output_dir)
+        flat_std_threshold: A frame is "flat" if per-frame std < this (default 0.1)
+        max_flat_frame_pct: Skip if more than this % of frames are flat (default 20%)
     
     Returns:
-        Dictionary with TAPIP3D-ready data:
-        - video: (T, H, W, 3) uint8 RGB frames
-        - depths: (T, H, W) float32 metric depth maps
-        - intrinsics: (T, 3, 3) float32 camera matrices
-        - extrinsics: (T, 4, 4) float32 world2cam matrices
+        Dictionary with results:
+        - npz_path: Path to saved .npz file (None if skipped due to flat depth)
+        - video_name: Name of the video
+        - num_frames: Number of frames processed
+        - pct_flat_frames: % of frames that are flat
+        - skipped: True if skipped due to flat depth
     """
     video_path = Path(video_path)
     frames_dir = Path(frames_dir)
@@ -301,6 +332,23 @@ def run_vipe_on_video(
     # Convert poses (cam2world) to extrinsics (world2cam)
     extrinsics = convert_poses_to_extrinsics(poses)
     
+    # Check for flat depth (indicates ViPE failure)
+    should_discard, pct_flat, overall_std = is_depth_flat(
+        depths,
+        flat_std_threshold=flat_std_threshold,
+        max_flat_frame_pct=max_flat_frame_pct,
+    )
+    
+    if should_discard:
+        # Skip saving - too many flat frames
+        return {
+            'npz_path': None,
+            'video_name': video_name,
+            'num_frames': num_frames,
+            'pct_flat_frames': pct_flat,
+            'skipped': True,
+        }
+    
     # Prepare TAPIP3D-ready output (NO video field)
     tapip3d_data = {
         'depths': depths.astype(np.float16),     # (T, H, W) float16 (50% smaller)
@@ -317,6 +365,8 @@ def run_vipe_on_video(
         'npz_path': str(npz_path),
         'video_name': video_name,
         'num_frames': num_frames,
+        'pct_flat_frames': pct_flat,
+        'skipped': False,
     }
     
     # Handle visualization artifacts
@@ -340,7 +390,7 @@ def process_frame_directory_with_vipe(vipe_pipeline, frames_dir, output_dir, con
         config: ViPE config dictionary
     
     Returns:
-        Path to saved .npz file or None if failed
+        Dict with processing results, or None if no frames found
     """
     frames_dir = Path(frames_dir)
     output_dir = Path(output_dir)
@@ -358,9 +408,11 @@ def process_frame_directory_with_vipe(vipe_pipeline, frames_dir, output_dir, con
         output_dir=output_dir,
         save_viz=config.get('vis_flag', False),
         vis_path=config.get('vis_path'),
+        flat_std_threshold=config.get('flat_std_threshold', 0.1),
+        max_flat_frame_pct=config.get('max_flat_frame_pct', 20.0),
     )
     
-    return Path(result.get('npz_path'))
+    return result
 
 
 def _worker_process(worker_id, video_dirs, output_dir, vipe_config, progress_queue):
@@ -403,13 +455,17 @@ def _worker_process(worker_id, video_dirs, output_dir, vipe_config, progress_que
     for video_dir in video_dirs:
         video_name = video_dir.name
         try:
-            npz_path = process_frame_directory_with_vipe(
+            result = process_frame_directory_with_vipe(
                 vipe_pipeline, video_dir, output_dir, vipe_config
             )
-            if npz_path is not None:
-                progress_queue.put(('done', worker_id, video_name))
+            if result is None:
+                progress_queue.put(('fail', worker_id, f"{video_name}: no frames"))
+            elif result.get('skipped'):
+                # Skipped due to flat depth
+                pct_flat = result.get('pct_flat_frames', 0)
+                progress_queue.put(('skip', worker_id, f"{video_name} ({pct_flat:.1f}% flat)"))
             else:
-                progress_queue.put(('fail', worker_id, video_name))
+                progress_queue.put(('done', worker_id, video_name))
         except Exception as e:
             progress_queue.put(('fail', worker_id, f"{video_name}: {e}\n{traceback.format_exc()}"))
     
@@ -446,12 +502,15 @@ def main():
     fov_max_degrees = vipe_config.get('fov_max_degrees')
     optimize_intrinsics = vipe_config.get('optimize_intrinsics', True)
     num_workers = vipe_config.get('num_workers', 2)
+    flat_std_threshold = vipe_config.get('flat_std_threshold', 0.1)
+    max_flat_frame_pct = vipe_config.get('max_flat_frame_pct', 20.0)
     
     print(f"Device: {device}")
     print(f"Workers: {num_workers}")
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Output format: TAPIP3D-ready .npz")
+    print(f"Flat depth filter: skip if >{max_flat_frame_pct}% of frames have std<{flat_std_threshold}")
     if fixed_fov_degrees is not None:
         opt_str = " + SLAM bounded optimization" if optimize_intrinsics else ", fixed"
         print(f"Intrinsics: Fixed FOV {fixed_fov_degrees}°{opt_str}")
@@ -532,6 +591,7 @@ def main():
     
     # Track progress
     processed = []
+    skipped = []  # Skipped due to flat depth
     failed = []
     workers_initialized = 0
     workers_finished = 0
@@ -551,6 +611,10 @@ def main():
             processed.append(data)
             pbar.update(1)
             pbar.set_postfix_str(f"W{worker_id}: {data}")
+        elif msg_type == 'skip':
+            skipped.append(data)
+            pbar.update(1)
+            tqdm.write(f"  Worker {worker_id} SKIP (flat depth): {data}")
         elif msg_type == 'fail':
             failed.append(data)
             pbar.update(1)
@@ -571,11 +635,18 @@ def main():
     # Summary
     print("\n" + "=" * 60)
     print("Processing Complete!")
-    print(f"  Processed: {len(processed)}")
+    print(f"  Saved: {len(processed)}")
+    print(f"  Skipped (flat depth): {len(skipped)}")
     print(f"  Failed: {len(failed)}")
     print(f"  Output format: TAPIP3D-ready .npz files")
+    if skipped:
+        print(f"\n  Skipped videos (>{max_flat_frame_pct}% frames with std<{flat_std_threshold}):")
+        for s in skipped[:10]:
+            print(f"    - {s}")
+        if len(skipped) > 10:
+            print(f"    ... and {len(skipped) - 10} more")
     if failed:
-        print(f"  Failed videos: {failed[:10]}{'...' if len(failed) > 10 else ''}")
+        print(f"\n  Failed videos: {failed[:10]}{'...' if len(failed) > 10 else ''}")
     if vis_flag and vis_path:
         print(f"\n  Interactive 3D Visualization:")
         print(f"    Run: vipe visualize {vis_path} --port 20540")

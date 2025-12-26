@@ -173,16 +173,22 @@
                 <div class="stat fps" id="fpsDisplay">FPS: --</div>
                 <div class="stat resolution" id="resDisplay">-- × --</div>
                 <div class="stat status" id="statusDisplay">Disconnected</div>
+                <div class="stat hands" id="handsDisplay" style="color: #22d3ee;">Hands: --</div>
+                <div class="stat pred" id="predDisplay" style="color: #c084fc;">Pred: --</div>
             </div>
             <img id="stream" alt="Video Stream">
             <div class="placeholder" id="placeholder">Waiting for connection...</div>
         </div>
         
         <div class="controls">
-            <button id="resetBtn">Reset Tracking (R)</button>
+            <input type="text" id="promptInput" placeholder="Object to detect (e.g. red block)">
+            <button id="detectBtn">Detect</button>
+            <input type="text" id="predictionPromptInput" placeholder="Prediction task">
+            <button id="promptBtn">Prompt</button>
         </div>
     </div>
     
+    <script src="config.js"></script>
     <script>
         // DOM Elements
         const streamImg = document.getElementById('stream');
@@ -190,10 +196,15 @@
         const fpsDisplay = document.getElementById('fpsDisplay');
         const resDisplay = document.getElementById('resDisplay');
         const statusDisplay = document.getElementById('statusDisplay');
+        const handsDisplay = document.getElementById('handsDisplay');
+        const predDisplay = document.getElementById('predDisplay');
         const statusIndicator = document.getElementById('statusIndicator');
         const wsUrlInput = document.getElementById('wsUrl');
         const connectBtn = document.getElementById('connectBtn');
-        const resetBtn = document.getElementById('resetBtn');
+        const promptInput = document.getElementById('promptInput');
+        const detectBtn = document.getElementById('detectBtn');
+        const predictionPromptInput = document.getElementById('predictionPromptInput');
+        const promptBtn = document.getElementById('promptBtn');
         
         // Configuration
         const RECONNECT_DELAY = 2000;
@@ -284,6 +295,37 @@
                             streamImg.src = 'data:image/jpeg;base64,' + data.frame;
                             fpsDisplay.textContent = `FPS: ${data.fps}`;
                             resDisplay.textContent = `${data.width} × ${data.height}`;
+                            
+                            // Update hand pose status
+                            if (data.hand_poses) {
+                                const hands = [];
+                                if (data.hand_poses.left) hands.push('L');
+                                if (data.hand_poses.right) hands.push('R');
+                                handsDisplay.textContent = hands.length > 0 ? `Hands: ${hands.join('+')}` : 'Hands: --';
+                                handsDisplay.style.color = hands.length > 0 ? '#22d3ee' : '#6a6a7a';
+                            } else {
+                                handsDisplay.textContent = 'Hands: --';
+                                handsDisplay.style.color = '#6a6a7a';
+                            }
+                            
+                            // Update predicted hand status
+                            if (data.predicted_hand_poses) {
+                                const predHands = [];
+                                if (data.predicted_hand_poses.left_valid) predHands.push('L');
+                                if (data.predicted_hand_poses.right_valid) predHands.push('R');
+                                const numTimesteps = data.predicted_hand_poses.num_timesteps || 0;
+                                if (predHands.length > 0) {
+                                    predDisplay.textContent = `Pred: ${predHands.join('+')} (${numTimesteps}t)`;
+                                    predDisplay.style.color = '#c084fc';  // Purple
+                                } else {
+                                    predDisplay.textContent = 'Pred: --';
+                                    predDisplay.style.color = '#6a6a7a';
+                                }
+                            } else {
+                                predDisplay.textContent = 'Pred: --';
+                                predDisplay.style.color = '#6a6a7a';
+                            }
+                            
                         }
                     } catch (e) {}
                 };
@@ -314,9 +356,25 @@
             }
         }, 1000);
         
-        function resetTracking() {
+        function setPrompt() {
+            const prompt = promptInput.value.trim();
+            if (!prompt) {
+                promptInput.focus();
+                return;
+            }
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ command: 'reset' }));
+                ws.send(JSON.stringify({ command: 'set_prompt', prompt: prompt }));
+            }
+        }
+        
+        function setPredictionPrompt() {
+            const prompt = predictionPromptInput.value.trim();
+            if (!prompt) {
+                predictionPromptInput.focus();
+                return;
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ command: 'set_prediction_prompt', prompt: prompt }));
             }
         }
         
@@ -330,16 +388,26 @@
             }
         });
         
-        resetBtn.addEventListener('click', resetTracking);
+        detectBtn.addEventListener('click', setPrompt);
+        promptBtn.addEventListener('click', setPredictionPrompt);
         
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'r' || e.key === 'R') resetTracking();
+        // Submit prompt on Enter key
+        promptInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') setPrompt();
+        });
+        predictionPromptInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') setPredictionPrompt();
         });
         
         // Auto-detect WebSocket URL from page host
         // If page is served from 192.168.x.x, use that IP for WebSocket too
         const pageHost = window.location.hostname || 'localhost';
         wsUrlInput.value = `ws://${pageHost}:8765`;
+        
+        // Pre-populate prompt from config if available
+        if (window.DEFAULT_PROMPT) {
+            promptInput.value = window.DEFAULT_PROMPT;
+        }
         
         // Auto-connect on load
         streamImg.style.display = 'none';

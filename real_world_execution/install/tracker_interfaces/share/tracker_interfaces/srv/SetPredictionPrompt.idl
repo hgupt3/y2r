@@ -1,0 +1,22 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from tracker_interfaces/srv/SetPredictionPrompt.srv
+// generated code does not contain a copyright notice
+
+
+module tracker_interfaces {
+  module srv {
+    @verbatim (language="comment", text=
+      "SetPredictionPrompt service - set the text prompt for prediction model" "\n"
+      "Request")
+    struct SetPredictionPrompt_Request {
+      string prompt;
+    };
+    @verbatim (language="comment", text=
+      "Response")
+    struct SetPredictionPrompt_Response {
+      boolean success;
+
+      string message;
+    };
+  };
+};

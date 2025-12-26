@@ -10,12 +10,12 @@ frame_stack: 2          # Number of observation frames (model will use this valu
 num_track_ts: 10         # Number of future timesteps to predict (model num_future_steps)
 num_track_ids: 32       # Number of trajectory points per frame
 downsample_factor: 1    # 1=consecutive frames, 2=every 2nd frame, etc.
-sample_stride: 3        # Minimum frame spacing between samples (1=use all, 3=at least 3 frames apart)
+sample_stride: 1        # Minimum frame spacing between samples (1=use all, 3=at least 3 frames apart)
 cache_all: true         # Cache all data in memory
 cache_image: true       # Images are stored in HDF5 file, not separately on disk
 track_type: "3d"        # "2d" or "3d" - determines data format and normalization
 hand_mode: "right"      # "left", "right", "both", or null to disable hand pose loading
-text_mode: false        # Whether to load text descriptions for language conditioning
+text_mode: true        # Whether to load text descriptions for language conditioning
 # normalization_stats.yaml is auto-detected from dataset_dir
 
 # Train/validation split configuration

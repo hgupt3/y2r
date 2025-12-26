@@ -29,13 +29,13 @@ common:
   wilor_vis_dir: "${common.base_data_dir}/wilor_vis"
   
   # Common parameters
-  detection_model: "florence-2"  # Detection model to use: "grounding-dino" or "florence-2"
+  detection_model: "sam3" # Detection model to use: "grounding-dino", "florence-2", or "sam3"
   device: "cuda:0"  # CUDA device to use across all stages
   target_fps: 10  # FPS for both extraction and visualization
   window_length: 10  # Number of frames per sliding window
   num_videos_to_process: null  # Number of videos to process (null = all)
   continue: false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
-  vis_flag: false  # Enable/disable visualization videos
+  vis_flag: true  # Enable/disable visualization videos
   stride: 1  # Step size between window starts
   
 # ===== PIPELINE STAGES =====
@@ -51,7 +51,7 @@ preprocess:
   continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam_human:
-  detection_model: ${common.detection_model}  # Detection model: "grounding-dino" or "florence-2"
+  detection_model: ${common.detection_model}  # Detection model: "grounding-dino", "florence-2", or "sam3"
   text_prompt: "person."  # Text prompt for object detection (better detection than "human.")
   key_frame_idx: -1  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
   input_images_dir: ${common.frames_dir}  # <- Input from preprocess output
@@ -78,8 +78,8 @@ diffueraser:
   continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
 
 gsam:
-  detection_model: ${common.detection_model}  # Detection model: "grounding-dino" or "florence-2"
-  text_prompt: 'small red t-shaped block.'  # Set to null to use noun from metadata.csv, or provide a string to use that for all clips
+  detection_model: ${common.detection_model}  # Detection model: "grounding-dino", "florence-2", or "sam3"
+  text_prompt: null  # Set to null to use noun from metadata.csv, or provide a string to use that for all clips
   key_frame_idx: 0  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
   input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output
   device: ${common.device}  # CUDA device to use
@@ -118,6 +118,8 @@ vipe:
   fov_min_degrees: 60
   fov_max_degrees: 90
   optimize_intrinsics: true  # SLAM can refine intrinsics, but stays within FOV bounds above
+  flat_std_threshold: 0.1  # A frame is "flat" if per-frame depth std < this value
+  max_flat_frame_pct: 10.0  # Skip video if more than this % of frames are flat
   input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output (clean frames)
   output_dir: ${common.vipe_dir}  # Where to save TAPIP3D-ready .npz files (video, depths, intrinsics, extrinsics)
   device: ${common.device}  # CUDA device to use (e.g., "cuda:0")

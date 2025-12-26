@@ -350,6 +350,7 @@
             <div class="stat resolution" id="resDisplay">-- × --</div>
             <div class="stat points" id="pointsDisplay">Points: --</div>
             <div class="stat status" id="statusDisplay">Disconnected</div>
+            <div class="stat" id="handsDisplay" style="color: #22d3ee;">Hands: --</div>
         </div>
         
         <div id="hover-info"></div>
@@ -359,7 +360,10 @@
         <div id="control-panel">
             <input type="text" id="wsUrl" placeholder="WebSocket URL">
             <button id="connectBtn">Connect</button>
-            <button id="resetBtn">Reset (R)</button>
+            <input type="text" id="promptInput" placeholder="Object to detect">
+            <button id="detectBtn">Detect</button>
+            <input type="text" id="predictionPromptInput" placeholder="Prediction task">
+            <button id="promptBtn">Prompt</button>
             <button id="resetViewBtn">Reset View</button>
             <button id="settingsBtn">Settings</button>
         </div>
@@ -402,6 +406,18 @@
                     <input type="range" id="frustumSize" min="0.1" max="1" step="0.05" value="0.3">
                 </div>
             </div>
+            
+            <div class="settings-group">
+                <h3>Hand Poses</h3>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="showHandAxes" checked>
+                    <label for="showHandAxes">Show Hand Axes</label>
+                </div>
+                <div class="slider-row">
+                    <label>Axis Length</label>
+                    <input type="range" id="handAxisLength" min="0.02" max="0.15" step="0.01" value="0.05">
+                </div>
+            </div>
         </div>
     </div>
     
@@ -409,6 +425,9 @@
         <div class="spinner"></div>
         <div class="loading-text">Initializing 3D Viewer...</div>
     </div>
+    
+    <!-- Config from server -->
+    <script src="config.js"></script>
     
     <!-- Three.js Libraries -->
     <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
@@ -442,6 +461,7 @@
                 this.backgroundTexture = null;
                 this.pointCloud = null;
                 this.pointCloudData = null;  // Store pixel coords for hover lookup
+                this.pointCloudCallId = 0;   // Track async calls to prevent race conditions
                 
                 // Raycaster for hover detection
                 this.raycaster = new THREE.Raycaster();
@@ -463,16 +483,26 @@
                 // Camera frustum
                 this.cameraFrustum = null;
                 
+                // Hand pose axes
+                this.handAxes = { left: null, right: null };
+                
+                // Predicted hand pose trajectories
+                this.predictedHandGroups = { left: null, right: null };
+                
                 // UI Elements
                 this.ui = {
                     fpsDisplay: document.getElementById('fpsDisplay'),
                     resDisplay: document.getElementById('resDisplay'),
                     pointsDisplay: document.getElementById('pointsDisplay'),
                     statusDisplay: document.getElementById('statusDisplay'),
+                    handsDisplay: document.getElementById('handsDisplay'),
                     statusIndicator: document.getElementById('statusIndicator'),
                     wsUrl: document.getElementById('wsUrl'),
                     connectBtn: document.getElementById('connectBtn'),
-                    resetBtn: document.getElementById('resetBtn'),
+                    promptInput: document.getElementById('promptInput'),
+                    detectBtn: document.getElementById('detectBtn'),
+                    predictionPromptInput: document.getElementById('predictionPromptInput'),
+                    promptBtn: document.getElementById('promptBtn'),
                     resetViewBtn: document.getElementById('resetViewBtn'),
                     settingsBtn: document.getElementById('settingsBtn'),
                     settingsPanel: document.getElementById('settings-panel'),
@@ -482,7 +512,9 @@
                     showPointCloud: document.getElementById('showPointCloud'),
                     pointSize: document.getElementById('pointSize'),
                     showFrustum: document.getElementById('showFrustum'),
-                    frustumSize: document.getElementById('frustumSize')
+                    frustumSize: document.getElementById('frustumSize'),
+                    showHandAxes: document.getElementById('showHandAxes'),
+                    handAxisLength: document.getElementById('handAxisLength')
                 };
                 
                 this.initThreeJS();
@@ -620,9 +652,8 @@
                     return;
                 }
                 
-                // Store old point cloud to remove AFTER new one is ready
-                const oldPointCloud = this.pointCloud;
-                const oldPointCloudData = this.pointCloudData;
+                // Use unique ID to track which call this is - newer calls invalidate older ones
+                const callId = ++this.pointCloudCallId;
                 
                 // Decode both images using canvas
                 const depthImg = new Image();
@@ -632,6 +663,9 @@
                 
                 const createPointCloud = () => {
                     if (!depthLoaded || !rgbLoaded) return;
+                    
+                    // Skip if a newer call has started (race condition prevention)
+                    if (callId !== this.pointCloudCallId) return;
                     
                     const canvas = document.createElement('canvas');
                     const ctx = canvas.getContext('2d');
@@ -687,15 +721,16 @@
                     });
                     
                     const newPointCloud = new THREE.Points(geometry, material);
-                    this.scene.add(newPointCloud);
                     
-                    // NOW remove old point cloud (after new one is added)
-                    if (oldPointCloud) {
-                        this.scene.remove(oldPointCloud);
-                        oldPointCloud.geometry.dispose();
-                        oldPointCloud.material.dispose();
+                    // Remove old point cloud FIRST (use this.pointCloud directly, not captured closure)
+                    if (this.pointCloud) {
+                        this.scene.remove(this.pointCloud);
+                        this.pointCloud.geometry.dispose();
+                        this.pointCloud.material.dispose();
                     }
                     
+                    // Then add new one
+                    this.scene.add(newPointCloud);
                     this.pointCloud = newPointCloud;
                     this.pointCloudData = newPointCloudData;
                 };
@@ -753,7 +788,14 @@
                     }
                 });
                 
-                this.ui.resetBtn.addEventListener('click', () => this.resetTracking());
+                this.ui.detectBtn.addEventListener('click', () => this.setPrompt());
+                this.ui.promptInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') this.setPrompt();
+                });
+                this.ui.promptBtn.addEventListener('click', () => this.setPredictionPrompt());
+                this.ui.predictionPromptInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') this.setPredictionPrompt();
+                });
                 this.ui.resetViewBtn.addEventListener('click', () => this.resetView());
                 
                 this.ui.settingsBtn.addEventListener('click', () => {
@@ -762,7 +804,6 @@
                 });
                 
                 document.addEventListener('keydown', (e) => {
-                    if (e.key === 'r' || e.key === 'R') this.resetTracking();
                     if (e.key === 'Escape') {
                         this.ui.settingsPanel.classList.remove('visible');
                         this.ui.settingsBtn.classList.remove('active');
@@ -786,6 +827,17 @@
                 });
                 this.ui.frustumSize.addEventListener('input', () => this.updateCameraFrustum());
                 
+                // Hand pose settings
+                this.ui.showHandAxes.addEventListener('change', () => {
+                    if (this.handAxes.left) this.handAxes.left.visible = this.ui.showHandAxes.checked;
+                    if (this.handAxes.right) this.handAxes.right.visible = this.ui.showHandAxes.checked;
+                    if (this.predictedHandGroups.left) this.predictedHandGroups.left.visible = this.ui.showHandAxes.checked;
+                    if (this.predictedHandGroups.right) this.predictedHandGroups.right.visible = this.ui.showHandAxes.checked;
+                });
+                this.ui.handAxisLength.addEventListener('input', () => {
+                    // Will be applied on next update
+                });
+                
                 // Stale check
                 setInterval(() => {
                     if (this.streaming && Date.now() - this.lastFrameTime > 5000) {
@@ -799,6 +851,12 @@
             autoConnect() {
                 const pageHost = window.location.hostname || 'localhost';
                 this.ui.wsUrl.value = `ws://${pageHost}:8765`;
+                
+                // Pre-populate prompt from config if available
+                if (window.DEFAULT_PROMPT) {
+                    this.ui.promptInput.value = window.DEFAULT_PROMPT;
+                }
+                
                 this.connect();
             }
             
@@ -896,6 +954,20 @@
                     this.updateTrajectories(data.trajectories);
                 }
                 
+                // Update hand poses
+                if (data.hand_poses) {
+                    this.updateHandPoses(data.hand_poses);
+                } else {
+                    this.clearHandPoses();
+                }
+                
+                // Update predicted hand poses
+                if (data.predicted_hand_poses) {
+                    this.updatePredictedHandPoses(data.predicted_hand_poses);
+                } else {
+                    this.clearPredictedHandPoses();
+                }
+                
                 // Update UI stats
                 this.ui.fpsDisplay.textContent = `FPS: ${data.fps || '--'}`;
                 this.ui.resDisplay.textContent = `${data.width || '--'} × ${data.height || '--'}`;
@@ -904,6 +976,19 @@
                 const numTrajPoints = data.trajectories ? 
                     (data.trajectories.traj_x ? data.trajectories.traj_x.length : 0) : 0;
                 this.ui.pointsDisplay.textContent = `PC: ${numPcPoints} | Traj: ${numTrajPoints}`;
+                
+                // Update hand pose status
+                if (data.hand_poses) {
+                    const hands = [];
+                    if (data.hand_poses.left) hands.push('L');
+                    if (data.hand_poses.right) hands.push('R');
+                    this.ui.handsDisplay.textContent = hands.length > 0 ? `Hands: ${hands.join('+')}` : 'Hands: --';
+                    this.ui.handsDisplay.style.color = hands.length > 0 ? '#22d3ee' : '#6a6a7a';
+                } else {
+                    this.ui.handsDisplay.textContent = 'Hands: --';
+                    this.ui.handsDisplay.style.color = '#6a6a7a';
+                }
+                
             }
             
             getGradientColor(ratio) {
@@ -1051,9 +1136,255 @@
                 });
             }
             
-            resetTracking() {
+            updateHandPoses(handPoses) {
+                const axisLength = parseFloat(this.ui.handAxisLength.value);
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                
+                for (const side of ['left', 'right']) {
+                    const handData = handPoses[side];
+                    
+                    // Remove existing axes for this side
+                    if (this.handAxes[side]) {
+                        this.scene.remove(this.handAxes[side]);
+                        this.handAxes[side].children.forEach(child => {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) child.material.dispose();
+                        });
+                        this.handAxes[side] = null;
+                    }
+                    
+                    if (!handData || !handData.valid) continue;
+                    
+                    const u = handData.u;
+                    const v = handData.v;
+                    const depth = handData.depth;
+                    const rotation = handData.rotation;
+                    
+                    // Skip if depth is invalid
+                    if (depth === null || isNaN(depth) || depth <= 0) continue;
+                    
+                    // Unproject wrist to 3D
+                    const wrist3D = this.unproject(u, v, depth);
+                    
+                    // Create rotation matrix from flat array (row-major)
+                    const rotMatrix = new THREE.Matrix4();
+                    rotMatrix.set(
+                        rotation[0], rotation[1], rotation[2], 0,
+                        rotation[3], rotation[4], rotation[5], 0,
+                        rotation[6], rotation[7], rotation[8], 0,
+                        0, 0, 0, 1
+                    );
+                    
+                    // Create axes group
+                    const axesGroup = new THREE.Group();
+                    
+                    // Axis colors: X=Red, Y=Green, Z=Blue
+                    const axisColors = [0xff0000, 0x00ff00, 0x0000ff];
+                    
+                    for (let i = 0; i < 3; i++) {
+                        // Get axis direction from rotation matrix column
+                        const axisDir = new THREE.Vector3(rotation[i], rotation[i + 3], rotation[i + 6]);
+                        
+                        // Flip Y to match Three.js coordinate system (same as unproject)
+                        axisDir.y = -axisDir.y;
+                        
+                        // Compute end point
+                        const endPoint = wrist3D.clone().add(axisDir.multiplyScalar(axisLength));
+                        
+                        // Create line geometry
+                        const lineGeometry = new THREE.LineGeometry();
+                        lineGeometry.setPositions([
+                            wrist3D.x, wrist3D.y, wrist3D.z,
+                            endPoint.x, endPoint.y, endPoint.z
+                        ]);
+                        
+                        const lineMaterial = new THREE.LineMaterial({
+                            color: axisColors[i],
+                            linewidth: 4,
+                            resolution: resolution
+                        });
+                        
+                        const line = new THREE.Line2(lineGeometry, lineMaterial);
+                        axesGroup.add(line);
+                    }
+                    
+                    // Add wrist sphere
+                    const sphereGeometry = new THREE.SphereGeometry(0.01, 16, 16);
+                    const sphereColor = side === 'left' ? 0x00ffff : 0xff00ff;  // Cyan for left, Magenta for right
+                    const sphereMaterial = new THREE.MeshBasicMaterial({ color: sphereColor });
+                    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+                    sphere.position.copy(wrist3D);
+                    axesGroup.add(sphere);
+                    
+                    axesGroup.visible = this.ui.showHandAxes.checked;
+                    this.scene.add(axesGroup);
+                    this.handAxes[side] = axesGroup;
+                }
+            }
+            
+            clearHandPoses() {
+                for (const side of ['left', 'right']) {
+                    if (this.handAxes[side]) {
+                        this.scene.remove(this.handAxes[side]);
+                        this.handAxes[side].children.forEach(child => {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) child.material.dispose();
+                        });
+                        this.handAxes[side] = null;
+                    }
+                }
+            }
+            
+            updatePredictedHandPoses(predictedHandPoses) {
+                const axisLength = parseFloat(this.ui.handAxisLength.value);
+                const resolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+                
+                // Color gradients: start -> end for trajectory
+                const colors = {
+                    left: { start: 0x00ffff, end: 0xffffff },   // Cyan to white
+                    right: { start: 0xff00ff, end: 0xffffff }   // Magenta to white
+                };
+                
+                for (const side of ['left', 'right']) {
+                    // Clear existing predicted hand group
+                    if (this.predictedHandGroups[side]) {
+                        this.scene.remove(this.predictedHandGroups[side]);
+                        this.predictedHandGroups[side].traverse(child => {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) child.material.dispose();
+                        });
+                        this.predictedHandGroups[side] = null;
+                    }
+                    
+                    const validKey = `${side}_valid`;
+                    if (!predictedHandPoses[validKey]) continue;
+                    
+                    const handData = predictedHandPoses[side];
+                    if (!handData) continue;
+                    
+                    const trajU = handData.trajectory_u;
+                    const trajV = handData.trajectory_v;
+                    const trajD = handData.trajectory_d;
+                    const finalRotation = handData.final_rotation;
+                    
+                    const T = trajU.length;
+                    if (T === 0) continue;
+                    
+                    const group = new THREE.Group();
+                    const sideColors = colors[side];
+                    
+                    // Build 3D positions for trajectory
+                    const positions = [];
+                    for (let t = 0; t < T; t++) {
+                        const depth = trajD[t];
+                        if (depth <= 0) continue;
+                        const pos = this.unproject(trajU[t], trajV[t], depth);
+                        positions.push(pos);
+                    }
+                    
+                    if (positions.length < 2) continue;
+                    
+                    // Draw trajectory with gradient segments
+                    for (let t = 0; t < positions.length - 1; t++) {
+                        const alpha = t / Math.max(1, positions.length - 1);
+                        const startColor = new THREE.Color(sideColors.start);
+                        const endColor = new THREE.Color(sideColors.end);
+                        const segColor = startColor.lerp(endColor, alpha);
+                        
+                        const lineGeometry = new THREE.LineGeometry();
+                        lineGeometry.setPositions([
+                            positions[t].x, positions[t].y, positions[t].z,
+                            positions[t + 1].x, positions[t + 1].y, positions[t + 1].z
+                        ]);
+                        
+                        const lineMaterial = new THREE.LineMaterial({
+                            color: segColor,
+                            linewidth: 3,
+                            resolution: resolution
+                        });
+                        
+                        const line = new THREE.Line2(lineGeometry, lineMaterial);
+                        group.add(line);
+                    }
+                    
+                    // Draw endpoint sphere
+                    const endPos = positions[positions.length - 1];
+                    const sphereGeometry = new THREE.SphereGeometry(0.012, 16, 16);
+                    const sphereMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+                    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+                    sphere.position.copy(endPos);
+                    group.add(sphere);
+                    
+                    // Draw rotation axes at endpoint
+                    if (finalRotation && finalRotation.length === 9) {
+                        const axisColors = [0xff0000, 0x00ff00, 0x0000ff];  // X, Y, Z
+                        
+                        for (let i = 0; i < 3; i++) {
+                            const axisDir = new THREE.Vector3(
+                                finalRotation[i], 
+                                finalRotation[i + 3], 
+                                finalRotation[i + 6]
+                            );
+                            // Flip Y to match Three.js coordinate system
+                            axisDir.y = -axisDir.y;
+                            
+                            const axisEndPoint = endPos.clone().add(axisDir.multiplyScalar(axisLength));
+                            
+                            const axisGeometry = new THREE.LineGeometry();
+                            axisGeometry.setPositions([
+                                endPos.x, endPos.y, endPos.z,
+                                axisEndPoint.x, axisEndPoint.y, axisEndPoint.z
+                            ]);
+                            
+                            const axisMaterial = new THREE.LineMaterial({
+                                color: axisColors[i],
+                                linewidth: 3,
+                                resolution: resolution
+                            });
+                            
+                            const axisLine = new THREE.Line2(axisGeometry, axisMaterial);
+                            group.add(axisLine);
+                        }
+                    }
+                    
+                    group.visible = this.ui.showHandAxes.checked;
+                    this.scene.add(group);
+                    this.predictedHandGroups[side] = group;
+                }
+            }
+            
+            clearPredictedHandPoses() {
+                for (const side of ['left', 'right']) {
+                    if (this.predictedHandGroups[side]) {
+                        this.scene.remove(this.predictedHandGroups[side]);
+                        this.predictedHandGroups[side].traverse(child => {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) child.material.dispose();
+                        });
+                        this.predictedHandGroups[side] = null;
+                    }
+                }
+            }
+            
+            setPrompt() {
+                const prompt = this.ui.promptInput.value.trim();
+                if (!prompt) {
+                    this.ui.promptInput.focus();
+                    return;
+                }
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({ command: 'reset' }));
+                    this.ws.send(JSON.stringify({ command: 'set_prompt', prompt: prompt }));
+                }
+            }
+            
+            setPredictionPrompt() {
+                const prompt = this.ui.predictionPromptInput.value.trim();
+                if (!prompt) {
+                    this.ui.predictionPromptInput.focus();
+                    return;
+                }
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({ command: 'set_prediction_prompt', prompt: prompt }));
                 }
             }
             
