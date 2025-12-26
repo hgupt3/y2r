@@ -57,3 +57,4 @@ wandb/
 .cursor/
 
 epics_kitchen/
+misc/test_visualizations
