@@ -11,7 +11,7 @@ import timm
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 
-from y2r.models.blocks import EfficientUpdateFormer, Mlp
+from y2r.models.blocks import EfficientUpdateFormer, DiTUpdateFormer, Mlp
 from y2r.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_embedding
 from y2r.models.model_utils import extend_vit_to_rgbd
 from y2r.models.model_config import get_model_config, ENCODING_DIMS
@@ -23,7 +23,7 @@ class BaseIntentTracker(nn.Module, ABC):
     
     This class provides shared functionality including:
     - ViT encoder (DINOv3) for visual feature extraction
-    - SigLIP2 text encoder for language conditioning
+    - UMT5 text encoder for language conditioning
     - Temporal embeddings for observation and prediction timesteps
     - Common encoding utilities (position encoding, etc.)
     - Encoder freezing/unfreezing methods for curriculum learning
@@ -124,18 +124,23 @@ class BaseIntentTracker(nn.Module, ABC):
         self.register_buffer("obs_time_emb", obs_time_emb.squeeze(0))  # (frame_stack, hidden_size)
         
         # =========================================================================
-        # Text Encoder (SigLIP2) - Optional
+        # Text Encoder (UMT5) - Optional
         # =========================================================================
         if text_mode:
-            from transformers import AutoTokenizer, SiglipTextModel
-            siglip_model_name = cfg['siglip_model_name']
+            from transformers import AutoTokenizer, T5EncoderModel
+            text_model_name = cfg['text_model_name']
             text_embed_dim = cfg['text_embed_dim']
-            
-            self.text_tokenizer = AutoTokenizer.from_pretrained(siglip_model_name)
-            self.text_encoder = SiglipTextModel.from_pretrained(siglip_model_name)
-            self.text_proj = nn.Linear(text_embed_dim, hidden_size)
-            
-            # Freeze text encoder initially (will be unfrozen during training)
+
+            self.text_tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+            self.text_encoder = T5EncoderModel.from_pretrained(text_model_name)
+
+            # Project UMT5 embeddings to hidden_size if dimensions don't match
+            if text_embed_dim != hidden_size:
+                self.text_proj = nn.Linear(text_embed_dim, hidden_size)
+            else:
+                self.text_proj = nn.Identity()
+
+            # Freeze text encoder (UMT5 is always frozen)
             for param in self.text_encoder.parameters():
                 param.requires_grad = False
     
@@ -190,39 +195,41 @@ class BaseIntentTracker(nn.Module, ABC):
     
     def encode_text(self, text_list: List[str]) -> torch.Tensor:
         """
-        Encode batch of text strings using SigLIP2 text encoder.
-        
+        Encode batch of text strings using UMT5 encoder.
+
         Args:
             text_list: List of B text strings
-            
+
         Returns:
-            text_tokens: (B, 1, hidden_size) - Text embeddings projected to hidden_size
+            text_tokens: (B, L, hidden_size) - Sequence of text token embeddings
+                        where L is the number of tokens (varies by text length)
         """
         if not self.text_mode:
             raise RuntimeError("encode_text called but text_mode is False")
-        
+
         # Tokenize text
         inputs = self.text_tokenizer(
-            text_list, 
-            padding=True, 
+            text_list,
+            padding=True,
             truncation=True,
             max_length=64,
             return_tensors='pt'
         )
-        
+
         # Move to same device as model
-        inputs = {k: v.to(self.text_proj.weight.device) for k, v in inputs.items()}
-        
-        # Encode with SigLIP text encoder
-        with torch.set_grad_enabled(self.text_encoder.training):
+        device = next(self.text_encoder.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # Encode with UMT5 text encoder (always no grad since frozen)
+        with torch.no_grad():
             outputs = self.text_encoder(**inputs)
-        
-        # Use pooled output (CLS token)
-        text_emb = outputs.pooler_output  # (B, text_embed_dim)
-        
-        # Project to hidden_size and add sequence dimension
-        text_tokens = self.text_proj(text_emb).unsqueeze(1)  # (B, 1, hidden_size)
-        
+
+        # Get sequence of token embeddings (B, L, text_embed_dim)
+        text_emb = outputs.last_hidden_state
+
+        # Project to hidden_size: (B, L, text_embed_dim) -> (B, L, hidden_size)
+        text_tokens = self.text_proj(text_emb)
+
         return text_tokens
     
     # =========================================================================
@@ -292,7 +299,7 @@ class BaseIntentTracker(nn.Module, ABC):
         if self.text_mode and hasattr(self, 'text_encoder'):
             for param in self.text_encoder.parameters():
                 param.requires_grad = False
-        print("Encoders frozen (ViT" + (" + SigLIP" if self.text_mode else "") + ")")
+        print("Encoders frozen (ViT" + (" + UMT5" if self.text_mode else "") + ")")
     
     def unfreeze_encoders(self):
         """Unfreeze both ViT and text encoder (if text_mode is enabled)."""
@@ -301,7 +308,7 @@ class BaseIntentTracker(nn.Module, ABC):
         if self.text_mode and hasattr(self, 'text_encoder'):
             for param in self.text_encoder.parameters():
                 param.requires_grad = True
-        print("Encoders unfrozen (ViT" + (" + SigLIP" if self.text_mode else "") + ")")
+        print("Encoders unfrozen (ViT" + (" + UMT5" if self.text_mode else "") + ")")
     
     def set_encoders_frozen(self, frozen: bool):
         """Set the frozen state for both encoders."""
@@ -368,19 +375,40 @@ class BaseIntentTracker(nn.Module, ABC):
     # Helper Methods for Subclasses
     # =========================================================================
     
-    def _create_updateformer(self) -> EfficientUpdateFormer:
-        """Create the UpdateFormer transformer with current configuration."""
-        return EfficientUpdateFormer(
-            depth=self.time_depth,
-            input_dim=self.hidden_size,
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
-            output_dim=self.hidden_size,
-            mlp_ratio=self.mlp_ratio,
-            add_space_attn=self.add_space_attn,
-            p_drop_attn=self.p_drop_attn,
-            linear_layer_for_vis_conf=False,
-        )
+    def _create_updateformer(self, use_dit: bool = False):
+        """
+        Create the UpdateFormer transformer with current configuration.
+
+        Args:
+            use_dit: If True, use DiTUpdateFormer with adaLN conditioning.
+                    If False, use standard EfficientUpdateFormer.
+
+        Returns:
+            UpdateFormer module (either DiT or standard variant)
+        """
+        if use_dit:
+            return DiTUpdateFormer(
+                depth=self.time_depth,
+                input_dim=self.hidden_size,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                output_dim=self.hidden_size,
+                mlp_ratio=self.mlp_ratio,
+                add_space_attn=self.add_space_attn,
+                p_drop_attn=self.p_drop_attn,
+            )
+        else:
+            return EfficientUpdateFormer(
+                depth=self.time_depth,
+                input_dim=self.hidden_size,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                output_dim=self.hidden_size,
+                mlp_ratio=self.mlp_ratio,
+                add_space_attn=self.add_space_attn,
+                p_drop_attn=self.p_drop_attn,
+                linear_layer_for_vis_conf=False,
+            )
     
     def _create_track_encoder(self, input_dim: int) -> Mlp:
         """Create track token encoder MLP."""

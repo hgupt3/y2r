@@ -655,3 +655,353 @@ class EfficientUpdateFormer(nn.Module):
             flow = torch.cat([flow, vis_conf], dim=-1)
 
         return flow
+
+
+#################################################################################
+#                    DiT Components (Diffusion Transformer)                    #
+#################################################################################
+# Adapted from: https://github.com/facebookresearch/DiT
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+def modulate(x, shift, scale):
+    """Apply affine modulation to layer norm output."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    Copied from DiT (Diffusion Transformer).
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(max_period)) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class DiTAttnBlock(nn.Module):
+    """
+    Self-attention block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    Adapted from DiT for use with factorized space-time attention.
+    """
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        attn_class=Attention,
+        drop=0.0,
+        **block_kwargs
+    ):
+        super().__init__()
+        # LayerNorms without learnable parameters (adaLN will provide them)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        # Attention
+        dim_head = hidden_size // num_heads
+        self.attn = attn_class(
+            hidden_size, num_heads=num_heads, dim_head=dim_head, qkv_bias=True, **block_kwargs
+        )
+
+        # MLP
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=drop,
+        )
+
+        # Adaptive modulation: produces 6 parameters (shift, scale, gate) x 2
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c, mask=None):
+        """
+        Args:
+            x: (B, N, C) input tokens
+            c: (B, C) conditioning vector (timestep embedding)
+            mask: optional attention mask
+        """
+        # Split modulation parameters
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=1)
+
+        # Attention block with modulation
+        attn_bias = None
+        if mask is not None:
+            # Handle mask (same logic as AttnBlock)
+            num_heads = self.attn.heads
+            B, seq_len = x.shape[0], x.shape[1]
+            mask_expanded = mask.unsqueeze(0).unsqueeze(0).expand(B, num_heads, seq_len, seq_len)
+            max_neg_value = -torch.finfo(x.dtype).max
+            attn_bias = torch.where(mask_expanded, torch.zeros_like(mask_expanded, dtype=x.dtype),
+                                   torch.full_like(mask_expanded, max_neg_value, dtype=x.dtype))
+
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            attn_bias=attn_bias
+        )
+
+        # MLP block with modulation
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
+
+        return x
+
+
+class DiTCrossAttnBlock(nn.Module):
+    """
+    Cross-attention block with adaptive layer norm (adaLN-Zero).
+    Queries attend to context (scene tokens), conditioned on timestep.
+    """
+    def __init__(
+        self,
+        hidden_size,
+        context_dim,
+        num_heads,
+        mlp_ratio=4.0,
+        drop=0.0,
+        **block_kwargs
+    ):
+        super().__init__()
+        # LayerNorms without learnable parameters (query side)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # Context norm is standard (not conditioned)
+        self.norm_context = nn.LayerNorm(hidden_size)
+
+        # Cross-attention
+        dim_head = hidden_size // num_heads
+        self.cross_attn = Attention(
+            hidden_size,
+            context_dim=context_dim,
+            num_heads=num_heads,
+            dim_head=dim_head,
+            qkv_bias=True,
+            **block_kwargs
+        )
+
+        # MLP
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=drop,
+        )
+
+        # Adaptive modulation for query and MLP (6 params)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, context, c, mask=None):
+        """
+        Args:
+            x: (B, N, C) query tokens
+            context: (B, M, C) key/value tokens (scene features)
+            c: (B, C) conditioning vector (timestep embedding)
+            mask: optional attention mask
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=1)
+
+        # Cross-attention with modulation
+        attn_bias = None
+        if mask is not None:
+            # Handle context masking
+            if mask.shape[1] == x.shape[1]:
+                mask = mask[:, None, :, None].expand(-1, self.cross_attn.heads, -1, context.shape[1])
+            else:
+                mask = mask[:, None, None].expand(-1, self.cross_attn.heads, x.shape[1], -1)
+            max_neg_value = -torch.finfo(x.dtype).max
+            attn_bias = (~mask) * max_neg_value
+
+        x = x + gate_msa.unsqueeze(1) * self.cross_attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            context=self.norm_context(context),
+            attn_bias=attn_bias
+        )
+
+        # MLP with modulation
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
+
+        return x
+
+
+class DiTUpdateFormer(nn.Module):
+    """
+    Transformer with DiT-style conditioning for diffusion trajectory prediction.
+
+    Uses factorized space-time attention with timestep conditioning:
+    1. Cross-attention to scene tokens (conditioned)
+    2. Spatial self-attention (conditioned)
+    3. Temporal self-attention (conditioned)
+
+    Each block is modulated by diffusion timestep via adaLN.
+    """
+    def __init__(
+        self,
+        depth=6,
+        input_dim=320,
+        hidden_size=384,
+        num_heads=8,
+        output_dim=130,
+        mlp_ratio=4.0,
+        add_space_attn=True,
+        p_drop_attn=0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.add_space_attn = add_space_attn
+
+        # Input projection
+        self.input_transform = nn.Linear(input_dim, hidden_size, bias=True) if input_dim != hidden_size else nn.Identity()
+
+        # Output head (simple linear, no conditioning)
+        self.flow_head = nn.Linear(hidden_size, output_dim, bias=True)
+
+        # DiT blocks
+        self.scene_cross_attn_blocks = nn.ModuleList([
+            DiTCrossAttnBlock(
+                hidden_size,
+                context_dim=hidden_size,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                drop=p_drop_attn
+            ) for _ in range(depth)
+        ])
+
+        if add_space_attn:
+            self.space_attn_blocks = nn.ModuleList([
+                DiTAttnBlock(
+                    hidden_size,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_class=Attention,
+                    drop=p_drop_attn
+                ) for _ in range(depth)
+            ])
+
+        self.time_attn_blocks = nn.ModuleList([
+            DiTAttnBlock(
+                hidden_size,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                attn_class=Attention,
+                drop=p_drop_attn
+            ) for _ in range(depth)
+        ])
+
+        # Initialize weights with DiT-style zero-init
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Initialize with DiT's adaLN-Zero: zero-out gate parameters."""
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        # Zero-out adaLN modulation layers (gates start at 0)
+        for block in self.scene_cross_attn_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        if self.add_space_attn:
+            for block in self.space_attn_blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        for block in self.time_attn_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, all_tokens, scene_tokens, timestep_cond, scene_mask=None, causal_mask=None):
+        """
+        Args:
+            all_tokens: (B, N, T, C) - Track (+ hand) tokens
+            scene_tokens: (B, M, C) - Scene context tokens (ViT features + text)
+            timestep_cond: (B, C) - Diffusion timestep conditioning vector
+            scene_mask: optional mask for scene tokens
+            causal_mask: optional causal mask for temporal attention
+
+        Returns:
+            output: (B, N, T, C) - Updated tokens
+        """
+        B, N, T, C = all_tokens.shape
+
+        # Input projection
+        x = self.input_transform(all_tokens)
+
+        # Process through DiT blocks
+        for i in range(self.depth):
+            # 1. Cross-attention to scene (all NT tokens attend to scene)
+            x_flat = x.view(B, N * T, C)
+            x_flat = self.scene_cross_attn_blocks[i](
+                x_flat, scene_tokens, timestep_cond, mask=scene_mask
+            )
+            x = x_flat.view(B, N, T, C)
+
+            # 2. Spatial attention (tokens at same t attend to each other)
+            if self.add_space_attn:
+                x_space = x.permute(0, 2, 1, 3).reshape(B * T, N, C)  # (B*T, N, C)
+                # Repeat timestep_cond for each timestep
+                timestep_cond_space = timestep_cond.unsqueeze(1).repeat(1, T, 1).view(B * T, C)
+                x_space = self.space_attn_blocks[i](x_space, timestep_cond_space)
+                x = x_space.view(B, T, N, C).permute(0, 2, 1, 3)  # (B, N, T, C)
+
+            # 3. Temporal attention (same position across t attend)
+            x_time = x.permute(0, 1, 2, 3).reshape(B * N, T, C)  # (B*N, T, C)
+            timestep_cond_time = timestep_cond.unsqueeze(1).repeat(1, N, 1).view(B * N, C)
+            x_time = self.time_attn_blocks[i](x_time, timestep_cond_time, mask=causal_mask)
+            x = x_time.view(B, N, T, C)
+
+        # Output head
+        output = self.flow_head(x)
+
+        return output

@@ -13,9 +13,9 @@ MODEL_SIZE_CONFIGS = {
         'mlp_ratio': 4.0,
         'time_depth': 6,
         'vit_model_name': 'vit_small_patch16_dinov3',
-        # SigLIP2 for text encoding (conservative: s/b use base, l uses large)
-        'siglip_model_name': 'google/siglip-base-patch16-224',
-        'text_embed_dim': 768,
+        # UMT5 for text encoding (always frozen)
+        'text_model_name': 'google/umt5-small',
+        'text_embed_dim': 512,  # UMT5-small d_model
     },
     'b': {
         'hidden_size': 768,
@@ -23,8 +23,8 @@ MODEL_SIZE_CONFIGS = {
         'mlp_ratio': 4.0,
         'time_depth': 12,
         'vit_model_name': 'vit_base_patch16_dinov3',
-        'siglip_model_name': 'google/siglip-base-patch16-224',
-        'text_embed_dim': 768,
+        'text_model_name': 'google/umt5-base',
+        'text_embed_dim': 768,  # UMT5-base d_model (perfect match!)
     },
     'l': {
         'hidden_size': 1024,
@@ -32,8 +32,8 @@ MODEL_SIZE_CONFIGS = {
         'mlp_ratio': 4.0,
         'time_depth': 24,
         'vit_model_name': 'vit_large_patch16_dinov3',
-        'siglip_model_name': 'google/siglip-large-patch16-256',
-        'text_embed_dim': 1152,
+        'text_model_name': 'google/umt5-large',
+        'text_embed_dim': 1024,  # UMT5-large d_model (perfect match!)
     },
 }
 
@@ -59,16 +59,16 @@ ENCODING_DIMS = {
 def get_model_config(model_size: str) -> dict:
     """
     Get model configuration for a given size.
-    
+
     Args:
         model_size: One of 's' (small), 'b' (base), 'l' (large)
-        
+
     Returns:
         Dictionary with:
             - hidden_size, num_heads, mlp_ratio, time_depth
             - vit_model_name (DINOv3 variant)
-            - siglip_model_name, text_embed_dim (SigLIP2 for text encoding)
-        
+            - text_model_name, text_embed_dim (UMT5 for text encoding, always frozen)
+
     Raises:
         ValueError: If model_size is not recognized
     """

@@ -10,7 +10,9 @@ model:
   model_size: 's'               # 's' (small), 'b' (base), or 'l' (large) - sets hidden_size, num_heads, time_depth, vit_model
   track_type: '2d'              # '2d' or '3d' - must match dataset_config.yaml
   hand_mode: null               # 'left', 'right', 'both', or null - must match dataset_config.yaml
-  text_mode: false              # Enable text/language conditioning
+  text_mode: false              # Enable text/language conditioning with UMT5 encoder (always frozen)
+  enable_cfg: false             # Classifier-Free Guidance (only used when text_mode=true)
+  cfg_dropout_prob: 0.1         # Probability of dropping text during training for CFG
   # Note: num_future_steps, frame_stack are derived from dataset_config
   model_resolution: [256, 256]
   add_space_attn: true
@@ -42,8 +44,8 @@ training:
   use_compile: true             # torch.compile for speed
   ema_decay: 0.999              # Model EMA
   
-  # Encoder unfreezing schedule (curriculum learning for ViT + SigLIP)
-  unfreeze_after: 0.3           # Unfreeze encoders at 30% of training (0.0 = always unfrozen)
+  # Encoder unfreezing schedule (curriculum learning for ViT; UMT5 always frozen)
+  unfreeze_after: 0.0           # Unfreeze ViT at 30% of training (0.0 = always unfrozen)
   
   # Learning rate schedule (cosine with warmup)
   lr_schedule: "cosine"

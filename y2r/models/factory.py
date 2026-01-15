@@ -87,7 +87,7 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
         if hand_mode:
             print(f"  Hand mode enabled: {hand_mode}")
         if text_mode:
-            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
+            print(f"  Text mode enabled: umt5={size_cfg['text_model_name']}")
     
     elif model_type == 'diffusion':
         print(f"Creating DiffusionIntentTracker model (size={model_size})...")
@@ -109,12 +109,16 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
             'num_inference_steps': getattr(cfg.model, 'num_inference_steps', 10),
             'disp_mean': disp_stats['displacement_mean'],
             'disp_std': disp_stats['displacement_std'],
+            'enable_cfg': getattr(cfg.model, 'enable_cfg', False),
+            'cfg_dropout_prob': getattr(cfg.model, 'cfg_dropout_prob', 0.1),
         }
         model = DiffusionIntentTracker(**diffusion_params)
         if hand_mode:
             print(f"  Hand mode enabled: {hand_mode}")
         if text_mode:
-            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
+            print(f"  Text mode enabled: umt5={size_cfg['text_model_name']}")
+            if getattr(cfg.model, 'enable_cfg', False):
+                print(f"  CFG enabled: dropout_prob={getattr(cfg.model, 'cfg_dropout_prob', 0.1)}")
     
     elif model_type == 'autoreg':
         print(f"Creating AutoregressiveIntentTracker model (size={model_size})...")
@@ -124,7 +128,7 @@ def create_model(cfg, disp_stats=None, device='cuda', from_pretrained=True):
         if hand_mode:
             print(f"  Hand mode enabled: {hand_mode}")
         if text_mode:
-            print(f"  Text mode enabled: siglip={size_cfg['siglip_model_name']}")
+            print(f"  Text mode enabled: umt5={size_cfg['text_model_name']}")
     
     else:
         raise ValueError(
