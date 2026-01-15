@@ -71,13 +71,12 @@ class DiffusionIntentTracker(BaseIntentTracker):
         self.enable_cfg = enable_cfg
         self.cfg_dropout_prob = cfg_dropout_prob
 
-        # Register null text embedding for CFG (used when text is dropped)
-        # This is a learnable embedding representing "no instruction"
+        # Learnable null text embedding for CFG (used when text is dropped)
+        # This is a learnable parameter representing "no instruction"
         if text_mode and enable_cfg:
-            # Initialize as zeros - will be learned during training
+            # Initialize as zeros - will be learned during training like DiT's approach
             # Shape: (1, 1, hidden_size) - single token, will be broadcasted during use
-            self.register_buffer(
-                'null_text_embedding',
+            self.null_text_embedding = nn.Parameter(
                 torch.zeros(1, 1, self.hidden_size)
             )
         
@@ -174,6 +173,16 @@ class DiffusionIntentTracker(BaseIntentTracker):
             clip_sample=False,
             prediction_type='epsilon',
         )
+
+        # =========================================================================
+        # Timestep Importance Sampling (Loss-Aware Sampling)
+        # =========================================================================
+        # Track per-timestep loss history for importance sampling
+        # Based on DiT's LossSecondMomentResampler approach
+        self.register_buffer('timestep_loss_history', torch.zeros(num_diffusion_steps, 10))
+        self.register_buffer('timestep_loss_counts', torch.zeros(num_diffusion_steps))
+        self.timestep_sampling_warmup = 10  # Warmup batches before using importance sampling
+        self.timestep_sampling_uniform_prob = 0.1  # Mix 10% uniform sampling
     
     def _build_track_tokens(
         self,
@@ -261,7 +270,69 @@ class DiffusionIntentTracker(BaseIntentTracker):
         hand_tokens = self.hand_encoder(token_input)
 
         return hand_tokens
-    
+
+    # =========================================================================
+    # Timestep Importance Sampling Methods
+    # =========================================================================
+
+    def update_timestep_loss_history(self, timesteps: torch.Tensor, losses: torch.Tensor):
+        """
+        Update the per-timestep loss history for importance sampling.
+
+        Args:
+            timesteps: (B,) tensor of timestep indices
+            losses: (B,) tensor of per-sample losses
+        """
+        if not self.training:
+            return
+
+        # Move to CPU for indexing (buffers are on model device)
+        timesteps_cpu = timesteps.cpu()
+        losses_cpu = losses.detach().cpu()
+
+        for t, loss in zip(timesteps_cpu, losses_cpu):
+            t = t.item()
+            # Rolling window: shift and add new loss
+            self.timestep_loss_history[t] = torch.roll(self.timestep_loss_history[t], -1)
+            self.timestep_loss_history[t, -1] = loss
+            self.timestep_loss_counts[t] += 1
+
+    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Sample diffusion timesteps with importance weighting based on loss history.
+
+        During warmup (first few batches), uses uniform sampling.
+        After warmup, samples difficult timesteps more frequently based on loss variance.
+
+        Args:
+            batch_size: Number of timesteps to sample
+            device: Device to place sampled timesteps
+
+        Returns:
+            timesteps: (batch_size,) tensor of sampled timestep indices
+        """
+        # Check if warmed up (all timesteps seen at least once)
+        if self.timestep_loss_counts.min() < self.timestep_sampling_warmup:
+            # Warmup: uniform random sampling
+            return torch.randint(0, self.num_diffusion_steps, (batch_size,), device=device, dtype=torch.long)
+
+        # Compute importance weights from loss history
+        # Use second moment (RMS) of losses as in DiT's LossSecondMomentResampler
+        loss_means = self.timestep_loss_history.mean(dim=1)  # (num_timesteps,)
+        weights = torch.sqrt((self.timestep_loss_history ** 2).mean(dim=1))  # RMS
+
+        # Normalize weights to be a probability distribution
+        weights = weights / weights.sum()
+
+        # Mix with uniform sampling (10% uniform, 90% importance)
+        uniform_prob = self.timestep_sampling_uniform_prob
+        weights = weights * (1 - uniform_prob) + uniform_prob / self.num_diffusion_steps
+
+        # Sample according to weights
+        timesteps = torch.multinomial(weights, batch_size, replacement=True).to(device)
+
+        return timesteps
+
     def forward(
         self,
         frames: Optional[torch.Tensor] = None,
@@ -361,31 +432,36 @@ class DiffusionIntentTracker(BaseIntentTracker):
         
         return outputs
     
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def compute_loss(self, batch: Dict[str, torch.Tensor], use_importance_sampling: bool = True) -> Dict[str, torch.Tensor]:
         """
         Compute diffusion training loss.
-        
+
         Args:
             batch: Dict containing training data
-            
+            use_importance_sampling: If True, sample timesteps based on loss history (recommended)
+
         Returns:
-            Dict with 'total_loss', 'track_loss', 'hand_uvd_loss', 'hand_rot_loss'
+            Dict with 'total_loss', 'track_loss', 'hand_uvd_loss', 'hand_rot_loss',
+            'per_sample_loss' (for updating history), and 'timesteps' (for updating history)
         """
         frames = batch['frames']
         query_coords = batch['query_coords']
         gt_disp = batch['gt_disp_normalized']  # (B, N, T, coord_dim)
         depth = batch.get('depth')
         text = batch.get('text')
-        
+
         B, N, T, _ = gt_disp.shape
         device = gt_disp.device
-        
+
         # Create conditioning slot (t=0): zero displacement
         zero_slot = torch.zeros(B, N, 1, self.coord_dim, device=device)
         gt_traj = torch.cat([zero_slot, gt_disp], dim=2)  # (B, N, T+1, coord_dim)
-        
-        # Sample random diffusion timesteps
-        timestep = torch.randint(0, self.num_diffusion_steps, (B,), device=device, dtype=torch.long)
+
+        # Sample diffusion timesteps (with optional importance sampling)
+        if use_importance_sampling:
+            timestep = self.sample_timesteps(B, device)
+        else:
+            timestep = torch.randint(0, self.num_diffusion_steps, (B,), device=device, dtype=torch.long)
         
         # Sample noise
         noise = torch.randn_like(gt_traj)
@@ -460,38 +536,55 @@ class DiffusionIntentTracker(BaseIntentTracker):
         track_mse = (predicted_noise - noise) ** 2  # (B, N, T+1, coord_dim)
         masked_track_mse = track_mse * track_loss_mask.unsqueeze(-1)
         track_loss = masked_track_mse.sum() / (track_loss_mask.sum() * self.coord_dim).clamp_min(1.0)
-        
+
+        # Compute per-sample losses for importance sampling
+        # Sum over all dimensions except batch to get per-sample loss
+        per_sample_track_loss = masked_track_mse.sum(dim=[1, 2, 3]) / (track_loss_mask[0].sum() * self.coord_dim)
+
         total_loss = track_loss
         hand_uvd_loss = torch.tensor(0.0, device=device)
         hand_rot_loss = torch.tensor(0.0, device=device)
-        
+
         # Hand loss
         if num_hands > 0 and 'hand_noise' in outputs:
             predicted_hand_noise = outputs['hand_noise']
-            
+
             hand_loss_mask = torch.ones(B, num_hands, T + 1, device=device)
             hand_loss_mask[:, :, 0] = 0.0
-            
+
             hand_uvd_weight = 1.0
             hand_rot_weight = 0.5
-            
+
             # UVD loss
             hand_uvd_mse = (predicted_hand_noise[..., :3] - hand_noise[..., :3]) ** 2
             masked_uvd_mse = hand_uvd_mse * hand_loss_mask.unsqueeze(-1)
             hand_uvd_loss = masked_uvd_mse.sum() / (hand_loss_mask.sum() * 3).clamp_min(1.0)
-            
+
+            # Per-sample hand UVD loss
+            per_sample_hand_uvd = masked_uvd_mse.sum(dim=[1, 2, 3]) / (hand_loss_mask[0].sum() * 3)
+
             # Rotation loss
             hand_rot_mse = (predicted_hand_noise[..., 3:] - hand_noise[..., 3:]) ** 2
             masked_rot_mse = hand_rot_mse * hand_loss_mask.unsqueeze(-1)
             hand_rot_loss = masked_rot_mse.sum() / (hand_loss_mask.sum() * 6).clamp_min(1.0)
-            
+
+            # Per-sample hand rotation loss
+            per_sample_hand_rot = masked_rot_mse.sum(dim=[1, 2, 3]) / (hand_loss_mask[0].sum() * 6)
+
+            # Combine per-sample losses
+            per_sample_loss = per_sample_track_loss + hand_uvd_weight * per_sample_hand_uvd + hand_rot_weight * per_sample_hand_rot
+
             total_loss = track_loss + hand_uvd_weight * hand_uvd_loss + hand_rot_weight * hand_rot_loss
-        
+        else:
+            per_sample_loss = per_sample_track_loss
+
         return {
             'total_loss': total_loss,
             'track_loss': track_loss,
             'hand_uvd_loss': hand_uvd_loss,
             'hand_rot_loss': hand_rot_loss,
+            'per_sample_loss': per_sample_loss,  # For updating loss history
+            'timesteps': timestep,  # For updating loss history
         }
     
     @torch.no_grad()
@@ -597,41 +690,54 @@ class DiffusionIntentTracker(BaseIntentTracker):
             
             # Forward pass to predict noise (with CFG if enabled)
             if use_cfg:
-                # Conditional prediction
-                cond_outputs = self(
+                # Batched CFG: combine conditional and unconditional in single forward pass
+                # This is 2x faster than separate passes (DiT-style optimization)
+
+                # Double batch dimension by concatenating conditional and unconditional
+                batched_query_coords = torch.cat([query_coords, query_coords], dim=0)
+                batched_noisy_traj = torch.cat([noisy_traj, noisy_traj], dim=0)
+                batched_timestep = torch.cat([timestep, timestep], dim=0)
+                batched_scene_tokens = torch.cat([cond_scene_tokens, uncond_scene_tokens], dim=0)
+
+                # Handle hand data if present
+                batched_hand_query_uvd = None
+                batched_hand_query_rot = None
+                batched_noisy_hand_traj = None
+                if hand_query_uvd is not None:
+                    batched_hand_query_uvd = torch.cat([hand_query_uvd, hand_query_uvd], dim=0)
+                    batched_hand_query_rot = torch.cat([hand_query_rot, hand_query_rot], dim=0)
+                if noisy_hand_traj is not None:
+                    batched_noisy_hand_traj = torch.cat([noisy_hand_traj, noisy_hand_traj], dim=0)
+
+                # Single forward pass with doubled batch
+                batched_outputs = self(
                     frames=None,
-                    query_coords=query_coords,
-                    noisy_traj=noisy_traj,
-                    timestep=timestep,
-                    scene_tokens=cond_scene_tokens,
-                    hand_query_uvd=hand_query_uvd,
-                    hand_query_rot=hand_query_rot,
-                    noisy_hand_traj=noisy_hand_traj,
+                    query_coords=batched_query_coords,
+                    noisy_traj=batched_noisy_traj,
+                    timestep=batched_timestep,
+                    scene_tokens=batched_scene_tokens,
+                    hand_query_uvd=batched_hand_query_uvd,
+                    hand_query_rot=batched_hand_query_rot,
+                    noisy_hand_traj=batched_noisy_hand_traj,
                 )
 
-                # Unconditional prediction
-                uncond_outputs = self(
-                    frames=None,
-                    query_coords=query_coords,
-                    noisy_traj=noisy_traj,
-                    timestep=timestep,
-                    scene_tokens=uncond_scene_tokens,
-                    hand_query_uvd=hand_query_uvd,
-                    hand_query_rot=hand_query_rot,
-                    noisy_hand_traj=noisy_hand_traj,
-                )
+                # Split results: first half is conditional, second half is unconditional
+                batched_track_noise = batched_outputs['track_noise']
+                cond_track_noise, uncond_track_noise = batched_track_noise.chunk(2, dim=0)
 
                 # Apply CFG: noise_pred = uncond + guidance_scale * (cond - uncond)
                 predicted_track_noise = (
-                    uncond_outputs['track_noise'] +
-                    cfg_guidance_scale * (cond_outputs['track_noise'] - uncond_outputs['track_noise'])
+                    uncond_track_noise +
+                    cfg_guidance_scale * (cond_track_noise - uncond_track_noise)
                 )
 
                 # Blend hand noise predictions if available
-                if num_hands > 0 and 'hand_noise' in cond_outputs:
+                if num_hands > 0 and 'hand_noise' in batched_outputs:
+                    batched_hand_noise = batched_outputs['hand_noise']
+                    cond_hand_noise, uncond_hand_noise = batched_hand_noise.chunk(2, dim=0)
                     predicted_hand_noise = (
-                        uncond_outputs['hand_noise'] +
-                        cfg_guidance_scale * (cond_outputs['hand_noise'] - uncond_outputs['hand_noise'])
+                        uncond_hand_noise +
+                        cfg_guidance_scale * (cond_hand_noise - uncond_hand_noise)
                     )
                 else:
                     predicted_hand_noise = None

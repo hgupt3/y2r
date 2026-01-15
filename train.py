@@ -372,11 +372,25 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, scaler, ema_model
         
         # === FORWARD ===
         with autocast(device_type='cuda', enabled=cfg.training.use_amp):
-            loss_dict = model.compute_loss(model_batch)
+            # Check if model supports importance sampling (diffusion models only)
+            use_importance_sampling = getattr(cfg.model, 'use_importance_sampling', True)
+            if hasattr(model, 'sample_timesteps'):
+                loss_dict = model.compute_loss(model_batch, use_importance_sampling=use_importance_sampling)
+            else:
+                loss_dict = model.compute_loss(model_batch)
+
             loss = loss_dict['total_loss']
             track_loss = loss_dict['track_loss']
             hand_uvd_loss = loss_dict.get('hand_uvd_loss', torch.tensor(0.0))
             hand_rot_loss = loss_dict.get('hand_rot_loss', torch.tensor(0.0))
+
+            # Update timestep loss history if importance sampling is enabled
+            if use_importance_sampling and hasattr(model, 'update_timestep_loss_history'):
+                if 'per_sample_loss' in loss_dict and 'timesteps' in loss_dict:
+                    model.update_timestep_loss_history(
+                        loss_dict['timesteps'],
+                        loss_dict['per_sample_loss']
+                    )
         
         # === BACKWARD ===
         optimizer.zero_grad()
