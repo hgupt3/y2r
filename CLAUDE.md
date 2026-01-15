@@ -33,6 +33,37 @@ y2r/
 └── thirdparty/              # External dependencies (SAM2, CoTracker, WiLoR, etc.)
 ```
 
+## Conda Environments
+
+This project uses **two separate conda environments**:
+
+### 1. `sam` - IntentTracker & Dataset Scripts
+Used for:
+- Training IntentTracker models (`train.py`)
+- Dataset processing (`dataset_scripts/`)
+- Model testing and inference
+- Real-world execution (ROS2)
+
+```bash
+conda activate sam
+python train.py --config configs/train_diffusion.yaml
+python test_dit_fixes.py  # Model tests
+```
+
+### 2. `y2r` - Isaac Lab Simulation
+Used for:
+- Isaac Lab RL policy training
+- Simulation environment
+- All scripts in `isaac_scripts/`
+
+```bash
+conda activate y2r
+./isaac_scripts/train.sh
+./isaac_scripts/play.sh
+```
+
+**Important**: Always use the correct environment for the task. Tests for IntentTracker models should use `sam`.
+
 ## IntentTracker Training
 
 ```bash
