@@ -1,5 +1,9 @@
 import os
 import sys
+import warnings
+# Suppress warnings early
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 import torch
 from omegaconf import OmegaConf
 import argparse
@@ -13,12 +17,174 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "thirdparty"))
+sys.path.insert(0, str(SCRIPT_DIR))  # For pipeline_utils
 
 from sam2.grounded_sam2 import gsam_video, sam3_video
 
 def load_config(config_path="config.yaml"):
     """Load configuration from YAML file using OmegaConf"""
     return OmegaConf.load(config_path)
+
+
+class GSAMWorkerFunction:
+    """Worker function for GSAM adaptive pool."""
+
+    def __init__(self, config, gsam_config, mode, clip_to_noun):
+        self.config = config
+        self.gsam_config = gsam_config
+        self.mode = mode
+        self.clip_to_noun = clip_to_noun
+
+        # Extract config
+        self.detection_model = gsam_config['detection_model']
+        self.key_frame_idx = gsam_config['key_frame_idx']
+        self.config_text_prompt = gsam_config.get('text_prompt', None)
+        self.vis_flag = gsam_config['vis_flag']
+        self.vis_path = Path(gsam_config['vis_path']) if self.vis_flag else None
+        self.vis_fps = gsam_config['vis_fps']
+        self.output_masks_dir = Path(gsam_config['output_masks_dir'])
+        self.device = gsam_config['device']
+
+        # Model placeholders (loaded in load_model)
+        self.grounding_model = None
+        self.processor = None
+        self.florence2_model = None
+        self.florence2_processor = None
+        self.sam2_predictor = None
+        self.sam3_predictor = None
+
+    def load_model(self):
+        """Load GSAM/SAM3 models (called once per worker)."""
+        print(f"[Worker] Loading {self.detection_model} model...")
+
+        if self.detection_model == "grounding-dino":
+            from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+            self.processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
+            self.grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                "IDEA-Research/grounding-dino-base"
+            ).to(self.device)
+
+            from sam2.build_sam import build_sam2_video_predictor
+            self.sam2_predictor = build_sam2_video_predictor(
+                "configs/sam2.1/sam2.1_hiera_l.yaml",
+                str(PROJECT_ROOT / "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"),
+                device=self.device
+            )
+
+        elif self.detection_model == "florence-2":
+            from transformers import AutoProcessor, AutoModelForCausalLM
+            self.florence2_processor = AutoProcessor.from_pretrained(
+                "microsoft/Florence-2-large", trust_remote_code=True
+            )
+            self.florence2_model = AutoModelForCausalLM.from_pretrained(
+                "microsoft/Florence-2-large",
+                trust_remote_code=True,
+                attn_implementation="eager"
+            ).eval().to(self.device)
+
+            from sam2.build_sam import build_sam2_video_predictor
+            self.sam2_predictor = build_sam2_video_predictor(
+                "configs/sam2.1/sam2.1_hiera_l.yaml",
+                str(PROJECT_ROOT / "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"),
+                device=self.device
+            )
+
+        elif self.detection_model == "sam3":
+            sys.path.insert(0, str(PROJECT_ROOT / "thirdparty/sam3"))
+            from sam3.model_builder import build_sam3_video_predictor
+            self.sam3_predictor = build_sam3_video_predictor()
+
+        print(f"[Worker] Model loaded")
+        return self  # Return self for compatibility
+
+    def process(self, model, video_folder):
+        """Process method for AdaptiveWorkerPool compatibility."""
+        return self(video_folder)
+
+    def __call__(self, video_folder):
+        """Process a single video."""
+        video_name = video_folder.name
+
+        # Get text prompt
+        clip_id = int(video_name)
+        if self.config_text_prompt is not None:
+            text_prompt = self.config_text_prompt
+        elif clip_id in self.clip_to_noun:
+            text_prompt = self.clip_to_noun[clip_id] + "."
+        else:
+            print(f"⚠ No noun found for clip_id {clip_id}, skipping {video_name}")
+            return None
+
+        # Run detection
+        save_path = str(self.vis_path) if self.vis_flag else None
+        current_key_frame = self.key_frame_idx
+
+        if self.detection_model == "sam3":
+            masks_4d, obj_dict = sam3_video(
+                frames_dir=str(video_folder),
+                text_prompt=text_prompt,
+                key_frame_idx=current_key_frame,
+                save_path=save_path,
+                video_name=video_name,
+                device=self.device,
+                fps=self.vis_fps,
+                sam3_predictor=self.sam3_predictor
+            )
+
+            # Retry with middle frame if needed
+            if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
+                masks_4d, obj_dict = sam3_video(
+                    frames_dir=str(video_folder),
+                    text_prompt=text_prompt,
+                    key_frame_idx=-1,
+                    save_path=save_path,
+                    video_name=video_name,
+                    device=self.device,
+                    fps=self.vis_fps,
+                    sam3_predictor=self.sam3_predictor
+                )
+        else:
+            masks_4d, obj_dict = gsam_video(
+                frames_dir=str(video_folder),
+                text_prompt=text_prompt,
+                key_frame_idx=current_key_frame,
+                save_path=save_path,
+                video_name=video_name,
+                device=self.device,
+                fps=self.vis_fps,
+                grounding_model=self.grounding_model,
+                processor=self.processor,
+                sam2_predictor=self.sam2_predictor,
+                detection_model=self.detection_model,
+                florence2_model=self.florence2_model,
+                florence2_processor=self.florence2_processor
+            )
+
+            # Retry with middle frame if needed
+            if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
+                masks_4d, obj_dict = gsam_video(
+                    frames_dir=str(video_folder),
+                    text_prompt=text_prompt,
+                    key_frame_idx=-1,
+                    save_path=save_path,
+                    video_name=video_name,
+                    device=self.device,
+                    fps=self.vis_fps,
+                    grounding_model=self.grounding_model,
+                    processor=self.processor,
+                    sam2_predictor=self.sam2_predictor,
+                    detection_model=self.detection_model,
+                    florence2_model=self.florence2_model,
+                    florence2_processor=self.florence2_processor
+                )
+
+        # Save masks
+        if masks_4d is not None and obj_dict is not None:
+            output_file = self.output_masks_dir / f"{video_name}.pt"
+            torch.save({'masks': masks_4d, 'obj_dict': obj_dict}, output_file)
+            return output_file
+
+        return None
 
 
 def main():
@@ -108,70 +274,7 @@ def main():
     if vis_flag:
         print(f"Visualization path: {vis_path}")
     print(f"{'='*60}\n")
-    
-    # Load models once before processing all videos
-    print(f"{'='*60}")
-    print("LOADING MODELS (one-time initialization)")
-    print(f"{'='*60}")
-    
-    # Initialize variables for detection models
-    grounding_model = None
-    processor = None
-    florence2_model = None
-    florence2_processor = None
-    sam2_predictor = None
-    sam3_predictor = None
-    
-    # Load detection model based on configuration
-    if detection_model == "grounding-dino":
-        print("Loading Grounding DINO model...")
-        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-        processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
-        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").to(device)
-        print("✅ Grounding DINO loaded")
-        
-        print("Loading SAM2 video predictor...")
-        from sam2.build_sam import build_sam2_video_predictor
-        sam2_predictor = build_sam2_video_predictor(
-            "configs/sam2.1/sam2.1_hiera_l.yaml",  # Hydra expects relative path to sam2 package
-            str(PROJECT_ROOT / "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"),
-            device=device
-        )
-        print("✅ SAM2 loaded")
-        
-    elif detection_model == "florence-2":
-        print(f"Loading Florence-2 model (microsoft/Florence-2-large)...")
-        from transformers import AutoProcessor, AutoModelForCausalLM
-        florence2_processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
-        florence2_model = AutoModelForCausalLM.from_pretrained(
-            "microsoft/Florence-2-large",
-            trust_remote_code=True,
-            attn_implementation="eager"  # Use eager attention to avoid compatibility issues
-        ).eval().to(device)
-        print("✅ Florence-2 loaded")
-        
-        print("Loading SAM2 video predictor...")
-        from sam2.build_sam import build_sam2_video_predictor
-        sam2_predictor = build_sam2_video_predictor(
-            "configs/sam2.1/sam2.1_hiera_l.yaml",  # Hydra expects relative path to sam2 package
-            str(PROJECT_ROOT / "thirdparty/sam2/checkpoints/sam2.1_hiera_large.pt"),
-            device=device
-        )
-        print("✅ SAM2 loaded")
-        
-    elif detection_model == "sam3":
-        print("Loading SAM3 video predictor (unified detection + segmentation)...")
-        # Add sam3 to path
-        sys.path.insert(0, str(PROJECT_ROOT / "thirdparty/sam3"))
-        from sam3.model_builder import build_sam3_video_predictor
-        sam3_predictor = build_sam3_video_predictor()
-        print("✅ SAM3 loaded")
-        
-    else:
-        raise ValueError(f"Unknown detection_model: {detection_model}. Must be 'grounding-dino', 'florence-2', or 'sam3'.")
-    
-    print(f"{'='*60}\n")
-    
+
     total_videos_processed = 0
     skipped_videos = 0
     start_time = time.time()
@@ -212,90 +315,117 @@ def main():
     else:
         # Not continuing, process all videos
         videos_to_process = list(range(len(video_folders)))
-    
-    # Process each video folder that needs processing
-    for idx in videos_to_process:
-        video_folder = video_folders[idx]
+
+    # Check if adaptive workers are enabled
+    use_adaptive = config.get('optimization', {}).get('use_adaptive_workers', False)
+
+    if use_adaptive:
+        # ====================================================================
+        # ADAPTIVE WORKER MODE
+        # ====================================================================
+        from pipeline_utils.adaptive_workers import AdaptiveWorkerPool
+        from pipeline_utils.gpu_utils import detect_gpus
+
+        num_gpus, gpu_info = detect_gpus()
+        max_workers_per_gpu = gsam_config['max_workers']
+
         print(f"\n{'='*60}")
-        print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
+        print("ADAPTIVE WORKER MODE")
         print(f"{'='*60}")
+        print(f"🚀 Detected {num_gpus} GPU(s), max {max_workers_per_gpu} workers/GPU")
+
+        # Create worker function
+        worker_fn = GSAMWorkerFunction(config, gsam_config, args.mode, clip_to_noun)
+
+        # Create adaptive pool
+        pool = AdaptiveWorkerPool(
+            num_gpus=num_gpus,
+            max_workers_per_gpu=max_workers_per_gpu,
+            worker_fn=worker_fn,
+            spawn_delay=config['optimization']['spawn_delay'],
+            verbose_workers=config['optimization'].get('verbose_workers', False),
+            save_worker_logs=config['optimization'].get('save_worker_logs', True),
+            log_dir=Path(gsam_config['worker_log_dir']),
+        )
+
+        # Get video folders to process
+        videos_for_pool = [video_folders[idx] for idx in videos_to_process]
+
+        # Process videos
+        results, stable_workers = pool.process_items(videos_for_pool, desc="GSAM")
+
+        # Count successful
+        total_videos_processed = sum(1 for r in results if r is not None)
+        skipped_videos = len(video_folders) - len(videos_to_process)
+
+    else:
+        # ====================================================================
+        # SEQUENTIAL MODE
+        # ====================================================================
+        # Process each video folder that needs processing
+        for idx in videos_to_process:
+            video_folder = video_folders[idx]
+            print(f"\n{'='*60}")
+            print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
+            print(f"{'='*60}")
         
-        video_start_time = time.time()
-        
-        # Prepare save path for visualization if enabled
-        save_path = str(vis_path) if vis_flag else None
-        video_name = video_folder.name  # Get the video name (e.g., 00000, 00001, etc.)
-        
-        # Get text prompt: use config if provided, otherwise get from metadata
-        clip_id = int(video_name)  # Convert folder name to int (e.g., "00042" -> 42)
-        if config_text_prompt is not None:
-            text_prompt = config_text_prompt
-        elif clip_id in clip_to_noun:
-            text_prompt = clip_to_noun[clip_id] + "."  # Add period for GSAM format
-        else:
-            print(f"⚠ No noun found in metadata for clip_id {clip_id}, skipping {video_folder.name}")
-            continue
-        
-        # Run detection and segmentation on the video folder
-        current_key_frame = key_frame_idx
-        
-        if detection_model == "sam3":
-            # Use SAM3's unified detection + segmentation
-            print(f"Running SAM3 detection and segmentation...")
-            print(f"  Text prompt: \"{text_prompt}\"")
+            video_start_time = time.time()
             
-            masks_4d, obj_dict = sam3_video(
-                frames_dir=str(video_folder),
-                text_prompt=text_prompt,
-                key_frame_idx=current_key_frame,
-                save_path=save_path,
-                video_name=video_name,
-                device=device,
-                fps=vis_fps,
-                sam3_predictor=sam3_predictor
-            )
+            # Prepare save path for visualization if enabled
+            save_path = str(vis_path) if vis_flag else None
+            video_name = video_folder.name  # Get the video name (e.g., 00000, 00001, etc.)
             
-            # If detection failed and we weren't already using middle frame, retry with middle frame
-            if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
-                print(f"  ⚠ No object detected at frame {current_key_frame}, retrying with middle frame...")
+            # Get text prompt: use config if provided, otherwise get from metadata
+            clip_id = int(video_name)  # Convert folder name to int (e.g., "00042" -> 42)
+            if config_text_prompt is not None:
+                text_prompt = config_text_prompt
+            elif clip_id in clip_to_noun:
+                text_prompt = clip_to_noun[clip_id] + "."  # Add period for GSAM format
+            else:
+                print(f"⚠ No noun found in metadata for clip_id {clip_id}, skipping {video_folder.name}")
+                continue
+            
+            # Run detection and segmentation on the video folder
+            current_key_frame = key_frame_idx
+            
+            if detection_model == "sam3":
+                # Use SAM3's unified detection + segmentation
+                print(f"Running SAM3 detection and segmentation...")
+                print(f"  Text prompt: \"{text_prompt}\"")
+                
                 masks_4d, obj_dict = sam3_video(
                     frames_dir=str(video_folder),
                     text_prompt=text_prompt,
-                    key_frame_idx=-1,  # Middle frame
+                    key_frame_idx=current_key_frame,
                     save_path=save_path,
                     video_name=video_name,
                     device=device,
                     fps=vis_fps,
                     sam3_predictor=sam3_predictor
                 )
-        else:
-            # Use GSAM (Grounding DINO/Florence-2 + SAM2)
-            print(f"Running GSAM detection and segmentation...")
-            print(f"  Text prompt: \"{text_prompt}\"")
-            
-            masks_4d, obj_dict = gsam_video(
-                frames_dir=str(video_folder),
-                text_prompt=text_prompt,
-                key_frame_idx=current_key_frame,
-                save_path=save_path,
-                video_name=video_name,
-                device=device,
-                fps=vis_fps,
-                grounding_model=grounding_model,
-                processor=processor,
-                sam2_predictor=sam2_predictor,
-                detection_model=detection_model,
-                florence2_model=florence2_model,
-                florence2_processor=florence2_processor
-            )
-            
-            # If detection failed and we weren't already using middle frame, retry with middle frame
-            if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
-                print(f"  ⚠ No object detected at frame {current_key_frame}, retrying with middle frame...")
+                
+                # If detection failed and we weren't already using middle frame, retry with middle frame
+                if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
+                    print(f"  ⚠ No object detected at frame {current_key_frame}, retrying with middle frame...")
+                    masks_4d, obj_dict = sam3_video(
+                        frames_dir=str(video_folder),
+                        text_prompt=text_prompt,
+                        key_frame_idx=-1,  # Middle frame
+                        save_path=save_path,
+                        video_name=video_name,
+                        device=device,
+                        fps=vis_fps,
+                        sam3_predictor=sam3_predictor
+                    )
+            else:
+                # Use GSAM (Grounding DINO/Florence-2 + SAM2)
+                print(f"Running GSAM detection and segmentation...")
+                print(f"  Text prompt: \"{text_prompt}\"")
+                
                 masks_4d, obj_dict = gsam_video(
                     frames_dir=str(video_folder),
                     text_prompt=text_prompt,
-                    key_frame_idx=-1,  # Middle frame
+                    key_frame_idx=current_key_frame,
                     save_path=save_path,
                     video_name=video_name,
                     device=device,
@@ -307,16 +437,35 @@ def main():
                     florence2_model=florence2_model,
                     florence2_processor=florence2_processor
                 )
-        
-        # If still no detection, skip this clip
-        if masks_4d is None or obj_dict is None or len(obj_dict) == 0:
-            print(f"⚠ No object detected in {video_folder.name} after retrying, skipping clip")
-            continue
-        
-        # Save masks as PyTorch file
-        mask_filename = output_masks_dir / f"{video_folder.name}.pt"
-        torch.save({
-            'masks': torch.from_numpy(masks_4d),
+                
+                # If detection failed and we weren't already using middle frame, retry with middle frame
+                if (masks_4d is None or obj_dict is None or len(obj_dict) == 0) and current_key_frame != -1:
+                    print(f"  ⚠ No object detected at frame {current_key_frame}, retrying with middle frame...")
+                    masks_4d, obj_dict = gsam_video(
+                        frames_dir=str(video_folder),
+                        text_prompt=text_prompt,
+                        key_frame_idx=-1,  # Middle frame
+                        save_path=save_path,
+                        video_name=video_name,
+                        device=device,
+                        fps=vis_fps,
+                        grounding_model=grounding_model,
+                        processor=processor,
+                        sam2_predictor=sam2_predictor,
+                        detection_model=detection_model,
+                        florence2_model=florence2_model,
+                        florence2_processor=florence2_processor
+                    )
+            
+            # If still no detection, skip this clip
+            if masks_4d is None or obj_dict is None or len(obj_dict) == 0:
+                print(f"⚠ No object detected in {video_folder.name} after retrying, skipping clip")
+                continue
+            
+            # Save masks as PyTorch file
+            mask_filename = output_masks_dir / f"{video_folder.name}.pt"
+            torch.save({
+                'masks': torch.from_numpy(masks_4d),
             'object_dict': obj_dict,
             'video_name': video_folder.name
         }, mask_filename)
@@ -338,9 +487,12 @@ def main():
         gc.collect()
     
     elapsed_time = time.time() - start_time
-    
+
     print(f"\n{'='*60}")
-    print(f"✅ ALL VIDEOS PROCESSED!")
+    if total_videos_processed > 0:
+        print(f"✅ PROCESSING COMPLETE!")
+    else:
+        print(f"❌ PROCESSING FAILED!")
     print(f"{'='*60}")
     print(f"Total videos: {len(video_folders)}")
     if continue_mode and skipped_videos > 0:
@@ -351,9 +503,9 @@ def main():
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
         print(f"Average: {elapsed_time/total_videos_processed:.2f}s per video")
-    print(f"Masks saved to: {output_masks_dir}")
-    if vis_flag:
-        print(f"Visualizations saved to: {vis_path}")
+        print(f"Masks saved to: {output_masks_dir}")
+        if vis_flag:
+            print(f"Visualizations saved to: {vis_path}")
     print(f"{'='*60}\n")
 
 

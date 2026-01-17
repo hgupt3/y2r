@@ -11,6 +11,11 @@ Usage:
 
 import os
 import sys
+import warnings
+# Suppress warnings early
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
 import logging
 import traceback
 import multiprocessing as mp
@@ -19,13 +24,14 @@ from omegaconf import OmegaConf
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))  # For utils imports
 
 
 def _setup_env_for_worker():
     """Setup environment variables for a worker process (called before torch import)."""
     # Suppress huggingface tokenizer parallelism warning
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    # Disable all internal tqdm progress bars
+    # Disable internal tqdm progress bars from ViPE libraries (workers only)
     os.environ["TQDM_DISABLE"] = "1"
 
 
@@ -40,9 +46,11 @@ def _load_config_early():
         gpu_id = device.split(":")[1]
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         print(f"Setting CUDA_VISIBLE_DEVICES={gpu_id}")
-    
-    _setup_env_for_worker()
-    
+
+    # Don't call _setup_env_for_worker() here - it's for workers only
+    # Suppress tokenizer warning in main process
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     return config, device
 
 
@@ -473,6 +481,68 @@ def _worker_process(worker_id, video_dirs, output_dir, vipe_config, progress_que
     progress_queue.put(('finished', worker_id, None))
 
 
+# ==============================================================================
+# ADAPTIVE WORKER SUPPORT
+# ==============================================================================
+
+class ViPEWorkerFunction:
+    """
+    Worker function for adaptive pool.
+
+    Note: ViPE already has multiprocessing infrastructure. This class provides
+    an alternative adaptive approach that spawns workers incrementally until OOM.
+    """
+
+    def __init__(self, config, vipe_config, output_dir):
+        self.config = config
+        self.vipe_config = vipe_config
+        self.output_dir = output_dir
+
+    def load_model(self):
+        """
+        Load ViPE pipeline (called once per worker).
+        """
+        _setup_env_for_worker()
+
+        # Suppress verbose logging
+        logging.getLogger("vipe").setLevel(logging.WARNING)
+        logging.getLogger("vipe.slam").setLevel(logging.WARNING)
+        logging.getLogger("vipe.pipeline").setLevel(logging.WARNING)
+
+        # Initialize ViPE pipeline for this worker
+        vipe_pipeline, model_cache = create_vipe_pipeline(
+            pipeline_name=self.vipe_config.get('pipeline', 'default'),
+            output_dir=self.output_dir,
+            save_viz=self.vipe_config.get('vis_flag', False),
+            vis_path=self.vipe_config.get('vis_path'),
+            fixed_fov_degrees=self.vipe_config.get('fixed_fov_degrees'),
+            fov_min_degrees=self.vipe_config.get('fov_min_degrees'),
+            fov_max_degrees=self.vipe_config.get('fov_max_degrees'),
+            optimize_intrinsics=self.vipe_config.get('optimize_intrinsics', True),
+        )
+
+        return vipe_pipeline
+
+    def process(self, vipe_pipeline, video_dir):
+        """Process single video with ViPE"""
+        video_name = video_dir.name
+
+        try:
+            result = process_frame_directory_with_vipe(
+                vipe_pipeline, video_dir, self.output_dir, self.vipe_config
+            )
+
+            if result is None:
+                raise RuntimeError(f"{video_name}: no frames")
+            elif result.get('skipped'):
+                pct_flat = result.get('pct_flat_frames', 0)
+                raise RuntimeError(f"{video_name}: skipped ({pct_flat:.1f}% flat depth)")
+
+            return result
+        except Exception as e:
+            raise RuntimeError(f"Failed to process {video_name}: {e}")
+
+
 def main():
     """Main function to run ViPE on all videos with parallel workers."""
     print("=" * 60)
@@ -501,7 +571,7 @@ def main():
     fov_min_degrees = vipe_config.get('fov_min_degrees')
     fov_max_degrees = vipe_config.get('fov_max_degrees')
     optimize_intrinsics = vipe_config.get('optimize_intrinsics', True)
-    num_workers = vipe_config.get('num_workers', 2)
+    num_workers = 1  # Sequential mode when use_adaptive_workers=false
     flat_std_threshold = vipe_config.get('flat_std_threshold', 0.1)
     max_flat_frame_pct = vipe_config.get('max_flat_frame_pct', 20.0)
     
@@ -559,11 +629,81 @@ def main():
     
     total_videos = len(video_dirs)
     print(f"Processing {total_videos} video directories with {num_workers} workers")
-    
+
     if total_videos == 0:
         print("No videos to process!")
         return
-    
+
+    # Check if adaptive workers enabled
+    use_adaptive = config.get('optimization', {}).get('use_adaptive_workers', False)
+
+    if use_adaptive:
+        # ====================================================================
+        # ADAPTIVE WORKER MODE
+        # ====================================================================
+        from pipeline_utils.adaptive_workers import AdaptiveWorkerPool
+        from pipeline_utils.gpu_utils import detect_gpus
+
+        num_gpus, gpu_info = detect_gpus()
+        max_workers_per_gpu = vipe_config['max_workers']
+
+        print(f"\n{'='*60}")
+        print("ADAPTIVE WORKER MODE")
+        print(f"{'='*60}")
+        print(f"🚀 Detected {num_gpus} GPU(s), max {max_workers_per_gpu} workers/GPU")
+        for gpu in gpu_info:
+            print(f"  GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f}GB)")
+        print(f"{'='*60}\n")
+
+        # Create worker function
+        vipe_config_dict = OmegaConf.to_container(vipe_config, resolve=True)
+        worker_fn = ViPEWorkerFunction(config, vipe_config_dict, output_dir)
+
+        # Create adaptive pool
+        checkpoint_dir = config.get('optimization', {}).get('checkpoint_dir', None)
+        if checkpoint_dir:
+            checkpoint_dir = Path(checkpoint_dir) / "vipe"
+
+        pool = AdaptiveWorkerPool(
+            num_gpus=num_gpus,
+            max_workers_per_gpu=max_workers_per_gpu,
+            worker_fn=worker_fn,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every=config.get('optimization', {}).get('save_checkpoint_every', 100),
+            spawn_delay=config['optimization']['spawn_delay'],
+            verbose_workers=config['optimization'].get('verbose_workers', False),
+            save_worker_logs=config['optimization'].get('save_worker_logs', True),
+            log_dir=Path(vipe_config['worker_log_dir']),
+        )
+
+        # Process videos
+        results, stable_workers = pool.process_items(video_dirs, desc="ViPE")
+
+        # Summary
+        successful = sum(1 for r in results.values() if r is not None)
+        failed = len(results) - successful
+
+        print(f"\n{'='*60}")
+        if successful > 0:
+            print(f"✅ PROCESSING COMPLETE!")
+            print(f"Stable workers: {stable_workers}")
+        else:
+            print(f"❌ PROCESSING FAILED!")
+        print(f"{'='*60}")
+        print(f"Videos processed: {successful}/{len(results)}")
+        if failed > 0:
+            print(f"Videos failed: {failed} (see error log)")
+        if successful > 0:
+            print(f"Output directory: {output_dir}")
+        print(f"{'='*60}")
+
+        return
+
+    # ====================================================================
+    # FIXED WORKER POOL MODE (EXISTING)
+    # ====================================================================
+    print("\n[Using fixed worker pool - set optimization.use_adaptive_workers=true for adaptive mode]\n")
+
     # Convert vipe_config to plain dict (OmegaConf objects can't be pickled for multiprocessing)
     vipe_config_dict = OmegaConf.to_container(vipe_config, resolve=True)
     

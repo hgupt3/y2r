@@ -167,3 +167,16 @@ cd .. && git add IsaacLab && git commit -m "Update IsaacLab submodule" && git pu
 ## Third-Party Dependencies
 
 Located in `thirdparty/`: SAM2, SAM3, CoTracker3, TAPIP3D, WiLoR, DINOv2, diffuEraser, ViPE
+
+## File Organization Convention
+
+**Archive planning/testing documents to `.claude/archive/`** after implementation is complete. This keeps the repository root clean while preserving historical context.
+
+Archive these:
+- Planning documents (PLAN_*.md, *_COMPLETE.md, *_REPORT.md)
+- Testing/validation scripts (test_*.py, compare_*.py, *_test.sh)
+- Session summaries and implementation reports
+
+Keep in root:
+- This file (CLAUDE.md) - always stays in root
+- Active production code and documentation

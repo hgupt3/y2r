@@ -12,7 +12,21 @@ Usage:
 
 import os
 import sys
+import warnings
+# Suppress warnings early (before torch import)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 import torch
+
+# Monkey-patch torch.load to use weights_only=False by default
+# This is needed for PyTorch 2.6+ compatibility with older checkpoint files
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 from omegaconf import OmegaConf
 import cv2
 import numpy as np
@@ -28,6 +42,7 @@ import zlib
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "thirdparty" / "WiLoR"))
+sys.path.insert(0, str(SCRIPT_DIR))  # For utils imports
 
 # Set PyOpenGL platform before importing pyrender
 os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -830,6 +845,73 @@ def process_video(
     return result
 
 
+# ============================================================================
+# ADAPTIVE WORKER SUPPORT
+# ============================================================================
+
+class WiLoRWorkerFunction:
+    """Worker function for adaptive pool"""
+
+    def __init__(self, config, wilor_config):
+        self.config = config
+        self.wilor_config = wilor_config
+        self.wilor_checkpoint = PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/wilor_final.ckpt"
+        self.wilor_cfg = PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/model_config.yaml"
+        self.yolo_checkpoint = PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/detector.pt"
+
+    def load_model(self):
+        """Load WiLoR and YOLO models (called once per worker)"""
+        # Load WiLoR
+        from wilor.models import load_wilor
+        model, model_cfg = load_wilor(
+            checkpoint_path=str(self.wilor_checkpoint),
+            cfg_path=str(self.wilor_cfg)
+        )
+        model = model.to("cuda:0")  # Always cuda:0 in worker (CUDA_VISIBLE_DEVICES set by pool)
+        model.eval()
+
+        # Load YOLO detector
+        from ultralytics import YOLO
+        detector = YOLO(str(self.yolo_checkpoint))
+        detector = detector.to("cuda:0")
+
+        # Get MANO faces
+        mano_faces = model.mano.faces.copy()
+
+        return {
+            'model': model,
+            'model_cfg': model_cfg,
+            'detector': detector,
+            'mano_faces': mano_faces,
+        }
+
+    def process(self, models, video_info):
+        """Process single video"""
+        video_folder, vipe_file, output_dir, vis_flag, vis_path, vis_fps = video_info
+        video_name = video_folder.name
+
+        try:
+            # Process video with WiLoR
+            result = process_video(
+                video_name=video_name,
+                frames_dir=video_folder,
+                vipe_file=vipe_file,
+                output_dir=output_dir,
+                model=models['model'],
+                model_cfg=models['model_cfg'],
+                detector=models['detector'],
+                device="cuda:0",
+                config=self.wilor_config,
+                mano_faces=models['mano_faces'],
+                vis_flag=vis_flag,
+                vis_path=vis_path,
+                vis_fps=vis_fps,
+            )
+            return result
+        except Exception as e:
+            raise RuntimeError(f"Failed to process {video_name}: {e}")
+
+
 def main():
     # Load configuration
     config = load_config("config.yaml")
@@ -880,40 +962,17 @@ def main():
     if vis_flag:
         print(f"Visualization path: {vis_path}")
     print(f"{'='*60}\n")
-    
-    # Load models
-    print(f"{'='*60}")
-    print("LOADING MODELS (one-time initialization)")
-    print(f"{'='*60}")
-    
-    print("Loading WiLoR model...")
-    from wilor.models import load_wilor
-    model, model_cfg = load_wilor(
-        checkpoint_path=str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/wilor_final.ckpt"),
-        cfg_path=str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/model_config.yaml")
-    )
-    model = model.to(device)
-    model.eval()
-    print("✅ WiLoR loaded")
-    
-    print("Loading YOLO hand detector...")
-    from ultralytics import YOLO
-    detector = YOLO(str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/detector.pt"))
-    detector = detector.to(device)
-    print("✅ YOLO detector loaded")
-    
-    # Get MANO faces for visualization
-    mano_faces = model.mano.faces.copy()
-    print(f"✅ MANO faces loaded ({len(mano_faces)} triangles)")
-    print(f"{'='*60}\n")
-    
+
+    # Check if adaptive workers enabled
+    use_adaptive = config.get('optimization', {}).get('use_adaptive_workers', False)
+
     # Process videos
     total_videos_processed = 0
     skipped_videos = 0
     start_time = time.time()
     videos_to_process = []
     processed_video_names = []
-    
+
     # Check for existing outputs if continuing
     if continue_mode and output_dir.exists():
         print(f"\n{'='*60}")
@@ -937,49 +996,153 @@ def main():
             print(f"\n✅ All {skipped_videos} videos are already complete!\n")
     else:
         videos_to_process = list(range(len(video_folders)))
-    
-    # Process each video
-    for idx in videos_to_process:
-        video_folder = video_folders[idx]
-        video_name = video_folder.name
-        
-        print(f"\n{'='*60}")
-        print(f"Processing video {idx + 1}/{len(video_folders)}: {video_name}")
+
+    if use_adaptive:
+        # ====================================================================
+        # ADAPTIVE WORKER MODE
+        # ====================================================================
+        from pipeline_utils.adaptive_workers import AdaptiveWorkerPool
+        from pipeline_utils.gpu_utils import detect_gpus
+
+        num_gpus, gpu_info = detect_gpus()
+        max_workers_per_gpu = wilor_config['max_workers']
+
         print(f"{'='*60}")
-        
-        video_start_time = time.time()
-        
-        # Check for ViPE data
-        vipe_file = input_vipe_dir / f"{video_name}.npz"
-        if not vipe_file.exists():
-            print(f"⚠ ViPE file not found: {vipe_file}")
-            continue
-        
-        result = process_video(
-            video_name=video_name,
-            frames_dir=video_folder,
-            vipe_file=vipe_file,
-            output_dir=output_dir,
-            model=model,
-            model_cfg=model_cfg,
-            detector=detector,
-            device=device,
-            config=wilor_config,
-            mano_faces=mano_faces,
-            vis_flag=vis_flag,
-            vis_path=vis_path,
-            vis_fps=vis_fps,
+        print("ADAPTIVE WORKER MODE")
+        print(f"{'='*60}")
+        print(f"🚀 Detected {num_gpus} GPU(s), max {max_workers_per_gpu} workers/GPU")
+        for gpu in gpu_info:
+            print(f"  GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f}GB)")
+        print(f"{'='*60}\n")
+
+        # Prepare video list (only videos to process, skip already processed)
+        video_infos = []
+        for idx in videos_to_process:
+            video_folder = video_folders[idx]
+            video_name = video_folder.name
+            vipe_file = input_vipe_dir / f"{video_name}.npz"
+
+            if not vipe_file.exists():
+                print(f"⚠️ ViPE file not found for {video_name}, skipping")
+                continue
+
+            video_infos.append((video_folder, vipe_file, output_dir, vis_flag, vis_path, vis_fps))
+
+        if len(video_infos) == 0:
+            print("✅ All videos already processed or no ViPE data found!")
+        else:
+            # Create worker function
+            worker_fn = WiLoRWorkerFunction(config, wilor_config)
+
+            # Create adaptive pool
+            checkpoint_dir = config.get('optimization', {}).get('checkpoint_dir', None)
+            if checkpoint_dir:
+                checkpoint_dir = Path(checkpoint_dir) / "wilor"
+
+            pool = AdaptiveWorkerPool(
+                num_gpus=num_gpus,
+                max_workers_per_gpu=max_workers_per_gpu,
+                worker_fn=worker_fn,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_every=config.get('optimization', {}).get('save_checkpoint_every', 100),
+                spawn_delay=config['optimization']['spawn_delay'],
+                verbose_workers=config['optimization'].get('verbose_workers', False),
+                save_worker_logs=config['optimization'].get('save_worker_logs', True),
+                log_dir=Path(wilor_config['worker_log_dir']),
+            )
+
+            # Process videos
+            results, stable_workers = pool.process_items(video_infos, desc="WiLoR")
+
+            print(f"\n✅ Completed with {stable_workers} stable workers")
+
+            # Save results to disk
+            for video_info, result in results.items():
+                if result is not None:
+                    video_name = video_info[0].name  # video_folder is first element
+                    output_file = output_dir / f"{video_name}.pt"
+                    torch.save(result, output_file)
+
+            # Summary
+            successful = sum(1 for r in results.values() if r is not None)
+            failed = len(results) - successful
+            total_videos_processed = successful
+            processed_video_names.extend([v[0].name for v, r in results.items() if r is not None])
+
+            if failed > 0:
+                print(f"⚠️ {failed} videos failed (see error log)")
+
+    else:
+        # ====================================================================
+        # SEQUENTIAL MODE (LEGACY)
+        # ====================================================================
+        print(f"{'='*60}")
+        print("SEQUENTIAL MODE (LEGACY)")
+        print(f"{'='*60}\n")
+
+        # Load models
+        print("Loading WiLoR model...")
+        from wilor.models import load_wilor
+        model, model_cfg = load_wilor(
+            checkpoint_path=str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/wilor_final.ckpt"),
+            cfg_path=str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/model_config.yaml")
         )
-        
-        if result is None:
-            print(f"⚠ Failed to process {video_name}")
-            continue
-        
-        # Save results
-        output_file = output_dir / f"{video_name}.pt"
-        torch.save(result, output_file)
-        
-        processed_video_names.append(video_name)
+        model = model.to(device)
+        model.eval()
+        print("✅ WiLoR loaded")
+
+        print("Loading YOLO hand detector...")
+        from ultralytics import YOLO
+        detector = YOLO(str(PROJECT_ROOT / "thirdparty/WiLoR/pretrained_models/detector.pt"))
+        detector = detector.to(device)
+        print("✅ YOLO detector loaded")
+
+        # Get MANO faces for visualization
+        mano_faces = model.mano.faces.copy()
+        print(f"✅ MANO faces loaded ({len(mano_faces)} triangles)\n")
+
+        # Process each video
+        for idx in videos_to_process:
+            video_folder = video_folders[idx]
+            video_name = video_folder.name
+
+            print(f"\n{'='*60}")
+            print(f"Processing video {idx + 1}/{len(video_folders)}: {video_name}")
+            print(f"{'='*60}")
+
+            video_start_time = time.time()
+
+            # Check for ViPE data
+            vipe_file = input_vipe_dir / f"{video_name}.npz"
+            if not vipe_file.exists():
+                print(f"⚠ ViPE file not found: {vipe_file}")
+                continue
+
+            result = process_video(
+                video_name=video_name,
+                frames_dir=video_folder,
+                vipe_file=vipe_file,
+                output_dir=output_dir,
+                model=model,
+                model_cfg=model_cfg,
+                detector=detector,
+                device=device,
+                config=wilor_config,
+                mano_faces=mano_faces,
+                vis_flag=vis_flag,
+                vis_path=vis_path,
+                vis_fps=vis_fps,
+            )
+
+            if result is None:
+                print(f"⚠ Failed to process {video_name}")
+                continue
+
+            # Save results
+            output_file = output_dir / f"{video_name}.pt"
+            torch.save(result, output_file)
+
+            processed_video_names.append(video_name)
         
         # Print summary
         video_elapsed = time.time() - video_start_time
@@ -1009,7 +1172,10 @@ def main():
         create_wilor_viz_html(vis_path, processed_video_names)
     
     print(f"\n{'='*60}")
-    print(f"✅ ALL VIDEOS PROCESSED!")
+    if total_videos_processed > 0:
+        print(f"✅ PROCESSING COMPLETE!")
+    else:
+        print(f"❌ PROCESSING FAILED!")
     print(f"{'='*60}")
     print(f"Total videos: {len(video_folders)}")
     if continue_mode and skipped_videos > 0:
@@ -1020,15 +1186,15 @@ def main():
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
         print(f"Average: {elapsed_time/total_videos_processed:.2f}s per video")
-    print(f"Output saved to: {output_dir}")
-    if vis_flag:
-        print(f"Visualizations saved to: {vis_path}")
-        print(f"\n{'='*60}")
-        print("TO VIEW 3D VISUALIZATION:")
-        print(f"{'='*60}")
-        print(f"  cd {vis_path}")
-        print(f"  python -m http.server 8000")
-        print(f"  Then open: http://localhost:8000/index.html")
+        print(f"Output saved to: {output_dir}")
+        if vis_flag:
+            print(f"Visualizations saved to: {vis_path}")
+            print(f"\n{'='*60}")
+            print("TO VIEW 3D VISUALIZATION:")
+            print(f"{'='*60}")
+            print(f"  cd {vis_path}")
+            print(f"  python -m http.server 8000")
+            print(f"  Then open: http://localhost:8000/index.html")
     print(f"{'='*60}\n")
 
 

@@ -28,6 +28,14 @@ from tqdm import tqdm
 import time
 import shutil
 import h5py
+import warnings
+
+# Suppress pynvml deprecation warnings (harmless for CPU-only workers)
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*pynvml.*')
+
+# Add utils to path
+SCRIPT_DIR = Path(__file__).parent
+sys.path.insert(0, str(SCRIPT_DIR))
 
 
 # ImageNet normalization constants
@@ -908,6 +916,61 @@ def compute_hand_pose_statistics(all_uvd_displacements, all_rot_displacements):
 
 
 # ==============================================================================
+# ADAPTIVE WORKER SUPPORT (CPU-only)
+# ==============================================================================
+
+class H5DatasetWorkerFunction:
+    """Worker function for adaptive CPU pool - processes videos to HDF5 in parallel"""
+
+    def __init__(self, config, h5_config, track_type, clip_to_text):
+        """Initialize worker with configuration
+
+        Args:
+            config: Full pipeline config
+            h5_config: create_h5_dataset section of config
+            track_type: "2d" or "3d"
+            clip_to_text: Dict mapping clip_id to text description
+        """
+        self.config = config
+        self.h5_config = h5_config
+        self.track_type = track_type
+        self.clip_to_text = clip_to_text
+
+    def load_model(self):
+        """No model loading needed for CPU-bound processing"""
+        return None
+
+    def process(self, model, video_info):
+        """Process single video to HDF5, return statistics
+
+        Args:
+            model: Unused (None for CPU-only workers)
+            video_info: Tuple of (video_folder, tracks_file, output_h5_path,
+                                  vipe_file, hand_poses_file, text_description)
+
+        Returns:
+            Statistics dict with displacements, depth_values, etc., or None if failed
+        """
+        (video_folder, tracks_file, output_h5_path,
+         vipe_file, hand_poses_file, text_description) = video_info
+
+        try:
+            result = process_video(
+                video_folder=video_folder,
+                tracks_file=tracks_file,
+                output_h5_path=output_h5_path,
+                config=self.h5_config,
+                track_type=self.track_type,
+                vipe_file=vipe_file,
+                hand_poses_file=hand_poses_file,
+                text_description=text_description,
+            )
+            return result
+        except Exception as e:
+            raise RuntimeError(f"Failed to process {video_folder.name}: {e}")
+
+
+# ==============================================================================
 # MAIN FUNCTION
 # ==============================================================================
 
@@ -915,7 +978,11 @@ def main():
     # Load configuration
     config = load_config("config.yaml")
     h5_config = config['create_h5_dataset']
-    
+
+    # Adaptive worker support: parallelizes Pass 1 (video processing)
+    # Pass 2 (statistics aggregation) remains sequential
+    use_adaptive = config.get('optimization', {}).get('use_adaptive_workers', False)
+
     # Extract configuration
     target_size = h5_config['target_size']
     num_track_ts = h5_config['num_track_ts']
@@ -1003,12 +1070,11 @@ def main():
     print(f"\n{'='*60}")
     print(f"PASS 1: PROCESSING VIDEOS AND COLLECTING STATISTICS")
     print(f"{'='*60}\n")
-    
+
     total_videos_processed = 0
     skipped_videos = 0
     start_time = time.time()
-    start_idx = 0
-    
+
     # For statistics collection
     all_displacements = []
     all_depth_values = []
@@ -1016,71 +1082,154 @@ def main():
     all_hand_uvd_displacements = []
     all_hand_rot_displacements = []
     all_stats = []
-    
-    # Efficient resume
-    if continue_mode and output_h5_dir.exists():
-        existing_h5 = sorted([f for f in output_h5_dir.iterdir() if f.suffix == '.hdf5'])
-        
-        if existing_h5:
-            last_h5 = existing_h5[-1]
-            video_name = last_h5.stem
-            
-            print(f"Last HDF5 file {video_name}.hdf5 exists")
-            
-            for i, vf in enumerate(video_folders):
-                if vf.name == video_name:
-                    start_idx = i + 1
-                    skipped_videos = i + 1
-                    break
-            
-            if start_idx > 0:
-                print(f"Resuming from video {start_idx + 1}/{len(video_folders)}")
-                print(f"Skipping {start_idx} already processed videos\n")
-    
-    # Process each video folder
-    for idx in range(start_idx, len(video_folders)):
-        video_folder = video_folders[idx]
+
+    if use_adaptive:
+        # ====================================================================
+        # ADAPTIVE WORKER MODE (CPU-only parallelization)
+        # ====================================================================
+        from pipeline_utils.adaptive_workers import AdaptiveWorkerPool
+
+        max_cpu_workers = h5_config.get('max_workers', 8)
+
         print(f"\n{'='*60}")
-        print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
+        print("ADAPTIVE WORKER MODE (CPU)")
         print(f"{'='*60}")
-        
-        video_start_time = time.time()
-        
-        # Find corresponding tracks file
-        tracks_file = input_tracks_dir / f"{video_folder.name}.pt"
-        
-        # Output path
-        output_h5_path = output_h5_dir / f"{video_folder.name}.hdf5"
-        
-        vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
-        hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
-        
-        # Get text description for this clip
-        clip_id = int(video_folder.name)  # Folder name is clip_id (e.g., "00042" -> 42)
-        text_description = clip_to_text.get(clip_id, "")
-        
-        stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file, hand_poses_file, text_description)
-        
-        if stats is not None:
-            all_stats.append(stats)
-            total_videos_processed += 1
-            
-            # Collect data for statistics
-            if 'displacements' in stats:
-                all_displacements.extend(stats['displacements'])
-            if 'depth_values' in stats:
-                all_depth_values.extend(stats['depth_values'])
-            if 'poses_9d' in stats:
-                all_poses_9d.extend(stats['poses_9d'])
-            if 'hand_uvd_displacements' in stats:
-                all_hand_uvd_displacements.extend(stats['hand_uvd_displacements'])
-            if 'hand_rot_displacements' in stats:
-                all_hand_rot_displacements.extend(stats['hand_rot_displacements'])
-            
-            video_elapsed = time.time() - video_start_time
-            print(f"\n  Completed in {video_elapsed:.2f}s")
-        else:
-            print(f"\n  Skipped due to missing data")
+        print(f"🚀 Using up to {max_cpu_workers} CPU workers\n")
+
+        # Create worker function
+        worker_fn = H5DatasetWorkerFunction(
+            config=config,
+            h5_config=h5_config,
+            track_type=track_type,
+            clip_to_text=clip_to_text
+        )
+
+        # Create pool (num_gpus=0 for CPU-only mode)
+        pool = AdaptiveWorkerPool(
+            num_gpus=0,  # CPU-only mode
+            max_workers_per_gpu=max_cpu_workers,
+            worker_fn=worker_fn,
+            spawn_delay=config['optimization'].get('spawn_delay', 2.0),
+            verbose_workers=config['optimization'].get('verbose_workers', False),
+            save_worker_logs=config['optimization'].get('save_worker_logs', True),
+            log_dir=Path(h5_config.get('worker_log_dir', output_h5_dir / 'worker_logs')),
+        )
+
+        # Prepare video info tuples
+        video_infos = []
+        for video_folder in video_folders:
+            tracks_file = input_tracks_dir / f"{video_folder.name}.pt"
+            output_h5_path = output_h5_dir / f"{video_folder.name}.hdf5"
+
+            # Skip if already processed in continue mode
+            if continue_mode and output_h5_path.exists():
+                skipped_videos += 1
+                continue
+
+            vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
+            hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
+            clip_id = int(video_folder.name)
+            text_description = clip_to_text.get(clip_id, "")
+
+            video_infos.append((video_folder, tracks_file, output_h5_path,
+                               vipe_file, hand_poses_file, text_description))
+
+        if skipped_videos > 0:
+            print(f"Skipping {skipped_videos} already processed videos (continue mode)\n")
+
+        # Process videos in parallel
+        results, stable_workers = pool.process_items(video_infos, desc="H5 Dataset")
+
+        # Aggregate statistics from results
+        for video_info, result in results.items():
+            if result is not None:
+                all_stats.append(result)
+                total_videos_processed += 1
+
+                # Collect statistics
+                if 'displacements' in result:
+                    all_displacements.extend(result['displacements'])
+                if 'depth_values' in result:
+                    all_depth_values.extend(result['depth_values'])
+                if 'poses_9d' in result:
+                    all_poses_9d.extend(result['poses_9d'])
+                if 'hand_uvd_displacements' in result:
+                    all_hand_uvd_displacements.extend(result['hand_uvd_displacements'])
+                if 'hand_rot_displacements' in result:
+                    all_hand_rot_displacements.extend(result['hand_rot_displacements'])
+
+        print(f"\n✅ Processed {total_videos_processed} videos with {stable_workers} workers\n")
+
+    else:
+        # ====================================================================
+        # SEQUENTIAL MODE
+        # ====================================================================
+        start_idx = 0
+
+        # Efficient resume
+        if continue_mode and output_h5_dir.exists():
+            existing_h5 = sorted([f for f in output_h5_dir.iterdir() if f.suffix == '.hdf5'])
+
+            if existing_h5:
+                last_h5 = existing_h5[-1]
+                video_name = last_h5.stem
+
+                print(f"Last HDF5 file {video_name}.hdf5 exists")
+
+                for i, vf in enumerate(video_folders):
+                    if vf.name == video_name:
+                        start_idx = i + 1
+                        skipped_videos = i + 1
+                        break
+
+                if start_idx > 0:
+                    print(f"Resuming from video {start_idx + 1}/{len(video_folders)}")
+                    print(f"Skipping {start_idx} already processed videos\n")
+
+        # Process each video folder
+        for idx in range(start_idx, len(video_folders)):
+            video_folder = video_folders[idx]
+            print(f"\n{'='*60}")
+            print(f"Processing video {idx + 1}/{len(video_folders)}: {video_folder.name}")
+            print(f"{'='*60}")
+
+            video_start_time = time.time()
+
+            # Find corresponding tracks file
+            tracks_file = input_tracks_dir / f"{video_folder.name}.pt"
+
+            # Output path
+            output_h5_path = output_h5_dir / f"{video_folder.name}.hdf5"
+
+            vipe_file = input_vipe_dir / f"{video_folder.name}.npz" if input_vipe_dir else None
+            hand_poses_file = input_hand_poses_dir / f"{video_folder.name}.pt" if input_hand_poses_dir else None
+
+            # Get text description for this clip
+            clip_id = int(video_folder.name)  # Folder name is clip_id (e.g., "00042" -> 42)
+            text_description = clip_to_text.get(clip_id, "")
+
+            stats = process_video(video_folder, tracks_file, output_h5_path, h5_config, track_type, vipe_file, hand_poses_file, text_description)
+
+            if stats is not None:
+                all_stats.append(stats)
+                total_videos_processed += 1
+
+                # Collect data for statistics
+                if 'displacements' in stats:
+                    all_displacements.extend(stats['displacements'])
+                if 'depth_values' in stats:
+                    all_depth_values.extend(stats['depth_values'])
+                if 'poses_9d' in stats:
+                    all_poses_9d.extend(stats['poses_9d'])
+                if 'hand_uvd_displacements' in stats:
+                    all_hand_uvd_displacements.extend(stats['hand_uvd_displacements'])
+                if 'hand_rot_displacements' in stats:
+                    all_hand_rot_displacements.extend(stats['hand_rot_displacements'])
+
+                video_elapsed = time.time() - video_start_time
+                print(f"\n  Completed in {video_elapsed:.2f}s")
+            else:
+                print(f"\n  Skipped due to missing data")
         
     
     # =========================================================================
@@ -1173,9 +1322,12 @@ def main():
     # FINAL SUMMARY
     # =========================================================================
     elapsed_time = time.time() - start_time
-    
+
     print(f"\n{'='*60}")
-    print(f"ALL VIDEOS PROCESSED!")
+    if total_videos_processed > 0:
+        print(f"✅ PROCESSING COMPLETE!")
+    else:
+        print(f"❌ PROCESSING FAILED!")
     print(f"{'='*60}")
     print(f"Total videos: {len(video_folders)}")
     if continue_mode and skipped_videos > 0:

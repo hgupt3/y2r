@@ -9,6 +9,10 @@ Usage:
 
 import os
 import sys
+import warnings
+# Suppress warnings early (before torch import)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 import torch
 from omegaconf import OmegaConf
 import cv2
@@ -21,27 +25,56 @@ import json
 import struct
 import zlib
 
-# Add thirdparty to path
+# Setup paths
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-sys.path.insert(0, str(PROJECT_ROOT / "thirdparty" / "TAPIP3D"))
+TAPIP3D_ROOT = PROJECT_ROOT / "thirdparty" / "TAPIP3D"
+
+# Add script directory to path FIRST (for local utils.adaptive_workers, etc.)
+sys.path.insert(0, str(SCRIPT_DIR))
+
+# Save original directory and change to TAPIP3D root for TAPIP3D imports
+ORIGINAL_CWD = Path.cwd()
+os.chdir(TAPIP3D_ROOT)
+
+# Temporarily add TAPIP3D to path for its imports
+sys.path.insert(0, str(TAPIP3D_ROOT))
 
 # Default TAPIP3D settings
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "thirdparty" / "TAPIP3D" / "checkpoints" / "tapip3d_final.pth"
+DEFAULT_CHECKPOINT = TAPIP3D_ROOT / "checkpoints" / "tapip3d_final.pth"
 DEFAULT_NUM_ITERS = 6  # TAPIP3D default
+VIZ_HTML_TEMPLATE = TAPIP3D_ROOT / "utils" / "viz.html"
 
-# Visualization HTML template
-VIZ_HTML_TEMPLATE = PROJECT_ROOT / "thirdparty" / "TAPIP3D" / "utils" / "viz.html"
+# Import TAPIP3D utilities using absolute path to avoid conflict with dataset_scripts/utils
+import importlib.util
+spec_inf = importlib.util.spec_from_file_location("tapip3d_inference_utils", TAPIP3D_ROOT / "utils" / "inference_utils.py")
+spec_common = importlib.util.spec_from_file_location("tapip3d_common_utils", TAPIP3D_ROOT / "utils" / "common_utils.py")
+inference_utils = importlib.util.module_from_spec(spec_inf)
+common_utils = importlib.util.module_from_spec(spec_common)
+spec_inf.loader.exec_module(inference_utils)
+spec_common.loader.exec_module(common_utils)
 
-from utils.inference_utils import load_model, inference, get_grid_queries
-from utils.common_utils import setup_logger
+# Extract functions from TAPIP3D modules for direct use
+inference = inference_utils.inference
+
 import logging
+
+# Change back to original directory
+os.chdir(ORIGINAL_CWD)
+
+# Remove TAPIP3D from the front of sys.path
+sys.path.remove(str(TAPIP3D_ROOT))
+# Add it back at the end (after SCRIPT_DIR) so dataset_scripts/utils takes precedence
+sys.path.append(str(TAPIP3D_ROOT))
 
 logger = logging.getLogger(__name__)
 
 
 def load_config(config_path="config.yaml"):
     """Load configuration from YAML file using OmegaConf"""
+    # Resolve relative path from script directory
+    if not Path(config_path).is_absolute():
+        config_path = SCRIPT_DIR / config_path
     return OmegaConf.load(config_path)
 
 
@@ -385,6 +418,11 @@ def process_video_with_tapip3d(
     if use_masks and mask_path.exists():
         mask_data = torch.load(mask_path, map_location='cpu', weights_only=False)
         masks = mask_data['masks']
+
+        # Convert to torch tensor if it's numpy
+        if isinstance(masks, np.ndarray):
+            masks = torch.from_numpy(masks)
+
         # Combine all objects: (T, O, H, W) -> (T, H, W)
         if masks.dim() == 4:
             mask = torch.any(masks > 0.5, dim=1).float()  # (T, H, W)
@@ -436,7 +474,7 @@ def process_video_with_tapip3d(
             )
         else:
             # Use grid queries from TAPIP3D
-            query_points = get_grid_queries(
+            query_points = inference_utils.get_grid_queries(
                 grid_size=grid_size,
                 depths=depths_tensor,
                 intrinsics=intrinsics_tensor,
@@ -953,9 +991,46 @@ def generate_visualizations(
     create_index_html(vis_path, video_list)
 
 
+# ============================================================================
+# ADAPTIVE WORKER SUPPORT
+# ============================================================================
+
+class TAPIP3DWorkerFunction:
+    """Worker function for adaptive pool"""
+
+    def __init__(self, config, tapip3d_config):
+        self.config = config
+        self.tapip3d_config = tapip3d_config
+        self.checkpoint_path = DEFAULT_CHECKPOINT
+
+    def load_model(self):
+        """Load TAPIP3D model (called once per worker)"""
+        model = inference_utils.load_model(str(self.checkpoint_path))
+        model.to("cuda:0")  # Always cuda:0 in worker (CUDA_VISIBLE_DEVICES set by pool)
+        model.eval()
+        return model
+
+    def process(self, model, video_info):
+        """Process single video"""
+        npz_path, mask_path, output_path = video_info
+
+        try:
+            # Process video with TAPIP3D
+            result = process_video_with_tapip3d(
+                model=model,
+                npz_path=npz_path,
+                mask_path=mask_path if mask_path.exists() else None,
+                output_path=output_path,
+                config=self.tapip3d_config,  # Pass tapip3d_config, not general config
+            )
+            return result
+        except Exception as e:
+            raise RuntimeError(f"Failed to process {npz_path.stem}: {e}")
+
+
 def main():
     # Set up logging - suppress verbose output
-    setup_logger()
+    common_utils.setup_logger()
     logging.getLogger().setLevel(logging.WARNING)
     
     # Load configuration
@@ -1020,62 +1095,143 @@ def main():
         print(f"Visualization path: {vis_path}")
     print(f"{'='*60}\n")
     
-    # Load TAPIP3D model
-    print(f"{'='*60}")
-    print("LOADING TAPIP3D MODEL")
-    print(f"{'='*60}")
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    model = load_model(str(checkpoint_path))
-    model.to(device)
-    print("TAPIP3D model loaded")
-    print(f"{'='*60}\n")
-    
+    # Check if adaptive workers enabled
+    use_adaptive = config.get('optimization', {}).get('use_adaptive_workers', False)
+
     # Track statistics
     total_videos_processed = 0
     total_windows_processed = 0
     skipped_videos = 0
     processed_video_names = []
     start_time = time.time()
-    
-    # Process each video
-    pbar = tqdm(npz_files, desc="Processing videos")
-    for npz_path in pbar:
-        video_name = npz_path.stem
-        pbar.set_postfix_str(video_name)
-        output_path = output_tracks_dir / f"{video_name}.pt"
-        
-        # Check if already processed
-        if continue_mode and output_path.exists():
-            skipped_videos += 1
-            processed_video_names.append(video_name)
-            continue
-        
-        # Find corresponding mask file
-        mask_path = input_masks_dir / f"{video_name}.pt"
-        
-        result_path = process_video_with_tapip3d(
-            model=model,
-            npz_path=npz_path,
-            mask_path=mask_path,
-            output_path=output_path,
-            config=tapip3d_config,
-        )
-        
-        if result_path is not None:
-            # Load result to count windows
-            result = torch.load(result_path, map_location='cpu', weights_only=False)
-            num_windows = len(result['windows'])
-            total_windows_processed += num_windows
-            total_videos_processed += 1
-            processed_video_names.append(video_name)
-                
-        # Clear GPU cache between videos
-        torch.cuda.empty_cache()
+
+    if use_adaptive:
+        # ====================================================================
+        # ADAPTIVE WORKER MODE
+        # ====================================================================
+        # Now that utils is renamed to pipeline_utils, no conflicts with TAPIP3D!
+        from pipeline_utils.adaptive_workers import AdaptiveWorkerPool
+        from pipeline_utils.gpu_utils import detect_gpus
+
+        num_gpus, gpu_info = detect_gpus()
+        max_workers_per_gpu = tapip3d_config['max_workers']
+
+        print(f"{'='*60}")
+        print("ADAPTIVE WORKER MODE")
+        print(f"{'='*60}")
+        print(f"🚀 Detected {num_gpus} GPU(s), max {max_workers_per_gpu} workers/GPU")
+        for gpu in gpu_info:
+            print(f"  GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f}GB)")
+        print(f"{'='*60}\n")
+
+        # Prepare video list
+        video_infos = []
+        for npz_path in npz_files:
+            video_name = npz_path.stem
+            mask_path = input_masks_dir / f"{video_name}.pt"
+            output_path = output_tracks_dir / f"{video_name}.pt"
+
+            # Skip if already processed
+            if continue_mode and output_path.exists():
+                skipped_videos += 1
+                processed_video_names.append(video_name)
+                continue
+
+            video_infos.append((npz_path, mask_path, output_path))
+
+        if len(video_infos) == 0:
+            print("✅ All videos already processed!")
+        else:
+            # Create worker function
+            worker_fn = TAPIP3DWorkerFunction(config, tapip3d_config)
+
+            # Create adaptive pool
+            checkpoint_dir = config.get('optimization', {}).get('checkpoint_dir', None)
+            if checkpoint_dir:
+                checkpoint_dir = Path(checkpoint_dir) / "tapip3d"
+
+            pool = AdaptiveWorkerPool(
+                num_gpus=num_gpus,
+                max_workers_per_gpu=max_workers_per_gpu,
+                worker_fn=worker_fn,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_every=config.get('optimization', {}).get('save_checkpoint_every', 100),
+                spawn_delay=config['optimization']['spawn_delay'],
+                verbose_workers=config['optimization'].get('verbose_workers', False),
+                save_worker_logs=config['optimization'].get('save_worker_logs', True),
+                log_dir=Path(tapip3d_config['worker_log_dir']),
+            )
+
+            # Process videos
+            results, stable_workers = pool.process_items(video_infos, desc="TAPIP3D")
+
+            print(f"\n✅ Completed with {stable_workers} stable workers")
+
+            # Summary
+            successful = sum(1 for r in results.values() if r is not None)
+            failed = len(results) - successful
+            total_videos_processed = successful
+            processed_video_names.extend([v[0].stem for v, r in results.items() if r is not None])
+
+            if failed > 0:
+                print(f"⚠️ {failed} videos failed (see error log)")
+
+    else:
+        # ====================================================================
+        # SEQUENTIAL MODE (LEGACY)
+        # ====================================================================
+        print(f"{'='*60}")
+        print("SEQUENTIAL MODE (LEGACY)")
+        print(f"{'='*60}\n")
+
+        # Load TAPIP3D model
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        model = inference_utils.load_model(str(checkpoint_path))
+        model.to(device)
+        print("TAPIP3D model loaded\n")
+
+        # Process each video
+        pbar = tqdm(npz_files, desc="Processing videos")
+        for npz_path in pbar:
+            video_name = npz_path.stem
+            pbar.set_postfix_str(video_name)
+            output_path = output_tracks_dir / f"{video_name}.pt"
+
+            # Check if already processed
+            if continue_mode and output_path.exists():
+                skipped_videos += 1
+                processed_video_names.append(video_name)
+                continue
+
+            # Find corresponding mask file
+            mask_path = input_masks_dir / f"{video_name}.pt"
+
+            result_path = process_video_with_tapip3d(
+                model=model,
+                npz_path=npz_path,
+                mask_path=mask_path,
+                output_path=output_path,
+                config=tapip3d_config,
+            )
+
+            if result_path is not None:
+                # Load result to count windows
+                result = torch.load(result_path, map_location='cpu', weights_only=False)
+                num_windows = len(result['windows'])
+                total_windows_processed += num_windows
+                total_videos_processed += 1
+                processed_video_names.append(video_name)
+
+            # Clear GPU cache between videos
+            torch.cuda.empty_cache()
     
     elapsed_time = time.time() - start_time
-    
+
     print(f"\n{'='*60}")
-    print(f"ALL VIDEOS PROCESSED!")
+    if total_videos_processed > 0:
+        print(f"✅ PROCESSING COMPLETE!")
+    else:
+        print(f"❌ PROCESSING FAILED!")
     print(f"{'='*60}")
     print(f"Total videos: {len(npz_files)}")
     print(f"Videos processed: {total_videos_processed}")
@@ -1085,7 +1241,7 @@ def main():
     print(f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} minutes)")
     if total_videos_processed > 0:
         print(f"Average: {elapsed_time/total_videos_processed:.2f}s per video")
-    print(f"Tracks saved to: {output_tracks_dir}")
+        print(f"Tracks saved to: {output_tracks_dir}")
     
     # Generate visualizations if enabled
     if vis_flag and vis_path and processed_video_names:

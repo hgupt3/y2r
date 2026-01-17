@@ -4,7 +4,7 @@
 # These variables are shared across multiple stages of the pipeline
 common:
   # Base paths
-  base_data_dir: "/home/harsh/sam/data"
+  base_data_dir: "/home/harsh/y2r/data"
   metadata_file: "${common.base_data_dir}/metadata.csv"
   raw_videos_dir: "${common.base_data_dir}/raw_videos"
   
@@ -18,6 +18,7 @@ common:
   vipe_dir: "${common.base_data_dir}/vipe"  # Output: vipe depth maps
   hand_poses_dir: "${common.base_data_dir}/hand_poses"  # Output: wilor hand poses
   save_h5_dir: "${common.base_data_dir}/h5_dataset"  # Where to save HDF5 dataset files
+  worker_log_dir: "${common.base_data_dir}/logs/workers"  # Where to save worker logs (worker_N.log files)
 
   # Visualization paths
   human_vis_dir: "${common.base_data_dir}/human_vis"
@@ -33,11 +34,22 @@ common:
   device: "cuda:0"  # CUDA device to use across all stages
   target_fps: 10  # FPS for both extraction and visualization
   window_length: 10  # Number of frames per sliding window
-  num_videos_to_process: null  # Number of videos to process (null = all)
+  num_videos_to_process: 5  # Number of videos to process (null = all)
   continue: false  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
   vis_flag: true  # Enable/disable visualization videos
   stride: 1  # Step size between window starts
-  
+
+
+# ===== OPTIMIZATION SETTINGS =====
+optimization:
+  # Enable adaptive worker pool (false = sequential mode)
+  use_adaptive_workers: true
+  gpu_strategy: 'round-robin'  # Options: 'round-robin', 'fill-first', 'memory-aware'
+  spawn_delay: 0.5  # Seconds to wait after spawning each worker (checks for immediate crashes/OOM)
+  verbose_workers: false  # Show worker output in main terminal (true = debug mode, false = clean terminal)
+  save_worker_logs: true  # Save worker logs to files (worker_N.log in output directory)
+
+
 # ===== PIPELINE STAGES =====
 
 preprocess:
@@ -54,6 +66,7 @@ gsam_human:
   detection_model: ${common.detection_model}  # Detection model: "grounding-dino", "florence-2", or "sam3"
   text_prompt: "person."  # Text prompt for object detection (better detection than "human.")
   key_frame_idx: -1  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
+  max_workers: 2  # Maximum adaptive workers (~8-10GB per worker for SAM3)
   input_images_dir: ${common.frames_dir}  # <- Input from preprocess output
   device: ${common.device}  # CUDA device to use
   output_masks_dir: ${common.human_masks_dir}  # Where to save .pt mask files -> feeds into diffueraser
@@ -79,8 +92,10 @@ diffueraser:
 
 gsam:
   detection_model: ${common.detection_model}  # Detection model: "grounding-dino", "florence-2", or "sam3"
-  text_prompt: null  # Set to null to use noun from metadata.csv, or provide a string to use that for all clips
+  text_prompt: 'red t-shaped block.'  # Set to null to use noun from metadata.csv, or provide a string to use that for all clips
   key_frame_idx: 0  # Frame index for detection (0=first frame, -1=middle frame, or specific number)
+  max_workers: 2  # Maximum adaptive workers (~8-10GB per worker for SAM3)
+  worker_log_dir: ${common.worker_log_dir}  # Where to save worker logs
   input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output
   device: ${common.device}  # CUDA device to use
   output_masks_dir: ${common.masks_dir}  # Where to save .pt mask files -> feeds into cotracker
@@ -123,7 +138,8 @@ vipe:
   input_images_dir: ${common.frames_dir}  # <- Input from diffueraser output (clean frames)
   output_dir: ${common.vipe_dir}  # Where to save TAPIP3D-ready .npz files (video, depths, intrinsics, extrinsics)
   device: ${common.device}  # CUDA device to use (e.g., "cuda:0")
-  num_workers: 1  # Parallel video workers (increase to raise GPU utilization)
+  max_workers: 1  # Maximum adaptive workers (~15GB per worker, so 2 = 30GB on 32GB GPU)
+  worker_log_dir: ${common.worker_log_dir}  # Where to save worker logs
   num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
   vis_flag: ${common.vis_flag}  # Enable ViPE visualization videos
   vis_path: ${common.vipe_vis_dir}  # Where to save ViPE visualization videos
@@ -134,12 +150,14 @@ tapip3d:
   stride: ${common.stride}  # Step size between window starts
   use_masks: true  # Whether to use masks for query points (if true, points sampled from mask)
   sampling_method: "random"  # "grid" or "random" - how to sample query points from mask
-  grid_size: 100  # For grid method: creates grid_size × grid_size points over image
+  grid_size: 64  # For grid method: creates grid_size × grid_size points over image
   target_points: 64  # For random method: number of points to sample from mask
   min_mask_percent: 0.0  # Minimum mask area as % of image (0-100). Skip window if below.
   mask_erosion_pixels: 2  # Number of pixels to erode mask (shrink) to avoid unreliable edge points
   visibility_threshold: 0.0  # Minimum visibility (0-1) to keep tracks; tracks below this at ANY frame are pruned
   resolution_factor: 1  # TAPIP3D inference resolution factor (1=base, 2=1.41x, 4=2x resolution)
+  max_workers: 2  # Maximum adaptive workers (~3GB per worker, so 8 = 24GB on 32GB GPU)
+  worker_log_dir: ${common.worker_log_dir}  # Where to save worker logs
   input_vipe_dir: ${common.vipe_dir}  # <- Input from ViPE output (.npz files with video, depths, intrinsics, extrinsics)
   input_frames_dir: ${common.frames_dir}  # <- Input from clean_frames (RGB frames for TAPIP3D)
   input_masks_dir: ${common.masks_dir}  # <- Optional: Input from gsam output (object masks)
@@ -156,6 +174,8 @@ wilor:
   input_vipe_dir: ${common.vipe_dir}  # <- Input from ViPE output (depth maps and intrinsics)
   output_dir: ${common.hand_poses_dir}  # Where to save hand pose .pt files
   device: ${common.device}  # CUDA device to use
+  max_workers: 2  # Maximum adaptive workers (~6GB per worker, so 4 = 24GB on 32GB GPU)
+  worker_log_dir: ${common.worker_log_dir}  # Where to save worker logs
   batch_size: 256  # Number of hand crops per WiLoR batch
   num_workers: 4  # DataLoader workers for parallel image preprocessing (0 = main process only)
   detection_confidence: 0.75  # YOLO hand detection threshold
@@ -185,4 +205,6 @@ create_h5_dataset:
   output_h5_dir: ${common.save_h5_dir}  # Where to save HDF5 dataset files
   num_videos_to_process: ${common.num_videos_to_process}  # Number of video folders to process (set to null to process all)
   continue: ${common.continue}  # Whether to continue from previous run (true = skip processed videos, false = delete previous output and start fresh)
+  max_workers: 8  # Maximum CPU workers (sweet spot: 6-12 workers, default: 8)
+  worker_log_dir: ${common.worker_log_dir}  # Where to save worker logs
 
