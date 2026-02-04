@@ -105,6 +105,7 @@ Python conventions:
 - Use `PascalCase` for classes.
 - Follow existing patterns in `y2r/models/` and `y2r/dataloaders/`.
 - Keep config filenames descriptive, such as `train_autoreg.yaml`.
+- Avoid "safe fallback" logic that masks errors; prefer explicit failures when required data is missing.
 
 ## Testing Guidelines
 There is no single root test suite. Choose the closest relevant check:
