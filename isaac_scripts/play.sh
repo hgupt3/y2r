@@ -25,6 +25,11 @@ REMAINING_ARGS=()
 # Parse all arguments, extract our flags, collect the rest
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --robot)
+            ROBOT="$2"
+            TASK=$(resolve_robot_task "$ROBOT")
+            shift 2
+            ;;
         --task)
             TASK_LAYER="$2"
             shift 2

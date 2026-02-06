@@ -10,7 +10,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 ISAACLAB_DIR="$REPO_ROOT/IsaacLab"
 
-TASK="Isaac-Trajectory-Kuka-Allegro-v0"
+# ==============================================================================
+# Robot Selection
+# ==============================================================================
+# Default robot. Override per-invocation with --robot <alias>.
+# Available: ur5e_leap, kuka_allegro
+# ==============================================================================
+ROBOT="${ROBOT:-ur5e_leap}"
+
+resolve_robot_task() {
+    case "$1" in
+        ur5e_leap)    echo "Isaac-Trajectory-UR5e-Leap-v0" ;;
+        kuka_allegro) echo "Isaac-Trajectory-Kuka-Allegro-v0" ;;
+        *)
+            echo "Error: Unknown robot '$1'" >&2
+            echo "Available robots: ur5e_leap, kuka_allegro" >&2
+            exit 1
+            ;;
+    esac
+}
+
+TASK=$(resolve_robot_task "$ROBOT")
+
+# Export robot selection for Python config loader
+export Y2R_ROBOT="$ROBOT"
 
 # ==============================================================================
 # Agent Configuration
@@ -76,10 +99,13 @@ parse_agent_args() {
     PARSED_ARGS=0
     local do_continue=false
 
-    # First pass: extract --agent to determine log directory
+    # First pass: extract --agent and --robot
     local args=("$@")
     for ((i=0; i<${#args[@]}; i++)); do
-        if [[ "${args[$i]}" == "--agent" ]]; then
+        if [[ "${args[$i]}" == "--robot" ]]; then
+            ROBOT="${args[$((i+1))]}"
+            TASK=$(resolve_robot_task "$ROBOT")
+        elif [[ "${args[$i]}" == "--agent" ]]; then
             local alias="${args[$((i+1))]}"
             AGENT_ENTRY=$(resolve_agent_entry "$alias")
             AGENT_LOG=$(resolve_agent_log "$alias")
@@ -100,6 +126,10 @@ parse_agent_args() {
     # Second pass: parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --robot)
+                PARSED_ARGS=$((PARSED_ARGS + 2))
+                shift 2
+                ;;
             --agent)
                 PARSED_ARGS=$((PARSED_ARGS + 2))
                 shift 2

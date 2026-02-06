@@ -17,6 +17,11 @@ STUDENT_CHECKPOINT=""
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --robot)
+            ROBOT="$2"
+            TASK=$(resolve_robot_task "$ROBOT")
+            shift 2
+            ;;
         --t_continue)
             TEACHER_CHECKPOINT=$(find_latest "trajectory")
             if [ -z "$TEACHER_CHECKPOINT" ]; then

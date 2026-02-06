@@ -3,8 +3,9 @@
 # Keyboard Debug - Palm Orientation Exploration
 # ==============================================================================
 # Usage:
-#   ./scripts/keyboard.sh                    # base task
-#   ./scripts/keyboard.sh --task <name>      # custom task
+#   ./isaac_scripts/keyboard.sh                           # ur5e_leap (default)
+#   ./isaac_scripts/keyboard.sh --robot kuka_allegro      # kuka_allegro
+#   ./isaac_scripts/keyboard.sh --task <name>             # custom task layer
 #
 # Controls: WASDQE=move, ZXTGCV=rotate, L=reset, ESC=quit
 # Palm orientation is printed every ~1 second.
@@ -16,6 +17,11 @@ TASK_LAYER="base"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --robot)
+            ROBOT="$2"
+            TASK=$(resolve_robot_task "$ROBOT")
+            shift 2
+            ;;
         --task)
             TASK_LAYER="$2"
             shift 2
@@ -29,7 +35,7 @@ done
 cd "$ISAACLAB_DIR"
 
 echo "========================================"
-echo "Keyboard Debug | Task: $TASK_LAYER"
+echo "Keyboard Debug | Robot: $ROBOT | Task: $TASK_LAYER"
 echo "========================================"
 echo "Controls:"
 echo "  W/S     - Move forward/backward (X)"
@@ -45,7 +51,7 @@ echo "========================================"
 
 Y2R_MODE=keyboard Y2R_TASK=$TASK_LAYER ./isaaclab.sh -p \
     source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/keyboard_debug.py \
-    --task "Isaac-Trajectory-Kuka-Allegro-v0" \
+    --task "$TASK" \
     --livestream 2 \
     "$@"
 

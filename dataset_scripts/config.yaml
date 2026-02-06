@@ -4,7 +4,7 @@
 # These variables are shared across multiple stages of the pipeline
 common:
   # Base paths
-  base_data_dir: "/home/harsh/y2r/data"
+  base_data_dir: "data"
   metadata_file: "${common.base_data_dir}/metadata.csv"
   raw_videos_dir: "${common.base_data_dir}/raw_videos"
   
