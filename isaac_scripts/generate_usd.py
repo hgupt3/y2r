@@ -8,8 +8,9 @@ Usage:
     python isaac_scripts/generate_usd.py --view
 
 Viewer legend (--view mode):
-    palm_link       — dim RGB axes (R=X, G=Y, B=Z)
-    palm_frame      — bright RGB axes (COMPUTED from palm_link + offset)
+    ur5e_link_6     — dim RGB axes (R=X, G=Y, B=Z)
+    palm_frame      — bright RGB axes (COMPUTED from ur5e_link_6 + offset)
+    camera_frame    — bright RGB axes, 8cm (COMPUTED from ur5e_link_6 + camera offset)
     fingertips (4×) — small bright axes (COMPUTED from link_3 + offset)
 """
 import argparse
@@ -28,6 +29,7 @@ app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 import torch
+import math
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_from_euler_xyz
@@ -35,12 +37,25 @@ from isaaclab_assets.robots import UR5E_LEAP_CFG
 
 # =============================================================================
 # Offsets from URDF joint origins (virtual frames merged away by merge_fixed_joints)
+# All offsets are relative to ur5e_link_6 (palm_link is merged into it).
 # =============================================================================
-PALM_FRAME_OFFSET_POS = torch.tensor([-0.04, -0.038, -0.035])
-# rpy=(π,0,0) → quat wxyz: 180° about X
+
+# palm_frame offset: ur5e_link_6 → virtual palm frame
+# Computed: R_flange × old_palm_offset + p_palm_in_link6
+PALM_FRAME_OFFSET_POS = torch.tensor([-0.008, -0.0345, 0.11])
 PALM_FRAME_OFFSET_QUAT = quat_from_euler_xyz(
-    torch.tensor([3.14159265358979]),
     torch.tensor([0.0]),
+    torch.tensor([-math.pi / 2]),
+    torch.tensor([math.pi / 2]),
+).squeeze(0)  # (4,)
+
+# Camera offset: ur5e_link_6 → camera optical frame
+# Computed: R_flange × old_camera_offset + p_palm_in_link6
+# Rotation is Ry(180°): camera -Z (look) → +Z in link_6, +Y (up) → +Y in link_6
+CAMERA_OFFSET_POS = torch.tensor([0.009, -0.0705, -0.0274])
+CAMERA_OFFSET_QUAT = quat_from_euler_xyz(
+    torch.tensor([0.0]),
+    torch.tensor([math.pi]),
     torch.tensor([0.0]),
 ).squeeze(0)  # (4,)
 
@@ -50,6 +65,9 @@ TIP_OFFSETS = {
     "ring_tip":   ("ring_link_3",   torch.tensor([0.0, -0.048, 0.015])),
     "thumb_tip":  ("thumb_link_3",  torch.tensor([0.0, -0.06, -0.015])),
 }
+
+# Body used for palm/camera frame computation (palm_link merged into this)
+PALM_BODY_NAME = "ur5e_link_6"
 
 # Create simulation
 sim_cfg = sim_utils.SimulationCfg(dt=1 / 120.0, device="cpu")
@@ -128,15 +146,15 @@ def quat_apply_single(quat, vec):
     return quat_apply(quat.unsqueeze(0), vec.unsqueeze(0)).squeeze(0)
 
 
-# --- Real body: palm_link ---
-palm_link_idx = find_body("palm_link")
+# --- Real body: ur5e_link_6 (palm_link merged into this) ---
+palm_body_idx = find_body(PALM_BODY_NAME)
 
 print("\n--- Frame poses (world) ---")
 
-if palm_link_idx is not None:
-    palm_pos = robot.data.body_pos_w[0, palm_link_idx]
-    palm_quat = robot.data.body_quat_w[0, palm_link_idx]
-    print(f"\n  palm_link (real body):")
+if palm_body_idx is not None:
+    palm_pos = robot.data.body_pos_w[0, palm_body_idx]
+    palm_quat = robot.data.body_quat_w[0, palm_body_idx]
+    print(f"\n  {PALM_BODY_NAME} (real body — palm_link merged here):")
     print(f"    pos:  ({palm_pos[0]:.5f}, {palm_pos[1]:.5f}, {palm_pos[2]:.5f})")
     print(f"    quat: ({palm_quat[0]:.5f}, {palm_quat[1]:.5f}, {palm_quat[2]:.5f}, {palm_quat[3]:.5f})  [wxyz]")
 
@@ -147,12 +165,23 @@ if palm_link_idx is not None:
     )
     pf_pos = pf_pos.squeeze(0)
     pf_quat = pf_quat.squeeze(0)
-    print(f"\n  palm_frame (COMPUTED from palm_link + offset):")
+    print(f"\n  palm_frame (COMPUTED from {PALM_BODY_NAME} + palm offset):")
     print(f"    pos:  ({pf_pos[0]:.5f}, {pf_pos[1]:.5f}, {pf_pos[2]:.5f})")
     print(f"    quat: ({pf_quat[0]:.5f}, {pf_quat[1]:.5f}, {pf_quat[2]:.5f}, {pf_quat[3]:.5f})  [wxyz]")
+
+    # Compute camera_frame from offset
+    cf_pos, cf_quat = combine_frame_transforms(
+        palm_pos.unsqueeze(0), palm_quat.unsqueeze(0),
+        CAMERA_OFFSET_POS.unsqueeze(0), CAMERA_OFFSET_QUAT.unsqueeze(0),
+    )
+    cf_pos = cf_pos.squeeze(0)
+    cf_quat = cf_quat.squeeze(0)
+    print(f"\n  camera_frame (COMPUTED from {PALM_BODY_NAME} + camera offset):")
+    print(f"    pos:  ({cf_pos[0]:.5f}, {cf_pos[1]:.5f}, {cf_pos[2]:.5f})")
+    print(f"    quat: ({cf_quat[0]:.5f}, {cf_quat[1]:.5f}, {cf_quat[2]:.5f}, {cf_quat[3]:.5f})  [wxyz]")
 else:
-    pf_pos = pf_quat = None
-    print("\n  palm_link: NOT FOUND")
+    pf_pos = pf_quat = cf_pos = cf_quat = None
+    print(f"\n  {PALM_BODY_NAME}: NOT FOUND")
 
 # --- Computed tip positions ---
 tip_poses = {}
@@ -194,26 +223,37 @@ if args.view:
     # -- Drawing config --
     FRAME_AXIS_LEN = 0.12  # 12cm
     TIP_AXIS_LEN = 0.04    # 4cm for fingertips
+    CAM_AXIS_LEN = 0.08    # 8cm for camera
 
     print("\nViewer running at http://localhost:8211")
     print("Frame axes:")
-    print("  palm_link       = dim   RGB  (R=X, G=Y, B=Z)")
-    print("  palm_frame      = bright RGB  (COMPUTED from palm_link + offset)")
+    print(f"  {PALM_BODY_NAME:15s} = dim   RGB  (R=X, G=Y, B=Z)")
+    print("  palm_frame      = bright RGB  (COMPUTED from ur5e_link_6 + palm offset)")
+    print("  camera_frame    = bright RGB  (COMPUTED from ur5e_link_6 + camera offset, 8cm axes)")
     print("  fingertips (4×) = small bright axes (COMPUTED from link_3 + offset)")
     print("Press Ctrl+C to exit.\n")
 
-    def draw_axes_at(pos, quat, axis_len, line_width, dim=False):
+    def draw_axes_at(pos, quat, axis_len, line_width, dim=False, color_override=None):
         """Append RGB axis lines at a given pose to the draw lists."""
         brightness = 0.5 if dim else 1.0
         alpha = 0.7 if dim else 1.0
-        for axis, rgb in [(X_AXIS, (brightness, 0.0, 0.0)),
-                          (Y_AXIS, (0.0, brightness, 0.0)),
-                          (Z_AXIS, (0.0, 0.0, brightness))]:
-            end = pos + quat_apply_single(quat, axis) * axis_len
-            starts.append(pos.tolist())
-            ends.append(end.tolist())
-            colors.append((*rgb, alpha))
-            sizes.append(line_width)
+        if color_override is not None:
+            # Use same color for all 3 axes
+            for axis in [X_AXIS, Y_AXIS, Z_AXIS]:
+                end = pos + quat_apply_single(quat, axis) * axis_len
+                starts.append(pos.tolist())
+                ends.append(end.tolist())
+                colors.append((*color_override, alpha))
+                sizes.append(line_width)
+        else:
+            for axis, rgb in [(X_AXIS, (brightness, 0.0, 0.0)),
+                              (Y_AXIS, (0.0, brightness, 0.0)),
+                              (Z_AXIS, (0.0, 0.0, brightness))]:
+                end = pos + quat_apply_single(quat, axis) * axis_len
+                starts.append(pos.tolist())
+                ends.append(end.tolist())
+                colors.append((*rgb, alpha))
+                sizes.append(line_width)
 
     while simulation_app.is_running():
         sim.step()
@@ -226,18 +266,25 @@ if args.view:
             colors = []
             sizes = []
 
-            # palm_link (dim RGB axes)
-            if palm_link_idx is not None:
-                pl_pos = robot.data.body_pos_w[0, palm_link_idx]
-                pl_quat = robot.data.body_quat_w[0, palm_link_idx]
+            # ur5e_link_6 (dim RGB axes)
+            if palm_body_idx is not None:
+                pl_pos = robot.data.body_pos_w[0, palm_body_idx]
+                pl_quat = robot.data.body_quat_w[0, palm_body_idx]
                 draw_axes_at(pl_pos, pl_quat, FRAME_AXIS_LEN, 3.0, dim=True)
 
-                # palm_frame (bright RGB axes, computed from palm_link + offset)
+                # palm_frame (bright RGB axes, computed from ur5e_link_6 + palm offset)
                 pf_p, pf_q = combine_frame_transforms(
                     pl_pos.unsqueeze(0), pl_quat.unsqueeze(0),
                     PALM_FRAME_OFFSET_POS.unsqueeze(0), PALM_FRAME_OFFSET_QUAT.unsqueeze(0),
                 )
                 draw_axes_at(pf_p.squeeze(0), pf_q.squeeze(0), FRAME_AXIS_LEN, 5.0, dim=False)
+
+                # camera_frame (RGB axes, computed from ur5e_link_6 + camera offset)
+                cf_p, cf_q = combine_frame_transforms(
+                    pl_pos.unsqueeze(0), pl_quat.unsqueeze(0),
+                    CAMERA_OFFSET_POS.unsqueeze(0), CAMERA_OFFSET_QUAT.unsqueeze(0),
+                )
+                draw_axes_at(cf_p.squeeze(0), cf_q.squeeze(0), CAM_AXIS_LEN, 4.0, dim=False)
 
             # Fingertips (small bright axes, computed from link_3 + offset)
             for tip_name, (parent_name, offset) in TIP_OFFSETS.items():
