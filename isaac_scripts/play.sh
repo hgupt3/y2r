@@ -99,7 +99,7 @@ if [ "$STUDENT" = "1" ]; then
     echo "========================================"
     echo "Mode: Student | Task: $TASK_LAYER"
     echo "========================================"
-    Y2R_MODE=play_student Y2R_TASK=$TASK_LAYER ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
+    Y2R_MODE=play_student Y2R_TASK=$TASK_LAYER Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
         --task "$TASK" \
         --livestream 2 \
         --enable_cameras \
@@ -110,7 +110,7 @@ else
     echo "========================================"
     echo "Mode: Teacher${AGENT_ALIAS:+ ($AGENT_ALIAS)} | Task: $TASK_LAYER"
     echo "========================================"
-    Y2R_MODE=play Y2R_TASK=$TASK_LAYER ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
+    Y2R_MODE=play Y2R_TASK=$TASK_LAYER Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
         --task "$TASK" \
         --livestream 2 \
         ${AGENT_ARGS} \

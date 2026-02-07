@@ -20,7 +20,7 @@ shift $PARSED_ARGS
 
 cd "$ISAACLAB_DIR"
 
-Y2R_MODE=train Y2R_TASK=base ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
+Y2R_MODE=train Y2R_TASK=base Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
     --task "$TASK" \
     --headless \
     --track \

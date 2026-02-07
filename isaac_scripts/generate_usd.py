@@ -107,8 +107,6 @@ robot.update(sim.cfg.dt)
 REPORT_BODIES = {
     "palm_link": find_body("palm_link"),
     "palm_frame": find_body("palm_frame"),
-    "gemini_305_left_camera_optical_frame": find_body("gemini_305_left_camera_optical_frame"),
-    "gemini_305_link": find_body("gemini_305_link"),
 }
 
 # Unit vectors for axis computation
@@ -181,15 +179,11 @@ if args.view:
     # Indices (pre-looked-up)
     palm_link_idx = REPORT_BODIES["palm_link"]
     palm_frame_idx = REPORT_BODIES["palm_frame"]
-    camera_optical_idx = REPORT_BODIES["gemini_305_left_camera_optical_frame"]
 
     print("\nViewer running at http://localhost:8211")
     print("Frame axes:")
     print("  palm_link  = dim   RGB  (R=X, G=Y, B=Z)")
     print("  palm_frame = bright RGB  (R=X, G=Y, B=Z)")
-    if camera_optical_idx is not None:
-        print("  camera     = bright, CAMERA convention:")
-        print("               Red=forward(+X)  Green=left(+Y)  Blue=up(+Z)")
     print("Press Ctrl+C to exit.\n")
 
     def draw_body_axes(body_idx, axis_len, line_width, dim=False):
@@ -254,10 +248,6 @@ if args.view:
             # palm_frame (bright RGB axes)
             if palm_frame_idx is not None:
                 draw_body_axes(palm_frame_idx, FRAME_AXIS_LEN, 5.0, dim=False)
-
-            # Camera optical frame (camera convention axes)
-            if camera_optical_idx is not None:
-                draw_camera_axes(camera_optical_idx, CAMERA_AXIS_LEN, 5.0)
 
             debug_draw.draw_lines(starts, ends, colors, sizes)
 else:

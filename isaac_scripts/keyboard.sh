@@ -49,7 +49,7 @@ echo "  L       - Reset keyboard deltas"
 echo "  ESC     - Quit"
 echo "========================================"
 
-Y2R_MODE=keyboard Y2R_TASK=$TASK_LAYER ./isaaclab.sh -p \
+Y2R_MODE=keyboard Y2R_TASK=$TASK_LAYER Y2R_ROBOT=$ROBOT ./isaaclab.sh -p \
     source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/keyboard_debug.py \
     --task "$TASK" \
     --livestream 2 \

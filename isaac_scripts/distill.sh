@@ -76,7 +76,7 @@ fi
 
 cd "$ISAACLAB_DIR"
 
-Y2R_MODE=distill Y2R_TASK=base ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/distill.py \
+Y2R_MODE=distill Y2R_TASK=base Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/distill.py \
     --task "$TASK" \
     --teacher-checkpoint "$TEACHER_CHECKPOINT" \
     --headless \
