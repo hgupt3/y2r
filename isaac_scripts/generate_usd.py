@@ -8,12 +8,9 @@ Usage:
     python isaac_scripts/generate_usd.py --view
 
 Viewer legend (--view mode):
-    palm_link  — dim RGB axes (R=X, G=Y, B=Z)
-    palm_frame — bright RGB axes
-    camera     — bright axes with CAMERA convention:
-                   Red   = +X = camera forward (optical +Z)
-                   Green = +Y = camera left    (optical -X)
-                   Blue  = +Z = camera up      (optical -Y)
+    palm_link       — dim RGB axes (R=X, G=Y, B=Z)
+    palm_frame      — bright RGB axes (COMPUTED from palm_link + offset)
+    fingertips (4×) — small bright axes (COMPUTED from link_3 + offset)
 """
 import argparse
 
@@ -33,8 +30,26 @@ simulation_app = app_launcher.app
 import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_from_euler_xyz
 from isaaclab_assets.robots import UR5E_LEAP_CFG
+
+# =============================================================================
+# Offsets from URDF joint origins (virtual frames merged away by merge_fixed_joints)
+# =============================================================================
+PALM_FRAME_OFFSET_POS = torch.tensor([-0.04, -0.038, -0.035])
+# rpy=(π,0,0) → quat wxyz: 180° about X
+PALM_FRAME_OFFSET_QUAT = quat_from_euler_xyz(
+    torch.tensor([3.14159265358979]),
+    torch.tensor([0.0]),
+    torch.tensor([0.0]),
+).squeeze(0)  # (4,)
+
+TIP_OFFSETS = {
+    "index_tip":  ("index_link_3",  torch.tensor([0.0, -0.048, 0.015])),
+    "middle_tip": ("middle_link_3", torch.tensor([0.0, -0.048, 0.015])),
+    "ring_tip":   ("ring_link_3",   torch.tensor([0.0, -0.048, 0.015])),
+    "thumb_tip":  ("thumb_link_3",  torch.tensor([0.0, -0.06, -0.015])),
+}
 
 # Create simulation
 sim_cfg = sim_utils.SimulationCfg(dt=1 / 120.0, device="cpu")
@@ -103,12 +118,6 @@ def find_body(name):
 
 robot.update(sim.cfg.dt)
 
-# Bodies to report (name → index); None means body not found in this URDF
-REPORT_BODIES = {
-    "palm_link": find_body("palm_link"),
-    "palm_frame": find_body("palm_frame"),
-}
-
 # Unit vectors for axis computation
 X_AXIS = torch.tensor([1.0, 0.0, 0.0])
 Y_AXIS = torch.tensor([0.0, 1.0, 0.0])
@@ -118,34 +127,46 @@ def quat_apply_single(quat, vec):
     """Apply quaternion rotation to a single vector."""
     return quat_apply(quat.unsqueeze(0), vec.unsqueeze(0)).squeeze(0)
 
-print("\n--- Frame poses (world) ---")
-for name, idx in REPORT_BODIES.items():
-    if idx is None:
-        print(f"\n  {name}: NOT FOUND")
-        continue
-    body_pos = robot.data.body_pos_w[0, idx]
-    body_quat = robot.data.body_quat_w[0, idx]
-    print(f"\n  {name}:")
-    print(f"    pos:  ({body_pos[0]:.5f}, {body_pos[1]:.5f}, {body_pos[2]:.5f})")
-    print(f"    quat: ({body_quat[0]:.5f}, {body_quat[1]:.5f}, {body_quat[2]:.5f}, {body_quat[3]:.5f})  [wxyz]")
 
-    # For camera frames, print raw axis directions + camera convention
-    if "gemini_305" in name:
-        opt_x = quat_apply_single(body_quat, X_AXIS)
-        opt_y = quat_apply_single(body_quat, Y_AXIS)
-        opt_z = quat_apply_single(body_quat, Z_AXIS)
-        print(f"    +X (world): ({opt_x[0]:.4f}, {opt_x[1]:.4f}, {opt_x[2]:.4f})")
-        print(f"    +Y (world): ({opt_y[0]:.4f}, {opt_y[1]:.4f}, {opt_y[2]:.4f})")
-        print(f"    +Z (world): ({opt_z[0]:.4f}, {opt_z[1]:.4f}, {opt_z[2]:.4f})")
-        if "optical" in name:
-            # ROS optical: X=right, Y=down, Z=forward
-            # User camera convention: X=forward, Y=left, Z=up
-            cam_forward = quat_apply_single(body_quat, Z_AXIS)    # optical +Z
-            cam_left = quat_apply_single(body_quat, -X_AXIS)      # optical -X
-            cam_up = quat_apply_single(body_quat, -Y_AXIS)        # optical -Y
-            print(f"    camera forward: ({cam_forward[0]:.4f}, {cam_forward[1]:.4f}, {cam_forward[2]:.4f})  [optical +Z]")
-            print(f"    camera left:    ({cam_left[0]:.4f}, {cam_left[1]:.4f}, {cam_left[2]:.4f})  [optical -X]")
-            print(f"    camera up:      ({cam_up[0]:.4f}, {cam_up[1]:.4f}, {cam_up[2]:.4f})  [optical -Y]")
+# --- Real body: palm_link ---
+palm_link_idx = find_body("palm_link")
+
+print("\n--- Frame poses (world) ---")
+
+if palm_link_idx is not None:
+    palm_pos = robot.data.body_pos_w[0, palm_link_idx]
+    palm_quat = robot.data.body_quat_w[0, palm_link_idx]
+    print(f"\n  palm_link (real body):")
+    print(f"    pos:  ({palm_pos[0]:.5f}, {palm_pos[1]:.5f}, {palm_pos[2]:.5f})")
+    print(f"    quat: ({palm_quat[0]:.5f}, {palm_quat[1]:.5f}, {palm_quat[2]:.5f}, {palm_quat[3]:.5f})  [wxyz]")
+
+    # Compute palm_frame from offset
+    pf_pos, pf_quat = combine_frame_transforms(
+        palm_pos.unsqueeze(0), palm_quat.unsqueeze(0),
+        PALM_FRAME_OFFSET_POS.unsqueeze(0), PALM_FRAME_OFFSET_QUAT.unsqueeze(0),
+    )
+    pf_pos = pf_pos.squeeze(0)
+    pf_quat = pf_quat.squeeze(0)
+    print(f"\n  palm_frame (COMPUTED from palm_link + offset):")
+    print(f"    pos:  ({pf_pos[0]:.5f}, {pf_pos[1]:.5f}, {pf_pos[2]:.5f})")
+    print(f"    quat: ({pf_quat[0]:.5f}, {pf_quat[1]:.5f}, {pf_quat[2]:.5f}, {pf_quat[3]:.5f})  [wxyz]")
+else:
+    pf_pos = pf_quat = None
+    print("\n  palm_link: NOT FOUND")
+
+# --- Computed tip positions ---
+tip_poses = {}
+for tip_name, (parent_name, offset) in TIP_OFFSETS.items():
+    parent_idx = find_body(parent_name)
+    if parent_idx is not None:
+        parent_pos = robot.data.body_pos_w[0, parent_idx]
+        parent_quat = robot.data.body_quat_w[0, parent_idx]
+        tip_pos = parent_pos + quat_apply_single(parent_quat, offset)
+        tip_poses[tip_name] = (tip_pos, parent_quat, parent_idx)
+        print(f"\n  {tip_name} (COMPUTED from {parent_name} + offset):")
+        print(f"    pos:  ({tip_pos[0]:.5f}, {tip_pos[1]:.5f}, {tip_pos[2]:.5f})")
+    else:
+        print(f"\n  {tip_name}: parent {parent_name} NOT FOUND")
 
 print("\n" + "=" * 60)
 print("Conversion successful!")
@@ -171,63 +192,27 @@ if args.view:
         debug_draw = omni_debug_draw.acquire_debug_draw_interface()
 
     # -- Drawing config --
-    # Standard RGB axes for body frames
     FRAME_AXIS_LEN = 0.12  # 12cm
-    # Camera axes (slightly longer for visibility)
-    CAMERA_AXIS_LEN = 0.15  # 15cm
-
-    # Indices (pre-looked-up)
-    palm_link_idx = REPORT_BODIES["palm_link"]
-    palm_frame_idx = REPORT_BODIES["palm_frame"]
+    TIP_AXIS_LEN = 0.04    # 4cm for fingertips
 
     print("\nViewer running at http://localhost:8211")
     print("Frame axes:")
-    print("  palm_link  = dim   RGB  (R=X, G=Y, B=Z)")
-    print("  palm_frame = bright RGB  (R=X, G=Y, B=Z)")
+    print("  palm_link       = dim   RGB  (R=X, G=Y, B=Z)")
+    print("  palm_frame      = bright RGB  (COMPUTED from palm_link + offset)")
+    print("  fingertips (4×) = small bright axes (COMPUTED from link_3 + offset)")
     print("Press Ctrl+C to exit.\n")
 
-    def draw_body_axes(body_idx, axis_len, line_width, dim=False):
-        """Append RGB axis lines for a body frame to the draw lists.
-
-        Args:
-            body_idx: Index into robot.data.body_pos_w / body_quat_w
-            axis_len: Length of each axis line (meters)
-            line_width: Pixel width of lines
-            dim: If True, use half-brightness colors
-        """
-        body_pos = robot.data.body_pos_w[0, body_idx]
-        body_quat = robot.data.body_quat_w[0, body_idx]
+    def draw_axes_at(pos, quat, axis_len, line_width, dim=False):
+        """Append RGB axis lines at a given pose to the draw lists."""
         brightness = 0.5 if dim else 1.0
         alpha = 0.7 if dim else 1.0
         for axis, rgb in [(X_AXIS, (brightness, 0.0, 0.0)),
                           (Y_AXIS, (0.0, brightness, 0.0)),
                           (Z_AXIS, (0.0, 0.0, brightness))]:
-            end = body_pos + quat_apply_single(body_quat, axis) * axis_len
-            starts.append(body_pos.tolist())
+            end = pos + quat_apply_single(quat, axis) * axis_len
+            starts.append(pos.tolist())
             ends.append(end.tolist())
             colors.append((*rgb, alpha))
-            sizes.append(line_width)
-
-    def draw_camera_axes(body_idx, axis_len, line_width):
-        """Draw camera-convention axes for the optical frame.
-
-        Maps ROS optical frame (X=right, Y=down, Z=forward) to camera convention:
-            Red   (+X, forward) = optical +Z
-            Green (+Y, left)    = optical -X
-            Blue  (+Z, up)      = optical -Y
-        """
-        body_pos = robot.data.body_pos_w[0, body_idx]
-        body_quat = robot.data.body_quat_w[0, body_idx]
-        cam_axes = [
-            (Z_AXIS,  (1.0, 0.0, 0.0, 1.0)),   # forward (+Z_opt) → Red
-            (-X_AXIS, (0.0, 1.0, 0.0, 1.0)),    # left (-X_opt) → Green
-            (-Y_AXIS, (0.0, 0.0, 1.0, 1.0)),    # up (-Y_opt) → Blue
-        ]
-        for axis_local, color in cam_axes:
-            end = body_pos + quat_apply_single(body_quat, axis_local) * axis_len
-            starts.append(body_pos.tolist())
-            ends.append(end.tolist())
-            colors.append(color)
             sizes.append(line_width)
 
     while simulation_app.is_running():
@@ -243,11 +228,25 @@ if args.view:
 
             # palm_link (dim RGB axes)
             if palm_link_idx is not None:
-                draw_body_axes(palm_link_idx, FRAME_AXIS_LEN, 3.0, dim=True)
+                pl_pos = robot.data.body_pos_w[0, palm_link_idx]
+                pl_quat = robot.data.body_quat_w[0, palm_link_idx]
+                draw_axes_at(pl_pos, pl_quat, FRAME_AXIS_LEN, 3.0, dim=True)
 
-            # palm_frame (bright RGB axes)
-            if palm_frame_idx is not None:
-                draw_body_axes(palm_frame_idx, FRAME_AXIS_LEN, 5.0, dim=False)
+                # palm_frame (bright RGB axes, computed from palm_link + offset)
+                pf_p, pf_q = combine_frame_transforms(
+                    pl_pos.unsqueeze(0), pl_quat.unsqueeze(0),
+                    PALM_FRAME_OFFSET_POS.unsqueeze(0), PALM_FRAME_OFFSET_QUAT.unsqueeze(0),
+                )
+                draw_axes_at(pf_p.squeeze(0), pf_q.squeeze(0), FRAME_AXIS_LEN, 5.0, dim=False)
+
+            # Fingertips (small bright axes, computed from link_3 + offset)
+            for tip_name, (parent_name, offset) in TIP_OFFSETS.items():
+                parent_idx = find_body(parent_name)
+                if parent_idx is not None:
+                    p_pos = robot.data.body_pos_w[0, parent_idx]
+                    p_quat = robot.data.body_quat_w[0, parent_idx]
+                    t_pos = p_pos + quat_apply_single(p_quat, offset)
+                    draw_axes_at(t_pos, p_quat, TIP_AXIS_LEN, 3.0, dim=False)
 
             debug_draw.draw_lines(starts, ends, colors, sizes)
 else:
